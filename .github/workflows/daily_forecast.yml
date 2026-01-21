@@ -1,0 +1,118 @@
+# .github/workflows/daily_forecast.yml
+# 毎日の需要予測・学習ワークフロー
+
+name: Daily Forecast & Learning
+
+on:
+  schedule:
+    # 毎朝6時（JST）= UTC 21時（前日）
+    - cron: '0 21 * * *'
+  workflow_dispatch:  # 手動実行も可能
+    inputs:
+      task:
+        description: '実行するタスク'
+        required: true
+        default: 'both'
+        type: choice
+        options:
+          - morning  # 朝の予測のみ
+          - evening  # 夜の比較・学習のみ
+          - both     # 両方
+
+jobs:
+  morning-forecast:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event.inputs.task == 'morning' || github.event.inputs.task == 'both'
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          pip install pandas numpy requests google-auth google-auth-oauthlib google-api-python-client
+      
+      - name: Run morning forecast
+        env:
+          GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+        run: |
+          cd scripts
+          python morning_forecast.py
+
+  evening-compare:
+    runs-on: ubuntu-latest
+    # 毎晩22時（JST）= UTC 13時
+    if: github.event.inputs.task == 'evening' || github.event.inputs.task == 'both'
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          pip install pandas numpy requests google-auth google-auth-oauthlib google-api-python-client
+      
+      - name: Run evening comparison & learning
+        env:
+          GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: |
+          cd scripts
+          python evening_compare.py
+
+---
+# 夜間バッチ用（別のcronで実行する場合）
+# .github/workflows/evening_learning.yml
+
+name: Evening Learning
+
+on:
+  schedule:
+    # 毎晩22時（JST）= UTC 13時
+    - cron: '0 13 * * *'
+
+jobs:
+  evening-compare:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          pip install pandas numpy requests google-auth google-auth-oauthlib google-api-python-client
+      
+      - name: Run evening comparison & learning
+        env:
+          GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: |
+          cd scripts
+          python evening_compare.py
