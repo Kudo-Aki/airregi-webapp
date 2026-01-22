@@ -1415,21 +1415,13 @@ def render_selected_products():
         with col1:
             st.write(f"**✅ 選択中の授与品（{len(st.session_state.selected_products)}件）**")
         with col2:
-            if st.button("🗑️ すべてクリア", key="clear_all_products"):
-                st.session_state.selected_products.clear()
-                st.session_state.analysis_mode = "合算"
-                st.session_state.sales_data = None
-                st.session_state.forecast_data = None
-                st.session_state.individual_sales_data = {}
-                st.rerun()
+            if st.button("🗑️ すべてクリア", key="clear_all_products", on_click=clear_all_selected_products):
+                pass  # callbackで処理
         
         # 個別削除可能な授与品リスト表示
         st.markdown("""
         <div style="background: #e3f2fd; border-radius: 10px; padding: 15px; margin: 10px 0;">
         """, unsafe_allow_html=True)
-        
-        # 削除対象を追跡
-        products_to_remove = []
         
         # 3列で表示（スマホでは1列になる）
         cols_per_row = 3
@@ -1446,23 +1438,36 @@ def render_selected_products():
                         with col_inner1:
                             st.markdown(f"📦 **{product}**")
                         with col_inner2:
-                            if st.button("✕", key=f"remove_{idx}_{product}", help=f"{product}を削除"):
-                                products_to_remove.append(product)
+                            # callback関数で削除処理
+                            st.button(
+                                "✕", 
+                                key=f"remove_product_{hash(product) % 10000}_{idx}", 
+                                help=f"{product}を削除",
+                                on_click=remove_single_product,
+                                args=(product,)
+                            )
         
         st.markdown("</div>", unsafe_allow_html=True)
-        
-        # 削除処理
-        if products_to_remove:
-            for product in products_to_remove:
-                if product in st.session_state.selected_products:
-                    st.session_state.selected_products.remove(product)
-            # 個別データもクリア
-            st.session_state.sales_data = None
-            st.session_state.forecast_data = None
-            st.session_state.individual_sales_data = {}
-            st.rerun()
     else:
         st.warning("👆 上から授与品を選んでください")
+
+
+def clear_all_selected_products():
+    """すべての選択をクリア（callback用）"""
+    st.session_state.selected_products = []
+    st.session_state.analysis_mode = "合算"
+    st.session_state.sales_data = None
+    st.session_state.forecast_data = None
+    st.session_state.individual_sales_data = {}
+
+
+def remove_single_product(product: str):
+    """単一の授与品を削除（callback用）"""
+    if product in st.session_state.selected_products:
+        st.session_state.selected_products.remove(product)
+    st.session_state.sales_data = None
+    st.session_state.forecast_data = None
+    st.session_state.individual_sales_data = {}
 
 
 def render_period_selection():
@@ -1505,60 +1510,28 @@ def render_period_selection():
     with col2:
         st.write("**期間指定**")
         
-        col_s1, col_s2, col_s3, col_e1, col_e2, col_e3 = st.columns([1, 1, 1, 1, 1, 1])
+        # カレンダーピッカーで選択（スマホでも使いやすい）
+        col_start, col_end = st.columns(2)
         
-        with col_s1:
-            start_year = st.selectbox(
-                "開始年",
-                list(range(2022, 2028)),
-                index=list(range(2022, 2028)).index(default_start.year) if default_start.year in range(2022, 2028) else 0,
-                key="start_year"
-            )
-        with col_s2:
-            start_month = st.selectbox(
-                "開始月",
-                list(range(1, 13)),
-                index=default_start.month - 1,
-                format_func=lambda x: f"{x}月",
-                key="start_month"
-            )
-        with col_s3:
-            max_day_start = calendar.monthrange(start_year, start_month)[1]
-            start_day = st.selectbox(
+        with col_start:
+            start_date = st.date_input(
                 "開始日",
-                list(range(1, max_day_start + 1)),
-                index=min(default_start.day - 1, max_day_start - 1),
-                format_func=lambda x: f"{x}日",
-                key="start_day"
+                value=default_start,
+                min_value=date(2022, 1, 1),
+                max_value=today,
+                key="analysis_start_date",
+                format="YYYY/MM/DD"
             )
         
-        with col_e1:
-            end_year = st.selectbox(
-                "終了年",
-                list(range(2022, 2028)),
-                index=list(range(2022, 2028)).index(default_end.year) if default_end.year in range(2022, 2028) else 0,
-                key="end_year"
-            )
-        with col_e2:
-            end_month = st.selectbox(
-                "終了月",
-                list(range(1, 13)),
-                index=default_end.month - 1,
-                format_func=lambda x: f"{x}月",
-                key="end_month"
-            )
-        with col_e3:
-            max_day_end = calendar.monthrange(end_year, end_month)[1]
-            end_day = st.selectbox(
+        with col_end:
+            end_date = st.date_input(
                 "終了日",
-                list(range(1, max_day_end + 1)),
-                index=min(default_end.day - 1, max_day_end - 1),
-                format_func=lambda x: f"{x}日",
-                key="end_day"
+                value=default_end,
+                min_value=date(2022, 1, 1),
+                max_value=today,
+                key="analysis_end_date",
+                format="YYYY/MM/DD"
             )
-    
-    start_date = date(start_year, start_month, start_day)
-    end_date = date(end_year, end_month, end_day)
     
     if start_date > end_date:
         st.error("⚠️ 開始日が終了日より後になっています")
@@ -2103,6 +2076,31 @@ def render_individual_forecast_section():
                 
                 total_all = sum(r['rounded_total'] for r in results)
                 st.metric("📦 全体の予測総数", f"{total_all:,}体")
+                
+                # 納品計画で使えるようにsession_stateに保存
+                # 複数商品の予測を合算したDataFrameを作成
+                if len(results) == 1:
+                    st.session_state.forecast_data = results[0]['forecast']
+                else:
+                    # 複数商品の場合は日付ごとに合算
+                    combined_forecast = results[0]['forecast'].copy()
+                    combined_forecast = combined_forecast.rename(columns={'predicted': 'predicted_sum'})
+                    
+                    for r in results[1:]:
+                        merged = combined_forecast.merge(
+                            r['forecast'][['date', 'predicted']], 
+                            on='date', 
+                            how='outer'
+                        )
+                        merged['predicted_sum'] = merged['predicted_sum'].fillna(0) + merged['predicted'].fillna(0)
+                        merged = merged.drop(columns=['predicted'])
+                        combined_forecast = merged
+                    
+                    combined_forecast = combined_forecast.rename(columns={'predicted_sum': 'predicted'})
+                    st.session_state.forecast_data = combined_forecast
+                
+                st.session_state.forecast_total = total_all
+                st.session_state.last_forecast_method = results[0]['method_message'] if results else ""
 
 
 def render_delivery_section():
