@@ -36,3 +36,35 @@ DELIVERY_PARAMS = {
     "default_safety_stock_days": 14, # 安全在庫日数
     "default_order_lot": 100,        # 発注ロット単位
 }
+
+# =============================================================================
+# v12追加: Vertex AI AutoML Forecasting 設定
+# =============================================================================
+# 
+# 【設定方法】
+# 1. Google Cloud Console でプロジェクトを作成または選択
+# 2. Vertex AI API を有効化
+# 3. AutoML Forecasting でモデルをトレーニング・デプロイ
+# 4. サービスアカウントを作成し、JSONキーをダウンロード
+# 5. 以下の値を設定
+#
+# 【環境変数での設定も可能】
+# - VERTEX_AI_PROJECT_ID
+# - VERTEX_AI_LOCATION
+# - VERTEX_AI_ENDPOINT_ID
+# - VERTEX_AI_SERVICE_ACCOUNT_FILE
+# =============================================================================
+
+# Google CloudプロジェクトID（例: "my-project-123456"）
+VERTEX_AI_PROJECT_ID = ""
+
+# リージョン（日本の場合は asia-northeast1 推奨）
+VERTEX_AI_LOCATION = "asia-northeast1"
+
+# AutoML ForecastingエンドポイントID
+# デプロイ後にVertex AI Consoleで確認できます（例: "1234567890123456789"）
+VERTEX_AI_ENDPOINT_ID = ""
+
+# サービスアカウントJSONファイルのパス
+# プロジェクトルートからの相対パス、または絶対パス
+VERTEX_AI_SERVICE_ACCOUNT_FILE = "service_account.json"

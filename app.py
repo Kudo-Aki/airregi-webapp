@@ -1,34 +1,657 @@
 """
-Airレジ 売上分析・需要予測 Webアプリ（v9: 高度な需要予測システム）
+Airレジ 売上分析・需要予測 Webアプリ（v12: Vertex AI AutoML Forecasting 完全統合版）
 
-新機能:
-- 内部実績分析（トレンド、季節性、カテゴリー別パフォーマンス）
-- 外部環境分析（天気×売上相関、カレンダー効果、検索トレンド）
-- 市場・顧客分析（ターゲット層別需要、類似商品分析、コンセプト評価）
-- 総合需要予測エンジン（複数要因を統合した高精度予測）
+v11からの変更点:
+1. google.generativeai → google.cloud.aiplatform に変更
+2. APIキー認証 → サービスアカウントJSON認証 に変更
+3. 統計ベース予測 → Vertex AI AutoML Forecastingエンドポイント呼び出し
+4. 共変量（天気、六曜、イベント等）対応
+5. エラーハンドリング強化（API制限、接続エラー対応）
+
+v11からの維持機能:
+- 複数授与品選択時に「合算」「個別」を選択可能
+- 予測期間を「日数指定」「期間指定」で選択可能
+- 新規授与品の需要予測（類似商品ベース）
+- 予測精度ダッシュボード
+- 高度な分析タブ
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 from datetime import date, datetime, timedelta
+from typing import Dict, List, Optional, Tuple, Any
 import plotly.express as px
 import plotly.graph_objects as go
 from collections import defaultdict
 import calendar
 import re
+import os
+import json
+import logging
+
+# ロギング設定
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # モジュールのインポート
 import sys
 sys.path.append('.')
 from modules.data_loader import SheetsDataLoader, aggregate_by_products, merge_with_calendar
 from modules.product_normalizer import ProductNormalizer
-from modules.demand_analyzer import InternalAnalyzer, ExternalAnalyzer, MarketAnalyzer, DemandForecastEngine
 import config
 
+# 高度な分析モジュール（オプショナル）
+try:
+    from modules.demand_analyzer import InternalAnalyzer, ExternalAnalyzer, MarketAnalyzer, DemandForecastEngine
+    ADVANCED_ANALYSIS_AVAILABLE = True
+except ImportError:
+    ADVANCED_ANALYSIS_AVAILABLE = False
+
+
+# =============================================================================
+# Vertex AI AutoML Forecasting 統合
+# =============================================================================
+
+# Vertex AI設定（config.pyまたは環境変数から読み込み）
+VERTEX_AI_CONFIG = {
+    'project_id': getattr(config, 'VERTEX_AI_PROJECT_ID', os.environ.get('VERTEX_AI_PROJECT_ID', '')),
+    'location': getattr(config, 'VERTEX_AI_LOCATION', os.environ.get('VERTEX_AI_LOCATION', 'asia-northeast1')),
+    'endpoint_id': getattr(config, 'VERTEX_AI_ENDPOINT_ID', os.environ.get('VERTEX_AI_ENDPOINT_ID', '')),
+    'service_account_file': getattr(config, 'VERTEX_AI_SERVICE_ACCOUNT_FILE', 
+                                     os.environ.get('VERTEX_AI_SERVICE_ACCOUNT_FILE', 'service_account.json')),
+}
+
+# Vertex AI利用可能フラグ
+VERTEX_AI_AVAILABLE = False
+aiplatform = None
+prediction_service_client = None
+
+try:
+    from google.cloud import aiplatform
+    from google.cloud.aiplatform.gapic.schema import predict as predict_schema
+    from google.protobuf import json_format
+    from google.protobuf.struct_pb2 import Value
+    from google.oauth2 import service_account
+    from google.api_core import exceptions as google_exceptions
+    
+    # サービスアカウント認証
+    if os.path.exists(VERTEX_AI_CONFIG['service_account_file']):
+        credentials = service_account.Credentials.from_service_account_file(
+            VERTEX_AI_CONFIG['service_account_file'],
+            scopes=['https://www.googleapis.com/auth/cloud-platform']
+        )
+        
+        # Vertex AI初期化
+        if VERTEX_AI_CONFIG['project_id'] and VERTEX_AI_CONFIG['endpoint_id']:
+            aiplatform.init(
+                project=VERTEX_AI_CONFIG['project_id'],
+                location=VERTEX_AI_CONFIG['location'],
+                credentials=credentials
+            )
+            VERTEX_AI_AVAILABLE = True
+            logger.info("Vertex AI AutoML Forecasting: 初期化成功")
+        else:
+            logger.warning("Vertex AI: project_idまたはendpoint_idが設定されていません")
+    else:
+        logger.warning(f"Vertex AI: サービスアカウントファイルが見つかりません: {VERTEX_AI_CONFIG['service_account_file']}")
+        
+except ImportError as e:
+    logger.warning(f"Vertex AI SDKがインストールされていません: {e}")
+except Exception as e:
+    logger.error(f"Vertex AI初期化エラー: {e}")
+
+
+class VertexAIForecaster:
+    """Vertex AI AutoML Forecastingエンドポイントを呼び出すクラス"""
+    
+    def __init__(self):
+        self.project_id = VERTEX_AI_CONFIG['project_id']
+        self.location = VERTEX_AI_CONFIG['location']
+        self.endpoint_id = VERTEX_AI_CONFIG['endpoint_id']
+        self.endpoint_name = f"projects/{self.project_id}/locations/{self.location}/endpoints/{self.endpoint_id}"
+        self._client = None
+    
+    @property
+    def client(self):
+        """Prediction Service Clientを取得（遅延初期化）"""
+        if self._client is None:
+            from google.cloud.aiplatform_v1.services.prediction_service import PredictionServiceClient
+            from google.cloud.aiplatform_v1.types import PredictRequest
+            
+            client_options = {"api_endpoint": f"{self.location}-aiplatform.googleapis.com"}
+            credentials = service_account.Credentials.from_service_account_file(
+                VERTEX_AI_CONFIG['service_account_file'],
+                scopes=['https://www.googleapis.com/auth/cloud-platform']
+            )
+            self._client = PredictionServiceClient(
+                credentials=credentials,
+                client_options=client_options
+            )
+        return self._client
+    
+    def prepare_forecast_instances(
+        self,
+        historical_data: pd.DataFrame,
+        forecast_horizon: int,
+        product_id: str,
+        covariates: Optional[Dict[str, List]] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Vertex AI Forecasting APIが期待するインスタンス形式を準備
+        
+        Args:
+            historical_data: 過去の売上データ（date, 販売商品数）
+            forecast_horizon: 予測日数
+            product_id: 商品識別子
+            covariates: 将来利用可能な共変量（天気、六曜、イベント等）
+        
+        Returns:
+            APIリクエスト用のインスタンスリスト
+        """
+        df = historical_data.copy()
+        df['date'] = pd.to_datetime(df['date'])
+        df = df.sort_values('date')
+        
+        # 時系列データの準備
+        time_series = []
+        for _, row in df.iterrows():
+            time_series.append({
+                'timestamp': row['date'].strftime('%Y-%m-%dT00:00:00Z'),
+                'target': float(row['販売商品数'])
+            })
+        
+        # 予測期間の準備
+        last_date = df['date'].max()
+        forecast_timestamps = []
+        for i in range(1, forecast_horizon + 1):
+            future_date = last_date + timedelta(days=i)
+            forecast_timestamps.append(future_date.strftime('%Y-%m-%dT00:00:00Z'))
+        
+        # インスタンス構造の構築
+        instance = {
+            'time_series_identifier': product_id,
+            'time_column': 'timestamp',
+            'target_column': 'target',
+            'historical_data': time_series,
+            'forecast_horizon': forecast_horizon,
+            'forecast_timestamps': forecast_timestamps,
+        }
+        
+        # 共変量の追加（天気、六曜、イベント等）
+        if covariates:
+            instance['available_at_forecast_columns'] = list(covariates.keys())
+            
+            # 過去データの共変量
+            if 'historical_covariates' in covariates:
+                instance['historical_covariates'] = covariates['historical_covariates']
+            
+            # 将来データの共変量
+            if 'future_covariates' in covariates:
+                instance['future_covariates'] = covariates['future_covariates']
+        
+        return [instance]
+    
+    def predict(
+        self,
+        historical_data: pd.DataFrame,
+        forecast_horizon: int,
+        product_id: str = "default",
+        covariates: Optional[Dict[str, List]] = None
+    ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+        """
+        Vertex AI AutoML Forecastingエンドポイントに予測リクエストを送信
+        
+        Args:
+            historical_data: 過去の売上データ
+            forecast_horizon: 予測日数
+            product_id: 商品識別子
+            covariates: 共変量データ
+        
+        Returns:
+            予測結果のDataFrameとメタデータ
+        """
+        if not VERTEX_AI_AVAILABLE:
+            raise RuntimeError("Vertex AIが利用できません。設定を確認してください。")
+        
+        try:
+            # インスタンス準備
+            instances = self.prepare_forecast_instances(
+                historical_data, forecast_horizon, product_id, covariates
+            )
+            
+            # Protobuf形式に変換
+            instances_pb = [json_format.ParseDict(inst, Value()) for inst in instances]
+            
+            # 予測リクエスト送信
+            response = self.client.predict(
+                endpoint=self.endpoint_name,
+                instances=instances_pb,
+            )
+            
+            # レスポンス解析
+            predictions = []
+            metadata = {
+                'model_version': getattr(response, 'model_version_id', 'unknown'),
+                'deployed_model_id': getattr(response, 'deployed_model_id', 'unknown'),
+            }
+            
+            last_date = pd.to_datetime(historical_data['date']).max()
+            
+            for i, prediction in enumerate(response.predictions):
+                pred_dict = json_format.MessageToDict(prediction)
+                
+                # 予測値の取得（AutoML Forecastingのレスポンス形式に応じて調整）
+                if 'value' in pred_dict:
+                    pred_value = pred_dict['value']
+                elif 'predicted_target' in pred_dict:
+                    pred_value = pred_dict['predicted_target']
+                else:
+                    # フォールバック: リスト形式の場合
+                    pred_value = list(pred_dict.values())[0] if pred_dict else 0
+                
+                # 予測値が配列の場合の処理
+                if isinstance(pred_value, list):
+                    for j, val in enumerate(pred_value):
+                        predictions.append({
+                            'date': last_date + timedelta(days=j+1),
+                            'predicted': max(0, round(float(val))),
+                            'confidence_lower': pred_dict.get('lower_bound', [None])[j] if isinstance(pred_dict.get('lower_bound'), list) else None,
+                            'confidence_upper': pred_dict.get('upper_bound', [None])[j] if isinstance(pred_dict.get('upper_bound'), list) else None,
+                        })
+                else:
+                    predictions.append({
+                        'date': last_date + timedelta(days=i+1),
+                        'predicted': max(0, round(float(pred_value))),
+                    })
+            
+            return pd.DataFrame(predictions), metadata
+            
+        except google_exceptions.ResourceExhausted as e:
+            logger.error(f"Vertex AI クォータ制限: {e}")
+            raise RuntimeError(f"APIクォータ制限に達しました。しばらく待ってから再試行してください。\n詳細: {e}")
+        
+        except google_exceptions.InvalidArgument as e:
+            logger.error(f"Vertex AI リクエストエラー: {e}")
+            raise RuntimeError(f"リクエスト形式が不正です。\n詳細: {e}")
+        
+        except google_exceptions.NotFound as e:
+            logger.error(f"Vertex AI エンドポイント未発見: {e}")
+            raise RuntimeError(f"指定されたエンドポイントが見つかりません。endpoint_idを確認してください。\n詳細: {e}")
+        
+        except google_exceptions.PermissionDenied as e:
+            logger.error(f"Vertex AI 権限エラー: {e}")
+            raise RuntimeError(f"アクセス権限がありません。サービスアカウントの権限を確認してください。\n詳細: {e}")
+        
+        except Exception as e:
+            logger.error(f"Vertex AI 予測エラー: {e}")
+            raise RuntimeError(f"予測中にエラーが発生しました。\n詳細: {e}")
+
+
+# Vertex AIフォアキャスターのシングルトンインスタンス
+_vertex_ai_forecaster = None
+
+def get_vertex_ai_forecaster() -> Optional[VertexAIForecaster]:
+    """Vertex AIフォアキャスターを取得"""
+    global _vertex_ai_forecaster
+    if VERTEX_AI_AVAILABLE and _vertex_ai_forecaster is None:
+        _vertex_ai_forecaster = VertexAIForecaster()
+    return _vertex_ai_forecaster
+
+
+# =============================================================================
+# 共変量データ生成（天気、六曜、イベント）
+# =============================================================================
+
+def generate_covariates(start_date: date, end_date: date, location: str = "hitachinaka") -> Dict[str, List]:
+    """
+    将来利用可能な共変量データを生成
+    
+    Args:
+        start_date: 開始日
+        end_date: 終了日
+        location: 地域（天気予報用）
+    
+    Returns:
+        共変量データの辞書
+    """
+    covariates = {
+        'future_covariates': []
+    }
+    
+    current_date = start_date
+    while current_date <= end_date:
+        covariate_entry = {
+            'timestamp': current_date.strftime('%Y-%m-%dT00:00:00Z'),
+            'weekday': current_date.weekday(),  # 0=月曜, 6=日曜
+            'is_weekend': 1 if current_date.weekday() >= 5 else 0,
+            'month': current_date.month,
+            'day_of_month': current_date.day,
+        }
+        
+        # 六曜（簡易計算）
+        rokuyou_list = ['大安', '赤口', '先勝', '友引', '先負', '仏滅']
+        rokuyou_idx = (current_date.year + current_date.month + current_date.day) % 6
+        covariate_entry['rokuyou'] = rokuyou_idx
+        covariate_entry['is_taian'] = 1 if rokuyou_list[rokuyou_idx] == '大安' else 0
+        
+        # 特別期間フラグ
+        covariate_entry['is_new_year'] = 1 if (current_date.month == 1 and current_date.day <= 7) else 0
+        covariate_entry['is_obon'] = 1 if (current_date.month == 8 and 13 <= current_date.day <= 16) else 0
+        covariate_entry['is_shichigosan'] = 1 if (current_date.month == 11 and 10 <= current_date.day <= 20) else 0
+        covariate_entry['is_golden_week'] = 1 if (current_date.month == 5 and 3 <= current_date.day <= 5) else 0
+        
+        covariates['future_covariates'].append(covariate_entry)
+        current_date += timedelta(days=1)
+    
+    return covariates
+
+
+# =============================================================================
+# 予測関数（Vertex AI + フォールバック）
+# =============================================================================
+
+def get_vertex_ai_prediction(
+    df: pd.DataFrame,
+    periods: int,
+    product_id: str = "default",
+    use_covariates: bool = True
+) -> Tuple[pd.DataFrame, bool, str]:
+    """
+    Vertex AI AutoML Forecastingによる予測（フォールバック付き）
+    
+    Args:
+        df: 売上データ（date, 販売商品数）
+        periods: 予測日数
+        product_id: 商品識別子
+        use_covariates: 共変量を使用するか
+    
+    Returns:
+        予測DataFrame, Vertex AI使用フラグ, メッセージ
+    """
+    forecaster = get_vertex_ai_forecaster()
+    
+    if forecaster is None:
+        # Vertex AIが利用不可の場合はフォールバック
+        return forecast_with_seasonality_fallback(df, periods), False, "Vertex AI未設定のため、統計モデルで予測"
+    
+    try:
+        # 共変量の準備
+        covariates = None
+        if use_covariates:
+            last_date = pd.to_datetime(df['date']).max()
+            start_date = (last_date + timedelta(days=1)).date()
+            end_date = (last_date + timedelta(days=periods)).date()
+            covariates = generate_covariates(start_date, end_date)
+        
+        # Vertex AI予測
+        predictions, metadata = forecaster.predict(
+            historical_data=df,
+            forecast_horizon=periods,
+            product_id=product_id,
+            covariates=covariates
+        )
+        
+        return predictions, True, f"Vertex AI AutoML Forecasting (モデル: {metadata.get('deployed_model_id', 'N/A')})"
+        
+    except RuntimeError as e:
+        # エラー時はフォールバック
+        logger.warning(f"Vertex AI予測失敗、フォールバック実行: {e}")
+        return forecast_with_seasonality_fallback(df, periods), False, f"Vertex AIエラー: {str(e)[:100]}... 統計モデルで予測"
+    except Exception as e:
+        logger.error(f"予測エラー: {e}")
+        return forecast_with_seasonality_fallback(df, periods), False, f"エラー: {str(e)[:100]}... 統計モデルで予測"
+
+
+def forecast_with_seasonality_fallback(df: pd.DataFrame, periods: int) -> pd.DataFrame:
+    """
+    フォールバック用の季節性考慮予測（統計ベース）
+    
+    Vertex AIが利用できない場合に使用
+    """
+    df = df.copy()
+    df['date'] = pd.to_datetime(df['date'])
+    df = df.sort_values('date')
+    
+    overall_mean = df['販売商品数'].mean()
+    
+    if pd.isna(overall_mean) or overall_mean == 0:
+        overall_mean = 1
+    
+    # 曜日係数
+    df['weekday'] = df['date'].dt.dayofweek
+    weekday_means = df.groupby('weekday')['販売商品数'].mean()
+    weekday_factor = {}
+    for wd in range(7):
+        if wd in weekday_means.index and weekday_means[wd] > 0:
+            weekday_factor[wd] = weekday_means[wd] / overall_mean
+        else:
+            weekday_factor[wd] = 1.0
+    
+    # 月係数
+    df['month'] = df['date'].dt.month
+    month_means = df.groupby('month')['販売商品数'].mean()
+    month_factor = {}
+    for m in range(1, 13):
+        if m in month_means.index and month_means[m] > 0:
+            month_factor[m] = month_means[m] / overall_mean
+        else:
+            month_factor[m] = 1.0
+    
+    # 予測
+    last_date = df['date'].max()
+    future_dates = pd.date_range(start=last_date + timedelta(days=1), periods=periods, freq='D')
+    
+    predictions = []
+    for d in future_dates:
+        weekday_f = weekday_factor.get(d.dayofweek, 1.0)
+        month_f = month_factor.get(d.month, 1.0)
+        
+        # 特別期間の調整
+        special_factor = 1.0
+        if d.month == 1 and d.day <= 7:  # 正月
+            special_factor = 3.0
+        elif d.month == 8 and 13 <= d.day <= 16:  # お盆
+            special_factor = 1.5
+        elif d.month == 11 and 10 <= d.day <= 20:  # 七五三
+            special_factor = 1.3
+        
+        pred = overall_mean * weekday_f * month_f * special_factor
+        pred = max(0.1, pred)
+        
+        predictions.append({
+            'date': d,
+            'predicted': round(pred)
+        })
+    
+    return pd.DataFrame(predictions)
+
+
+# =============================================================================
+# 予測方法の統合（Vertex AI対応）
+# =============================================================================
+
+def forecast_with_vertex_ai(
+    df: pd.DataFrame,
+    periods: int,
+    method: str = "Vertex AI",
+    product_id: str = "default"
+) -> Tuple[pd.DataFrame, str]:
+    """
+    予測方法に応じた予測を実行
+    
+    Args:
+        df: 売上データ
+        periods: 予測日数
+        method: 予測方法
+        product_id: 商品識別子
+    
+    Returns:
+        予測DataFrame, 使用した予測方法の説明
+    """
+    if method == "🚀 Vertex AI（推奨）":
+        predictions, used_vertex_ai, message = get_vertex_ai_prediction(df, periods, product_id, use_covariates=True)
+        return predictions, message
+    
+    elif method == "移動平均法（シンプル）":
+        return forecast_moving_average(df, periods), "移動平均法（統計モデル）"
+    
+    elif method == "季節性考慮（統計）":
+        return forecast_with_seasonality_fallback(df, periods), "季節性考慮（統計モデル）"
+    
+    elif method == "指数平滑法":
+        return forecast_exponential_smoothing(df, periods), "指数平滑法（統計モデル）"
+    
+    else:
+        # デフォルトはVertex AI
+        predictions, used_vertex_ai, message = get_vertex_ai_prediction(df, periods, product_id, use_covariates=True)
+        return predictions, message
+
+
+def forecast_moving_average(df: pd.DataFrame, periods: int, window: int = 30) -> pd.DataFrame:
+    """移動平均法による予測"""
+    df = df.copy()
+    df['date'] = pd.to_datetime(df['date'])
+    df = df.sort_values('date')
+    
+    recent_data = df.tail(window)
+    base_mean = recent_data['販売商品数'].mean()
+    
+    if pd.isna(base_mean) or base_mean <= 0:
+        base_mean = 1.0
+    
+    last_date = df['date'].max()
+    future_dates = pd.date_range(start=last_date + timedelta(days=1), periods=periods, freq='D')
+    
+    predictions = []
+    for d in future_dates:
+        pred = max(0.1, base_mean)
+        predictions.append({
+            'date': d,
+            'predicted': round(pred)
+        })
+    
+    return pd.DataFrame(predictions)
+
+
+def forecast_exponential_smoothing(df: pd.DataFrame, periods: int, alpha: float = 0.3) -> pd.DataFrame:
+    """指数平滑法による予測"""
+    df = df.copy()
+    df['date'] = pd.to_datetime(df['date'])
+    df = df.sort_values('date')
+    
+    values = df['販売商品数'].values
+    
+    if len(values) == 0:
+        return pd.DataFrame({'date': [], 'predicted': []})
+    
+    smoothed = [values[0]]
+    for i in range(1, len(values)):
+        smoothed_value = alpha * values[i] + (1 - alpha) * smoothed[-1]
+        smoothed.append(smoothed_value)
+    
+    base_prediction = smoothed[-1] if smoothed else 1.0
+    
+    if pd.isna(base_prediction) or base_prediction <= 0:
+        base_prediction = 1.0
+    
+    if len(smoothed) >= 7:
+        recent_trend = (smoothed[-1] - smoothed[-7]) / 7
+    else:
+        recent_trend = 0
+    
+    last_date = df['date'].max()
+    future_dates = pd.date_range(start=last_date + timedelta(days=1), periods=periods, freq='D')
+    
+    predictions = []
+    for i, d in enumerate(future_dates):
+        decay_factor = 0.95 ** i
+        pred = base_prediction + (recent_trend * i * decay_factor)
+        pred = max(0.1, pred)
+        
+        predictions.append({
+            'date': d,
+            'predicted': round(pred)
+        })
+    
+    return pd.DataFrame(predictions)
+
+
+def forecast_all_methods_with_vertex_ai(df: pd.DataFrame, periods: int, product_id: str = "default") -> Dict[str, Tuple[pd.DataFrame, str]]:
+    """
+    すべての予測方法で予測を実行（Vertex AI含む）
+    """
+    results = {}
+    
+    # Vertex AI予測
+    if VERTEX_AI_AVAILABLE:
+        predictions, used_vertex_ai, message = get_vertex_ai_prediction(df, periods, product_id)
+        results['Vertex AI'] = (predictions, message)
+    
+    # 統計モデル予測
+    results['季節性考慮'] = (forecast_with_seasonality_fallback(df, periods), "季節性考慮（統計モデル）")
+    results['移動平均法'] = (forecast_moving_average(df, periods), "移動平均法（統計モデル）")
+    results['指数平滑法'] = (forecast_exponential_smoothing(df, periods), "指数平滑法（統計モデル）")
+    
+    return results
+
+
+# =============================================================================
+# 予測方法の定義（v12更新）
+# =============================================================================
+
+FORECAST_METHODS = {
+    "🚀 Vertex AI（推奨）": {
+        "description": "Google Cloud AutoML Forecastingによる高精度予測。天気・六曜・イベントを考慮。",
+        "icon": "🚀",
+        "color": "#4285F4",
+        "requires_vertex_ai": True
+    },
+    "季節性考慮（統計）": {
+        "description": "月別・曜日別の傾向と特別期間を考慮した統計モデル。Vertex AI未設定時の推奨。",
+        "icon": "📈",
+        "color": "#4CAF50",
+        "requires_vertex_ai": False
+    },
+    "移動平均法（シンプル）": {
+        "description": "過去30日間の平均値をベースに予測。安定した商品向け。",
+        "icon": "📊",
+        "color": "#1E88E5",
+        "requires_vertex_ai": False
+    },
+    "指数平滑法": {
+        "description": "直近のデータを重視した予測。トレンドの変化に敏感。",
+        "icon": "📉",
+        "color": "#FF9800",
+        "requires_vertex_ai": False
+    },
+    "🔄 すべての方法で比較": {
+        "description": "Vertex AIと統計モデルすべてで予測し、結果を比較します。",
+        "icon": "🔄",
+        "color": "#9C27B0",
+        "requires_vertex_ai": False
+    }
+}
+
+# カテゴリー別の特性（新規授与品予測用）
+CATEGORY_CHARACTERISTICS = {
+    "お守り": {"seasonality": "high", "base_daily": 3.0, "price_range": (500, 1500)},
+    "御朱印": {"seasonality": "medium", "base_daily": 5.0, "price_range": (300, 500)},
+    "御朱印帳": {"seasonality": "low", "base_daily": 1.0, "price_range": (1500, 3000)},
+    "おみくじ": {"seasonality": "high", "base_daily": 10.0, "price_range": (100, 300)},
+    "絵馬": {"seasonality": "high", "base_daily": 2.0, "price_range": (500, 1000)},
+    "お札": {"seasonality": "high", "base_daily": 1.5, "price_range": (500, 3000)},
+    "縁起物": {"seasonality": "medium", "base_daily": 1.0, "price_range": (500, 5000)},
+    "その他": {"seasonality": "low", "base_daily": 0.5, "price_range": (500, 2000)},
+}
+
+
+# =============================================================================
 # ページ設定
+# =============================================================================
+
 st.set_page_config(
-    page_title="Airレジ 売上分析",
+    page_title="Airレジ 売上分析（Vertex AI版）",
     page_icon="⛩️",
     layout="wide",
     initial_sidebar_state="collapsed"
@@ -51,6 +674,16 @@ st.markdown("""
         padding-bottom: 0.5rem;
         margin: 1.5rem 0 1rem 0;
     }
+    .accuracy-good { color: #4CAF50; font-weight: bold; }
+    .accuracy-medium { color: #FF9800; font-weight: bold; }
+    .accuracy-poor { color: #F44336; font-weight: bold; }
+    .new-product-card {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        border-radius: 15px;
+        padding: 20px;
+        color: white;
+        margin: 10px 0;
+    }
     .analysis-card {
         background: linear-gradient(135deg, #f5f7fa 0%, #e4e8eb 100%);
         border-radius: 10px;
@@ -58,31 +691,120 @@ st.markdown("""
         margin: 10px 0;
         border-left: 4px solid #1E88E5;
     }
-    .score-card {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        border-radius: 15px;
-        padding: 20px;
-        color: white;
-        text-align: center;
+    .method-card {
+        background: #f8f9fa;
+        border-radius: 8px;
+        padding: 12px;
+        margin: 8px 0;
+        border-left: 3px solid;
     }
-    .strength-item {
-        background-color: #e8f5e9;
-        border-left: 3px solid #4CAF50;
-        padding: 8px 12px;
-        margin: 5px 0;
-        border-radius: 0 5px 5px 0;
+    .method-vertex-ai { border-left-color: #4285F4; background: #e8f0fe; }
+    .method-seasonality { border-left-color: #4CAF50; }
+    .method-moving-avg { border-left-color: #1E88E5; }
+    .method-exponential { border-left-color: #FF9800; }
+    .vertex-ai-status {
+        padding: 10px 15px;
+        border-radius: 8px;
+        margin: 10px 0;
     }
-    .weakness-item {
-        background-color: #ffebee;
-        border-left: 3px solid #f44336;
-        padding: 8px 12px;
-        margin: 5px 0;
-        border-radius: 0 5px 5px 0;
+    .vertex-ai-available {
+        background: #e8f5e9;
+        border: 1px solid #4CAF50;
+        color: #2e7d32;
     }
-    .metric-highlight {
-        font-size: 2rem;
+    .vertex-ai-unavailable {
+        background: #fff3e0;
+        border: 1px solid #FF9800;
+        color: #e65100;
+    }
+    .individual-product-box {
+        background: #f0f8ff;
+        border-radius: 10px;
+        padding: 15px;
+        margin: 10px 0;
+        border: 1px solid #1E88E5;
+    }
+    
+    /* スマホ対応レスポンシブCSS */
+    @media screen and (max-width: 768px) {
+        .main-header {
+            font-size: 1.5rem;
+        }
+        .section-header {
+            font-size: 1.2rem;
+        }
+        /* Streamlitのカラムを縦並びに */
+        [data-testid="column"] {
+            width: 100% !important;
+            flex: 1 1 100% !important;
+            min-width: 100% !important;
+        }
+        /* メトリクスを小さく */
+        [data-testid="metric-container"] {
+            padding: 10px 5px;
+        }
+        [data-testid="metric-container"] > div {
+            font-size: 0.9rem;
+        }
+        [data-testid="stMetricValue"] {
+            font-size: 1.2rem !important;
+        }
+        /* タブのフォントサイズ調整 */
+        .stTabs [data-baseweb="tab"] {
+            font-size: 0.8rem;
+            padding: 8px 12px;
+        }
+        /* ボタンの幅を100%に */
+        .stButton > button {
+            width: 100%;
+        }
+        /* セレクトボックスのフォントサイズ */
+        .stSelectbox label {
+            font-size: 0.85rem;
+        }
+        /* 期間選択を縦並びに */
+        .stSelectbox {
+            margin-bottom: 5px;
+        }
+        /* カード内のテキスト調整 */
+        .analysis-card, .method-card {
+            padding: 10px;
+            font-size: 0.9rem;
+        }
+        /* グラフのマージン調整 */
+        .js-plotly-plot {
+            margin: 0 -15px;
+        }
+    }
+    
+    /* タブレット対応 */
+    @media screen and (min-width: 769px) and (max-width: 1024px) {
+        .main-header {
+            font-size: 2rem;
+        }
+        [data-testid="column"] {
+            min-width: 45% !important;
+        }
+    }
+    
+    /* 選択中の授与品の削除ボタン */
+    .product-tag {
+        display: inline-flex;
+        align-items: center;
+        background: #e3f2fd;
+        border-radius: 20px;
+        padding: 5px 12px;
+        margin: 3px;
+        font-size: 0.9rem;
+    }
+    .product-tag-remove {
+        margin-left: 8px;
+        cursor: pointer;
+        color: #666;
         font-weight: bold;
-        color: #1E88E5;
+    }
+    .product-tag-remove:hover {
+        color: #f44336;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -102,6 +824,14 @@ if 'forecast_data' not in st.session_state:
     st.session_state.forecast_data = None
 if 'forecast_total' not in st.session_state:
     st.session_state.forecast_total = 0
+if 'forecast_results' not in st.session_state:
+    st.session_state.forecast_results = {}
+if 'analysis_mode' not in st.session_state:
+    st.session_state.analysis_mode = "合算"
+if 'individual_sales_data' not in st.session_state:
+    st.session_state.individual_sales_data = {}
+if 'last_forecast_method' not in st.session_state:
+    st.session_state.last_forecast_method = ""
 
 
 # =============================================================================
@@ -114,6 +844,20 @@ def round_up_to_50(value: int) -> int:
         return 0
     return ((value + 49) // 50) * 50
 
+
+def get_available_forecast_methods() -> List[str]:
+    """利用可能な予測方法のリストを取得"""
+    methods = []
+    for method_name, method_info in FORECAST_METHODS.items():
+        if method_info.get('requires_vertex_ai', False) and not VERTEX_AI_AVAILABLE:
+            continue
+        methods.append(method_name)
+    return methods
+
+
+# =============================================================================
+# データ初期化
+# =============================================================================
 
 def init_data():
     """データを初期化"""
@@ -157,6 +901,9 @@ def build_categories():
     if category_col is None and len(df_items.columns) >= 4:
         category_col = df_items.columns[3]
     
+    if category_col is None:
+        return
+    
     product_col = None
     for col in df_items.columns:
         if '商品名' in col or col == '商品' or col == 'product':
@@ -166,7 +913,7 @@ def build_categories():
     if product_col is None and len(df_items.columns) >= 3:
         product_col = df_items.columns[2]
     
-    if category_col is None or product_col is None:
+    if product_col is None:
         return
     
     for _, row in df_items[[product_col, category_col]].drop_duplicates().iterrows():
@@ -184,6 +931,10 @@ def build_categories():
     st.session_state.categories = dict(categories)
 
 
+# =============================================================================
+# ヘッダー
+# =============================================================================
+
 def render_header():
     """ヘッダーを描画"""
     col1, col2 = st.columns([4, 1])
@@ -198,7 +949,24 @@ def render_header():
             st.session_state.selected_products = []
             st.session_state.sales_data = None
             st.session_state.forecast_data = None
+            st.session_state.forecast_results = {}
+            st.session_state.individual_sales_data = {}
             st.rerun()
+    
+    # Vertex AIステータス表示
+    if VERTEX_AI_AVAILABLE:
+        st.markdown(f"""
+        <div class="vertex-ai-status vertex-ai-available">
+            ✅ <strong>Vertex AI AutoML Forecasting:</strong> 接続済み
+            （プロジェクト: {VERTEX_AI_CONFIG['project_id']}, リージョン: {VERTEX_AI_CONFIG['location']}）
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.markdown("""
+        <div class="vertex-ai-status vertex-ai-unavailable">
+            ⚠️ <strong>Vertex AI:</strong> 未設定（統計モデルで予測します）
+        </div>
+        """, unsafe_allow_html=True)
     
     if st.session_state.data_loader:
         min_date, max_date = st.session_state.data_loader.get_date_range()
@@ -212,43 +980,220 @@ def render_header():
 
 def render_main_tabs():
     """メインタブを描画"""
-    tab1, tab2, tab3 = st.tabs([
+    tab_labels = [
         "📊 既存授与品の分析・予測",
-        "✨ 新規授与品の需要予測（高度版）",
-        "📈 予測精度ダッシュボード"
-    ])
+        "✨ 新規授与品の需要予測",
+        "⚙️ Vertex AI設定",
+    ]
     
-    with tab1:
+    if ADVANCED_ANALYSIS_AVAILABLE:
+        tab_labels.append("🔬 高度な分析")
+    
+    tab_labels.append("📈 予測精度ダッシュボード")
+    
+    tabs = st.tabs(tab_labels)
+    
+    tab_idx = 0
+    
+    with tabs[tab_idx]:
         render_existing_product_analysis()
+    tab_idx += 1
     
-    with tab2:
-        render_advanced_new_product_forecast()
+    with tabs[tab_idx]:
+        render_new_product_forecast()
+    tab_idx += 1
     
-    with tab3:
+    with tabs[tab_idx]:
+        render_vertex_ai_settings()
+    tab_idx += 1
+    
+    if ADVANCED_ANALYSIS_AVAILABLE:
+        with tabs[tab_idx]:
+            render_advanced_analysis()
+        tab_idx += 1
+    
+    with tabs[tab_idx]:
         render_accuracy_dashboard()
 
 
 # =============================================================================
-# 既存授与品の分析（従来機能 + 高度分析）
+# Vertex AI設定タブ
+# =============================================================================
+
+def render_vertex_ai_settings():
+    """Vertex AI設定タブ"""
+    st.markdown('<p class="section-header">⚙️ Vertex AI AutoML Forecasting 設定</p>', unsafe_allow_html=True)
+    
+    # 現在の設定状況
+    st.write("### 📋 現在の設定状況")
+    
+    config_status = {
+        'プロジェクトID': VERTEX_AI_CONFIG['project_id'] or '未設定',
+        'リージョン': VERTEX_AI_CONFIG['location'] or '未設定',
+        'エンドポイントID': VERTEX_AI_CONFIG['endpoint_id'] or '未設定',
+        'サービスアカウントファイル': VERTEX_AI_CONFIG['service_account_file'],
+        'ファイル存在': '✅ あり' if os.path.exists(VERTEX_AI_CONFIG['service_account_file']) else '❌ なし',
+        'Vertex AI利用可能': '✅ はい' if VERTEX_AI_AVAILABLE else '❌ いいえ',
+    }
+    
+    for key, value in config_status.items():
+        st.write(f"- **{key}**: {value}")
+    
+    st.divider()
+    
+    # 設定方法の説明
+    st.write("### 🔧 設定方法")
+    
+    st.markdown("""
+    **方法1: 環境変数で設定**
+    ```bash
+    export VERTEX_AI_PROJECT_ID="your-project-id"
+    export VERTEX_AI_LOCATION="asia-northeast1"
+    export VERTEX_AI_ENDPOINT_ID="your-endpoint-id"
+    export VERTEX_AI_SERVICE_ACCOUNT_FILE="path/to/service_account.json"
+    ```
+    
+    **方法2: config.pyで設定**
+    ```python
+    # config.py
+    VERTEX_AI_PROJECT_ID = "your-project-id"
+    VERTEX_AI_LOCATION = "asia-northeast1"
+    VERTEX_AI_ENDPOINT_ID = "your-endpoint-id"
+    VERTEX_AI_SERVICE_ACCOUNT_FILE = "service_account.json"
+    ```
+    """)
+    
+    st.divider()
+    
+    # AutoML Forecastingモデルの作成手順
+    st.write("### 📚 AutoML Forecastingモデルの作成手順")
+    
+    with st.expander("1️⃣ データの準備", expanded=False):
+        st.markdown("""
+        Vertex AI AutoML Forecastingに必要なデータ形式：
+        
+        | カラム | 説明 | 例 |
+        |--------|------|-----|
+        | timestamp | 時間列（ISO形式） | 2025-01-01T00:00:00Z |
+        | target | 予測対象（販売数） | 15 |
+        | time_series_identifier | 系列識別子（商品ID等） | product_001 |
+        | weekday | 曜日（共変量） | 0-6 |
+        | is_holiday | 休日フラグ（共変量） | 0 or 1 |
+        | weather | 天気（共変量） | sunny, rainy, etc. |
+        """)
+    
+    with st.expander("2️⃣ モデルのトレーニング", expanded=False):
+        st.markdown("""
+        1. [Google Cloud Console](https://console.cloud.google.com/vertex-ai) にアクセス
+        2. 「データセット」→「作成」→「時系列予測」を選択
+        3. CSVをアップロードし、カラムを設定
+        4. 「トレーニング」→「AutoML」を選択
+        5. トレーニング完了を待つ（数時間〜）
+        """)
+    
+    with st.expander("3️⃣ エンドポイントのデプロイ", expanded=False):
+        st.markdown("""
+        1. トレーニング済みモデルを選択
+        2. 「デプロイとテスト」→「エンドポイントにデプロイ」
+        3. エンドポイント名を設定してデプロイ
+        4. デプロイ完了後、エンドポイントIDをコピー
+        """)
+    
+    with st.expander("4️⃣ サービスアカウントの設定", expanded=False):
+        st.markdown("""
+        1. 「IAMと管理」→「サービスアカウント」
+        2. 「サービスアカウントを作成」
+        3. 以下のロールを付与：
+           - Vertex AI ユーザー
+           - Vertex AI 予測ユーザー
+        4. 「鍵を作成」→ JSON形式でダウンロード
+        5. ダウンロードしたファイルをプロジェクトフォルダに配置
+        """)
+    
+    # 接続テスト
+    st.divider()
+    st.write("### 🧪 接続テスト")
+    
+    if st.button("🔍 Vertex AI接続をテスト", type="primary"):
+        if not VERTEX_AI_AVAILABLE:
+            st.error("Vertex AIが設定されていません。上記の設定を完了してください。")
+        else:
+            with st.spinner("接続テスト中..."):
+                try:
+                    forecaster = get_vertex_ai_forecaster()
+                    # 簡単なテストデータで接続確認
+                    test_df = pd.DataFrame({
+                        'date': pd.date_range(start='2025-01-01', periods=30, freq='D'),
+                        '販売商品数': np.random.randint(1, 10, 30)
+                    })
+                    predictions, metadata = forecaster.predict(test_df, 7, "test_product")
+                    st.success(f"✅ 接続成功！モデルID: {metadata.get('deployed_model_id', 'N/A')}")
+                    st.write("テスト予測結果:")
+                    st.dataframe(predictions.head())
+                except Exception as e:
+                    st.error(f"❌ 接続エラー: {e}")
+
+
+# =============================================================================
+# 既存授与品の分析
 # =============================================================================
 
 def render_existing_product_analysis():
     """既存授与品の分析・予測"""
     render_product_selection()
     start_date, end_date = render_period_selection()
-    sales_data = render_sales_analysis(start_date, end_date)
     
-    if sales_data is not None and not sales_data.empty:
-        render_advanced_analysis(sales_data)
+    if len(st.session_state.selected_products) > 1:
+        render_analysis_mode_selection()
     
-    render_forecast_section(sales_data)
-    render_delivery_section()
+    if st.session_state.analysis_mode == "個別":
+        render_individual_analysis(start_date, end_date)
+    else:
+        sales_data = render_sales_analysis(start_date, end_date)
+        render_forecast_section(sales_data)
+        render_delivery_section()
+
+
+def render_analysis_mode_selection():
+    """合算/個別モードの選択"""
+    st.markdown('<p class="section-header">📊 分析モード</p>', unsafe_allow_html=True)
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        mode = st.radio(
+            "複数授与品の分析方法",
+            ["合算", "個別"],
+            index=0 if st.session_state.analysis_mode == "合算" else 1,
+            horizontal=True,
+            help="合算：選択した授与品の合計を分析\n個別：授与品ごとに別々に分析"
+        )
+        st.session_state.analysis_mode = mode
+    
+    with col2:
+        if mode == "合算":
+            st.info(f"📊 {len(st.session_state.selected_products)}件の授与品を**合計**して分析します")
+        else:
+            st.info(f"📊 {len(st.session_state.selected_products)}件の授与品を**個別**に分析します")
 
 
 def render_product_selection():
     """授与品選択セクション"""
     st.markdown('<p class="section-header">① 授与品を選ぶ</p>', unsafe_allow_html=True)
     
+    tab1, tab2 = st.tabs(["🔍 名前で検索", "📁 カテゴリーから選ぶ"])
+    
+    with tab1:
+        render_search_tab()
+    
+    with tab2:
+        render_category_tab()
+    
+    render_selected_products()
+
+
+def render_search_tab():
+    """名前検索タブ"""
     search_query = st.text_input(
         "授与品名を入力",
         placeholder="例: 金運、お守り、御朱印帳...",
@@ -261,26 +1206,109 @@ def render_product_selection():
         if results:
             st.write(f"**{len(results)}件** 見つかりました")
             
-            cols = st.columns(4)
+            cols = st.columns(3)
             for i, result in enumerate(results):
                 name = result['normalized_name']
+                bracket = result.get('bracket_content', '')
                 
-                with cols[i % 4]:
+                with cols[i % 3]:
                     is_selected = name in st.session_state.selected_products
+                    label = f"{name}"
+                    if bracket:
+                        label += f" ({bracket})"
                     
-                    if st.checkbox(name, value=is_selected, key=f"search_{name}"):
+                    if st.checkbox(label, value=is_selected, key=f"search_{name}"):
                         if name not in st.session_state.selected_products:
                             st.session_state.selected_products.append(name)
                     else:
                         if name in st.session_state.selected_products:
                             st.session_state.selected_products.remove(name)
+        else:
+            st.info("該当する授与品が見つかりませんでした")
+
+
+def render_category_tab():
+    """カテゴリー選択タブ"""
+    if not st.session_state.categories:
+        st.info("カテゴリー情報がありません")
+        return
+    
+    st.write("**カテゴリーを選択して一括追加：**")
+    
+    cols = st.columns(4)
+    
+    sorted_categories = sorted(
+        st.session_state.categories.items(),
+        key=lambda x: len(x[1]),
+        reverse=True
+    )
+    
+    for i, (category, products) in enumerate(sorted_categories[:12]):
+        with cols[i % 4]:
+            if st.button(f"📁 {category} ({len(products)}件)", key=f"cat_{category}"):
+                for p in products:
+                    if p not in st.session_state.selected_products:
+                        st.session_state.selected_products.append(p)
+                st.rerun()
+
+
+def render_selected_products():
+    """選択中の授与品を表示（個別削除ボタン付き）"""
+    st.divider()
     
     if st.session_state.selected_products:
-        st.info(f"✅ 選択中: {', '.join(st.session_state.selected_products[:5])}{'...' if len(st.session_state.selected_products) > 5 else ''}")
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            st.write(f"**✅ 選択中の授与品（{len(st.session_state.selected_products)}件）**")
+        with col2:
+            if st.button("🗑️ すべてクリア", key="clear_all_products"):
+                st.session_state.selected_products.clear()
+                st.session_state.analysis_mode = "合算"
+                st.session_state.sales_data = None
+                st.session_state.forecast_data = None
+                st.session_state.individual_sales_data = {}
+                st.rerun()
         
-        if st.button("🗑️ クリア"):
-            st.session_state.selected_products = []
+        # 個別削除可能な授与品リスト表示
+        st.markdown("""
+        <div style="background: #e3f2fd; border-radius: 10px; padding: 15px; margin: 10px 0;">
+        """, unsafe_allow_html=True)
+        
+        # 削除対象を追跡
+        products_to_remove = []
+        
+        # 3列で表示（スマホでは1列になる）
+        cols_per_row = 3
+        products = st.session_state.selected_products.copy()
+        
+        for i in range(0, len(products), cols_per_row):
+            cols = st.columns(cols_per_row)
+            for j, col in enumerate(cols):
+                idx = i + j
+                if idx < len(products):
+                    product = products[idx]
+                    with col:
+                        col_inner1, col_inner2 = st.columns([4, 1])
+                        with col_inner1:
+                            st.markdown(f"📦 **{product}**")
+                        with col_inner2:
+                            if st.button("✕", key=f"remove_{idx}_{product}", help=f"{product}を削除"):
+                                products_to_remove.append(product)
+        
+        st.markdown("</div>", unsafe_allow_html=True)
+        
+        # 削除処理
+        if products_to_remove:
+            for product in products_to_remove:
+                if product in st.session_state.selected_products:
+                    st.session_state.selected_products.remove(product)
+            # 個別データもクリア
+            st.session_state.sales_data = None
+            st.session_state.forecast_data = None
+            st.session_state.individual_sales_data = {}
             st.rerun()
+    else:
+        st.warning("👆 上から授与品を選んでください")
 
 
 def render_period_selection():
@@ -289,30 +1317,98 @@ def render_period_selection():
     
     today = date.today()
     
-    col1, col2, col3 = st.columns(3)
+    col1, col2 = st.columns([1, 3])
     
     with col1:
         preset = st.selectbox(
             "プリセット",
-            ["過去1年", "過去6ヶ月", "過去3ヶ月", "過去2年", "全期間"],
-            index=0
+            ["カスタム", "過去1ヶ月", "過去3ヶ月", "過去6ヶ月", "過去1年", "過去2年", "全期間"],
+            index=4
         )
     
-    presets = {
-        "過去1年": (today - timedelta(days=365), today),
-        "過去6ヶ月": (today - timedelta(days=180), today),
-        "過去3ヶ月": (today - timedelta(days=90), today),
-        "過去2年": (today - timedelta(days=730), today),
-        "全期間": (date(2022, 8, 1), today)
-    }
-    
-    default_start, default_end = presets[preset]
+    if preset == "過去1ヶ月":
+        default_start = today - timedelta(days=30)
+        default_end = today
+    elif preset == "過去3ヶ月":
+        default_start = today - timedelta(days=90)
+        default_end = today
+    elif preset == "過去6ヶ月":
+        default_start = today - timedelta(days=180)
+        default_end = today
+    elif preset == "過去1年":
+        default_start = today - timedelta(days=365)
+        default_end = today
+    elif preset == "過去2年":
+        default_start = today - timedelta(days=730)
+        default_end = today
+    elif preset == "全期間":
+        default_start = date(2022, 8, 1)
+        default_end = today
+    else:
+        default_start = today - timedelta(days=365)
+        default_end = today
     
     with col2:
-        start_date = st.date_input("開始日", value=default_start)
+        st.write("**期間指定**")
+        
+        col_s1, col_s2, col_s3, col_e1, col_e2, col_e3 = st.columns([1, 1, 1, 1, 1, 1])
+        
+        with col_s1:
+            start_year = st.selectbox(
+                "開始年",
+                list(range(2022, 2028)),
+                index=list(range(2022, 2028)).index(default_start.year) if default_start.year in range(2022, 2028) else 0,
+                key="start_year"
+            )
+        with col_s2:
+            start_month = st.selectbox(
+                "開始月",
+                list(range(1, 13)),
+                index=default_start.month - 1,
+                format_func=lambda x: f"{x}月",
+                key="start_month"
+            )
+        with col_s3:
+            max_day_start = calendar.monthrange(start_year, start_month)[1]
+            start_day = st.selectbox(
+                "開始日",
+                list(range(1, max_day_start + 1)),
+                index=min(default_start.day - 1, max_day_start - 1),
+                format_func=lambda x: f"{x}日",
+                key="start_day"
+            )
+        
+        with col_e1:
+            end_year = st.selectbox(
+                "終了年",
+                list(range(2022, 2028)),
+                index=list(range(2022, 2028)).index(default_end.year) if default_end.year in range(2022, 2028) else 0,
+                key="end_year"
+            )
+        with col_e2:
+            end_month = st.selectbox(
+                "終了月",
+                list(range(1, 13)),
+                index=default_end.month - 1,
+                format_func=lambda x: f"{x}月",
+                key="end_month"
+            )
+        with col_e3:
+            max_day_end = calendar.monthrange(end_year, end_month)[1]
+            end_day = st.selectbox(
+                "終了日",
+                list(range(1, max_day_end + 1)),
+                index=min(default_end.day - 1, max_day_end - 1),
+                format_func=lambda x: f"{x}日",
+                key="end_day"
+            )
     
-    with col3:
-        end_date = st.date_input("終了日", value=default_end)
+    start_date = date(start_year, start_month, start_day)
+    end_date = date(end_year, end_month, end_day)
+    
+    if start_date > end_date:
+        st.error("⚠️ 開始日が終了日より後になっています")
+        end_date = start_date
     
     return start_date, end_date
 
@@ -362,143 +1458,8 @@ def render_sales_analysis(start_date: date, end_date: date):
     return df_agg
 
 
-def render_advanced_analysis(sales_data: pd.DataFrame):
-    """高度な分析セクション"""
-    
-    with st.expander("📊 **高度な分析を見る**", expanded=False):
-        
-        # 分析モジュールを初期化
-        try:
-            df_calendar = st.session_state.data_loader.load_calendar()
-        except:
-            df_calendar = None
-        
-        internal = InternalAnalyzer(sales_data)
-        external = ExternalAnalyzer(sales_data, df_calendar)
-        
-        tab1, tab2, tab3 = st.tabs(["📈 トレンド分析", "🗓️ 季節性分析", "🌤️ 外部要因分析"])
-        
-        with tab1:
-            render_trend_analysis(internal)
-        
-        with tab2:
-            render_seasonality_analysis(internal)
-        
-        with tab3:
-            render_external_analysis(external)
-
-
-def render_trend_analysis(internal: InternalAnalyzer):
-    """トレンド分析の表示"""
-    trend = internal.analyze_sales_trend()
-    
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        st.metric("トレンド", trend['trend_direction'])
-    
-    with col2:
-        growth = trend['growth_rate']
-        st.metric("成長率", f"{growth:+.1f}%")
-    
-    with col3:
-        st.metric("変動性", f"{trend['volatility']:.2f}")
-    
-    if trend['peak_periods']:
-        st.write(f"**ピーク期間**: {', '.join(trend['peak_periods'][:5])}")
-    
-    # グラフ
-    if 'monthly_data' in trend and not trend['monthly_data'].empty:
-        fig = px.line(
-            trend['monthly_data'], x='period', y='販売商品数',
-            title='月別販売推移',
-            markers=True
-        )
-        fig.update_traces(line_color='#1E88E5')
-        st.plotly_chart(fig, use_container_width=True)
-
-
-def render_seasonality_analysis(internal: InternalAnalyzer):
-    """季節性分析の表示"""
-    seasonality = internal.detect_seasonality()
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.write("**月別係数**（1.0が平均）")
-        
-        monthly = seasonality['monthly_pattern']
-        months = [f"{m}月" for m in range(1, 13)]
-        values = [monthly.get(m, 1.0) for m in range(1, 13)]
-        
-        fig = px.bar(
-            x=months, y=values,
-            labels={'x': '月', 'y': '係数'},
-            color=values,
-            color_continuous_scale='RdYlGn'
-        )
-        fig.add_hline(y=1.0, line_dash="dash", line_color="gray")
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with col2:
-        st.write("**曜日別係数**（1.0が平均）")
-        
-        weekday = seasonality['weekday_pattern']
-        days = list(weekday.keys())
-        day_values = list(weekday.values())
-        
-        fig = px.bar(
-            x=days, y=day_values,
-            labels={'x': '曜日', 'y': '係数'},
-            color=day_values,
-            color_continuous_scale='RdYlGn'
-        )
-        fig.add_hline(y=1.0, line_dash="dash", line_color="gray")
-        st.plotly_chart(fig, use_container_width=True)
-    
-    st.metric("季節性の強さ", f"{seasonality['seasonality_strength']:.2f}", 
-              help="0に近いほど安定、1に近いほど季節変動が大きい")
-
-
-def render_external_analysis(external: ExternalAnalyzer):
-    """外部要因分析の表示"""
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.write("**カレンダー効果**")
-        
-        calendar_effect = external.analyze_calendar_effect()
-        
-        if calendar_effect['available']:
-            st.metric("休日の影響", f"×{calendar_effect['holiday_impact']:.2f}")
-            
-            if calendar_effect['rokuyou_impact']:
-                st.write("六曜別の影響:")
-                for rok, impact in sorted(calendar_effect['rokuyou_impact'].items(), 
-                                         key=lambda x: x[1], reverse=True):
-                    bar_len = int(impact * 20)
-                    st.text(f"  {rok}: {'█' * bar_len} {impact:.2f}")
-        else:
-            st.info("カレンダーデータがありません")
-    
-    with col2:
-        st.write("**天気の影響**")
-        
-        weather_effect = external.analyze_weather_correlation()
-        
-        if weather_effect['available']:
-            if weather_effect['weather_impact']:
-                for weather, impact in sorted(weather_effect['weather_impact'].items(), 
-                                             key=lambda x: x[1], reverse=True):
-                    emoji = {'晴れ': '☀️', '曇り': '☁️', '雨': '🌧️', '雪': '❄️'}.get(weather, '🌤️')
-                    st.text(f"  {emoji} {weather}: ×{impact:.2f}")
-        else:
-            st.info("天気データがありません")
-
-
 def render_forecast_section(sales_data: pd.DataFrame):
-    """需要予測セクション"""
+    """需要予測セクション（Vertex AI対応）"""
     st.markdown('<p class="section-header">④ 需要を予測する</p>', unsafe_allow_html=True)
     
     if sales_data is None or sales_data.empty:
@@ -508,32 +1469,475 @@ def render_forecast_section(sales_data: pd.DataFrame):
     col1, col2 = st.columns(2)
     
     with col1:
-        forecast_days = st.slider("予測日数", 30, 365, 180, key="forecast_days_existing")
+        forecast_mode = st.radio(
+            "予測期間の指定方法",
+            ["日数で指定", "期間で指定"],
+            horizontal=True,
+            key="forecast_mode_existing",
+            help="「期間で指定」は期間限定品の予測に便利です"
+        )
     
     with col2:
+        available_methods = get_available_forecast_methods()
+        default_idx = 0  # Vertex AIがあれば0、なければ季節性考慮
+        if "🚀 Vertex AI（推奨）" not in available_methods:
+            default_idx = available_methods.index("季節性考慮（統計）") if "季節性考慮（統計）" in available_methods else 0
+        
         method = st.selectbox(
             "予測方法",
-            ["季節性考慮（おすすめ）", "移動平均法（シンプル）", "すべての方法で比較"],
-            index=0
+            available_methods,
+            index=default_idx,
+            key="forecast_method_existing"
+        )
+    
+    # 予測期間の設定
+    if forecast_mode == "日数で指定":
+        forecast_days = st.slider("予測日数", 30, 365, 180, key="forecast_days_existing")
+        forecast_start_date = None
+        forecast_end_date = None
+    else:
+        # 期間指定UI（分析期間と同じスタイル）
+        today = date.today()
+        default_start = today + timedelta(days=1)
+        default_end = today + timedelta(days=180)
+        
+        st.write("**予測期間指定**")
+        col_s1, col_s2, col_s3, col_e1, col_e2, col_e3 = st.columns([1, 1, 1, 1, 1, 1])
+        
+        with col_s1:
+            start_year = st.selectbox(
+                "予測開始年",
+                list(range(2025, 2028)),
+                index=list(range(2025, 2028)).index(default_start.year) if default_start.year in range(2025, 2028) else 0,
+                key="forecast_start_year"
+            )
+        with col_s2:
+            start_month = st.selectbox(
+                "予測開始月",
+                list(range(1, 13)),
+                index=default_start.month - 1,
+                format_func=lambda x: f"{x}月",
+                key="forecast_start_month"
+            )
+        with col_s3:
+            max_day_start = calendar.monthrange(start_year, start_month)[1]
+            start_day = st.selectbox(
+                "予測開始日",
+                list(range(1, max_day_start + 1)),
+                index=min(default_start.day - 1, max_day_start - 1),
+                format_func=lambda x: f"{x}日",
+                key="forecast_start_day"
+            )
+        
+        with col_e1:
+            end_year = st.selectbox(
+                "予測終了年",
+                list(range(2025, 2028)),
+                index=list(range(2025, 2028)).index(default_end.year) if default_end.year in range(2025, 2028) else 0,
+                key="forecast_end_year"
+            )
+        with col_e2:
+            end_month = st.selectbox(
+                "予測終了月",
+                list(range(1, 13)),
+                index=default_end.month - 1,
+                format_func=lambda x: f"{x}月",
+                key="forecast_end_month"
+            )
+        with col_e3:
+            max_day_end = calendar.monthrange(end_year, end_month)[1]
+            end_day = st.selectbox(
+                "予測終了日",
+                list(range(1, max_day_end + 1)),
+                index=min(default_end.day - 1, max_day_end - 1),
+                format_func=lambda x: f"{x}日",
+                key="forecast_end_day"
+            )
+        
+        forecast_start_date = date(start_year, start_month, start_day)
+        forecast_end_date = date(end_year, end_month, end_day)
+        
+        if forecast_end_date <= forecast_start_date:
+            st.error("⚠️ 終了日は開始日より後にしてください")
+            return
+        
+        forecast_days = (forecast_end_date - forecast_start_date).days + 1
+        st.info(f"📅 予測期間: {forecast_start_date.strftime('%Y年%m月%d日')} 〜 {forecast_end_date.strftime('%Y年%m月%d日')}（{forecast_days}日間）")
+    
+    # 予測方法の説明を表示
+    method_info = FORECAST_METHODS[method]
+    css_class = "vertex-ai" if "Vertex" in method else "seasonality" if "季節" in method else "moving-avg" if "移動" in method else "exponential"
+    
+    st.markdown(f"""
+    <div class="method-card method-{css_class}">
+        <strong>{method_info['icon']} {method}</strong><br>
+        {method_info['description']}
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # 共変量オプション（Vertex AI選択時）
+    use_covariates = False
+    if "Vertex AI" in method and VERTEX_AI_AVAILABLE:
+        use_covariates = st.checkbox(
+            "共変量を使用（天気・六曜・イベント）",
+            value=True,
+            help="予測精度が向上しますが、処理時間が長くなる場合があります"
         )
     
     if st.button("🔮 需要を予測", type="primary", use_container_width=True, key="forecast_btn_existing"):
         with st.spinner("予測中..."):
-            forecast = forecast_with_seasonality(sales_data, forecast_days)
+            try:
+                if method == "🔄 すべての方法で比較":
+                    # すべての方法で予測
+                    product_id = "_".join(st.session_state.selected_products[:3])
+                    all_results = forecast_all_methods_with_vertex_ai(sales_data, forecast_days, product_id)
+                    display_comparison_results_v12(all_results, forecast_days)
+                else:
+                    # 単一の予測方法
+                    product_id = "_".join(st.session_state.selected_products[:3])
+                    forecast, method_message = forecast_with_vertex_ai(sales_data, forecast_days, method, product_id)
+                    
+                    if forecast is not None and not forecast.empty:
+                        display_single_forecast_result_v12(forecast, forecast_days, method, method_message)
+                    else:
+                        st.error("予測結果が空です。データを確認してください。")
+            except Exception as e:
+                st.error(f"予測エラー: {e}")
+                logger.error(f"予測エラー: {e}")
+
+
+def display_single_forecast_result_v12(forecast: pd.DataFrame, forecast_days: int, method: str, method_message: str):
+    """単一の予測結果を表示（v12）"""
+    raw_total = int(forecast['predicted'].sum())
+    rounded_total = round_up_to_50(raw_total)
+    avg_predicted = forecast['predicted'].mean()
+    
+    # Vertex AI使用時は特別表示
+    if "Vertex AI" in method_message:
+        st.success(f"✅ 予測完了！（🚀 {method_message}）")
+    else:
+        st.success(f"✅ 予測完了！（{method_message}）")
+    
+    st.session_state.last_forecast_method = method_message
+    
+    col1, col2, col3 = st.columns(3)
+    col1.metric("📦 予測販売総数", f"{rounded_total:,}体")
+    col2.metric("📈 平均日販（予測）", f"{avg_predicted:.1f}体/日")
+    col3.metric("📅 予測期間", f"{forecast_days}日間")
+    
+    # グラフ表示
+    method_info = FORECAST_METHODS.get(method, {"color": "#4285F4"})
+    
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=forecast['date'],
+        y=forecast['predicted'],
+        mode='lines',
+        name='予測',
+        line=dict(color=method_info.get('color', '#4285F4'))
+    ))
+    
+    # 信頼区間があれば表示
+    if 'confidence_lower' in forecast.columns and forecast['confidence_lower'].notna().any():
+        fig.add_trace(go.Scatter(
+            x=forecast['date'],
+            y=forecast['confidence_upper'],
+            mode='lines',
+            name='上限（95%信頼区間）',
+            line=dict(color='rgba(66, 133, 244, 0.3)', dash='dash'),
+            showlegend=True
+        ))
+        fig.add_trace(go.Scatter(
+            x=forecast['date'],
+            y=forecast['confidence_lower'],
+            mode='lines',
+            name='下限（95%信頼区間）',
+            line=dict(color='rgba(66, 133, 244, 0.3)', dash='dash'),
+            fill='tonexty',
+            fillcolor='rgba(66, 133, 244, 0.1)',
+            showlegend=True
+        ))
+    
+    fig.update_layout(
+        title=f'{method}による日別予測',
+        xaxis_title='日付',
+        yaxis_title='予測販売数（体）'
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    
+    st.session_state.forecast_data = forecast
+    st.session_state.forecast_total = rounded_total
+
+
+def display_comparison_results_v12(all_results: Dict[str, Tuple[pd.DataFrame, str]], forecast_days: int):
+    """すべての予測方法の比較結果を表示（v12）"""
+    st.success("✅ すべての予測方法で比較完了！")
+    
+    st.write("### 📊 予測方法別サマリー")
+    
+    method_colors = {
+        'Vertex AI': '#4285F4',
+        '季節性考慮': '#4CAF50',
+        '移動平均法': '#1E88E5',
+        '指数平滑法': '#FF9800'
+    }
+    
+    # カラムで表示
+    cols = st.columns(len(all_results))
+    for i, (method_name, (forecast, message)) in enumerate(all_results.items()):
+        rounded_total = round_up_to_50(int(forecast['predicted'].sum()))
+        avg_predicted = forecast['predicted'].mean()
+        
+        css_class = "vertex-ai" if "Vertex" in method_name else "seasonality" if "季節" in method_name else "moving-avg" if "移動" in method_name else "exponential"
+        
+        with cols[i]:
+            is_vertex = "Vertex" in method_name
+            badge = "🚀 " if is_vertex else ""
+            st.markdown(f"""
+            <div class="method-card method-{css_class}">
+                <strong>{badge}{method_name}</strong><br>
+                📦 {rounded_total:,}体<br>
+                📈 {avg_predicted:.1f}体/日
+            </div>
+            """, unsafe_allow_html=True)
+    
+    # 比較グラフ
+    st.write("### 📈 日別予測比較グラフ")
+    
+    fig = go.Figure()
+    
+    for method_name, (forecast, message) in all_results.items():
+        fig.add_trace(go.Scatter(
+            x=forecast['date'],
+            y=forecast['predicted'],
+            mode='lines',
+            name=method_name,
+            line=dict(color=method_colors.get(method_name, '#666666'))
+        ))
+    
+    fig.update_layout(
+        title='予測方法別の日別予測比較',
+        xaxis_title='日付',
+        yaxis_title='予測販売数（体）',
+        legend=dict(orientation='h', yanchor='bottom', y=1.02)
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # 推奨
+    if 'Vertex AI' in all_results:
+        st.info("💡 **おすすめ**: Vertex AI AutoML Forecastingは機械学習モデルで学習済みのため、最も精度が高い傾向があります。")
+    else:
+        st.info("💡 **おすすめ**: 季節性考慮は月別・曜日別の傾向を考慮するため、統計モデルの中では最も精度が高い傾向があります。")
+    
+    # セッション状態に保存（Vertex AIがあればそれ、なければ季節性考慮）
+    if 'Vertex AI' in all_results:
+        st.session_state.forecast_data = all_results['Vertex AI'][0]
+        st.session_state.forecast_total = round_up_to_50(int(all_results['Vertex AI'][0]['predicted'].sum()))
+    elif '季節性考慮' in all_results:
+        st.session_state.forecast_data = all_results['季節性考慮'][0]
+        st.session_state.forecast_total = round_up_to_50(int(all_results['季節性考慮'][0]['predicted'].sum()))
+    
+    st.session_state.forecast_results = {k: v[0] for k, v in all_results.items()}
+
+
+def render_individual_analysis(start_date: date, end_date: date):
+    """個別分析モード"""
+    st.markdown('<p class="section-header">③ 個別売上分析</p>', unsafe_allow_html=True)
+    
+    if not st.session_state.selected_products:
+        st.info("授与品を選択すると、ここに売上が表示されます")
+        return
+    
+    df_items = st.session_state.data_loader.load_item_sales()
+    
+    if df_items.empty:
+        st.warning("データがありません")
+        return
+    
+    mask = (df_items['date'] >= pd.Timestamp(start_date)) & (df_items['date'] <= pd.Timestamp(end_date))
+    df_filtered = df_items[mask]
+    
+    individual_data = {}
+    
+    for product in st.session_state.selected_products:
+        original_names = st.session_state.normalizer.get_all_original_names([product])
+        df_agg = aggregate_by_products(df_filtered, original_names, aggregate=True)
+        
+        if not df_agg.empty:
+            df_agg = df_agg.sort_values('date').reset_index(drop=True)
+            individual_data[product] = df_agg
+    
+    st.session_state.individual_sales_data = individual_data
+    
+    for product, df_agg in individual_data.items():
+        with st.expander(f"📦 **{product}**", expanded=True):
+            total_qty = int(df_agg['販売商品数'].sum())
+            total_sales = df_agg['販売総売上'].sum()
+            period_days = (end_date - start_date).days + 1
+            avg_daily = total_qty / period_days if period_days > 0 else 0
             
-            if forecast is not None and not forecast.empty:
-                raw_total = int(forecast['predicted'].sum())
-                rounded_total = round_up_to_50(raw_total)
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("🛒 販売数量", f"{total_qty:,}体")
+            col2.metric("💰 売上合計", f"¥{total_sales:,.0f}")
+            col3.metric("📈 平均日販", f"{avg_daily:.1f}体/日")
+            col4.metric("📅 期間", f"{period_days}日間")
+    
+    render_individual_forecast_section()
+
+
+def render_individual_forecast_section():
+    """個別予測セクション（期間指定対応）"""
+    st.markdown('<p class="section-header">④ 個別需要予測</p>', unsafe_allow_html=True)
+    
+    if not st.session_state.individual_sales_data:
+        st.info("売上データがあると、需要予測ができます")
+        return
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        forecast_mode = st.radio(
+            "予測期間の指定方法",
+            ["日数で指定", "期間で指定"],
+            horizontal=True,
+            key="individual_forecast_mode",
+            help="「期間で指定」は期間限定品の予測に便利です"
+        )
+    
+    with col2:
+        available_methods = get_available_forecast_methods()
+        # 「すべての方法で比較」は個別モードでは除外
+        available_methods = [m for m in available_methods if "すべて" not in m]
+        
+        method = st.selectbox(
+            "予測方法",
+            available_methods,
+            index=0,
+            key="individual_forecast_method"
+        )
+    
+    # 予測期間の設定
+    if forecast_mode == "日数で指定":
+        forecast_days = st.slider("予測日数", 30, 365, 180, key="individual_forecast_days")
+        forecast_start_date = None
+        forecast_end_date = None
+    else:
+        # 期間指定UI（分析期間と同じスタイル）
+        today = date.today()
+        default_start = today + timedelta(days=1)
+        default_end = today + timedelta(days=180)
+        
+        st.write("**予測期間指定**")
+        col_s1, col_s2, col_s3, col_e1, col_e2, col_e3 = st.columns([1, 1, 1, 1, 1, 1])
+        
+        with col_s1:
+            start_year = st.selectbox(
+                "予測開始年",
+                list(range(2025, 2028)),
+                index=list(range(2025, 2028)).index(default_start.year) if default_start.year in range(2025, 2028) else 0,
+                key="ind_forecast_start_year"
+            )
+        with col_s2:
+            start_month = st.selectbox(
+                "予測開始月",
+                list(range(1, 13)),
+                index=default_start.month - 1,
+                format_func=lambda x: f"{x}月",
+                key="ind_forecast_start_month"
+            )
+        with col_s3:
+            max_day_start = calendar.monthrange(start_year, start_month)[1]
+            start_day = st.selectbox(
+                "予測開始日",
+                list(range(1, max_day_start + 1)),
+                index=min(default_start.day - 1, max_day_start - 1),
+                format_func=lambda x: f"{x}日",
+                key="ind_forecast_start_day"
+            )
+        
+        with col_e1:
+            end_year = st.selectbox(
+                "予測終了年",
+                list(range(2025, 2028)),
+                index=list(range(2025, 2028)).index(default_end.year) if default_end.year in range(2025, 2028) else 0,
+                key="ind_forecast_end_year"
+            )
+        with col_e2:
+            end_month = st.selectbox(
+                "予測終了月",
+                list(range(1, 13)),
+                index=default_end.month - 1,
+                format_func=lambda x: f"{x}月",
+                key="ind_forecast_end_month"
+            )
+        with col_e3:
+            max_day_end = calendar.monthrange(end_year, end_month)[1]
+            end_day = st.selectbox(
+                "予測終了日",
+                list(range(1, max_day_end + 1)),
+                index=min(default_end.day - 1, max_day_end - 1),
+                format_func=lambda x: f"{x}日",
+                key="ind_forecast_end_day"
+            )
+        
+        forecast_start_date = date(start_year, start_month, start_day)
+        forecast_end_date = date(end_year, end_month, end_day)
+        
+        if forecast_end_date <= forecast_start_date:
+            st.error("⚠️ 終了日は開始日より後にしてください")
+            return
+        
+        forecast_days = (forecast_end_date - forecast_start_date).days + 1
+        st.info(f"📅 予測期間: {forecast_start_date.strftime('%Y年%m月%d日')} 〜 {forecast_end_date.strftime('%Y年%m月%d日')}（{forecast_days}日間）")
+    
+    method_info = FORECAST_METHODS[method]
+    st.markdown(f"""
+    <div class="analysis-card">
+        <strong>{method_info['icon']} {method}</strong><br>
+        {method_info['description']}
+    </div>
+    """, unsafe_allow_html=True)
+    
+    if st.button("🔮 個別に需要予測を実行", type="primary", use_container_width=True, key="individual_forecast_btn"):
+        with st.spinner("予測中..."):
+            results = []
+            
+            for product, sales_data in st.session_state.individual_sales_data.items():
+                try:
+                    forecast, method_message = forecast_with_vertex_ai(sales_data, forecast_days, method, product)
+                    
+                    if forecast is not None and not forecast.empty:
+                        raw_total = int(forecast['predicted'].sum())
+                        rounded_total = round_up_to_50(raw_total)
+                        avg_predicted = forecast['predicted'].mean()
+                        
+                        results.append({
+                            'product': product,
+                            'forecast': forecast,
+                            'raw_total': raw_total,
+                            'rounded_total': rounded_total,
+                            'avg_predicted': avg_predicted,
+                            'method_message': method_message
+                        })
+                except Exception as e:
+                    st.warning(f"{product}の予測に失敗: {e}")
+            
+            if results:
+                st.success(f"✅ {len(results)}件の授与品の予測が完了しました！")
                 
-                st.success("✅ 予測完了！")
+                summary_df = pd.DataFrame([
+                    {
+                        '授与品': r['product'],
+                        '予測総数': f"{r['rounded_total']:,}体",
+                        '平均日販': f"{r['avg_predicted']:.1f}体/日",
+                        '発注推奨数（50倍数）': r['rounded_total']
+                    }
+                    for r in results
+                ])
+                st.dataframe(summary_df, use_container_width=True, hide_index=True)
                 
-                col1, col2, col3 = st.columns(3)
-                col1.metric("📦 予測販売総数", f"{rounded_total:,}体")
-                col2.metric("📈 平均日販（予測）", f"{forecast['predicted'].mean():.1f}体/日")
-                col3.metric("📅 予測期間", f"{forecast_days}日間")
-                
-                st.session_state.forecast_data = forecast
-                st.session_state.forecast_total = rounded_total
+                total_all = sum(r['rounded_total'] for r in results)
+                st.metric("📦 全体の予測総数", f"{total_all:,}体")
 
 
 def render_delivery_section():
@@ -542,12 +1946,17 @@ def render_delivery_section():
     
     forecast = st.session_state.get('forecast_data')
     
-    if forecast is None or forecast.empty:
+    if forecast is None or (isinstance(forecast, pd.DataFrame) and forecast.empty):
         st.info("需要予測を実行すると、納品計画を立てられます")
         return
     
     total_demand = st.session_state.get('forecast_total', 0)
-    st.info(f"📦 予測された需要数: **{total_demand:,}体**")
+    method_used = st.session_state.get('last_forecast_method', '')
+    
+    if method_used:
+        st.info(f"📦 予測された需要数: **{total_demand:,}体** （{method_used}）")
+    else:
+        st.info(f"📦 予測された需要数: **{total_demand:,}体**")
     
     col1, col2 = st.columns(2)
     
@@ -560,46 +1969,51 @@ def render_delivery_section():
     needed = total_demand + min_stock - current_stock
     recommended_order = round_up_to_50(max(0, needed))
     
-    st.metric("推奨発注数", f"{recommended_order:,}体")
+    st.metric("🛒 推奨発注数", f"{recommended_order:,}体")
+    
+    with st.expander("📝 計算詳細"):
+        st.write(f"""
+        - 予測需要: {total_demand:,}体
+        - 安全在庫: +{min_stock:,}体
+        - 現在在庫: -{current_stock:,}体
+        - **必要数量: {needed:,}体**
+        - **発注数（50の倍数）: {recommended_order:,}体**
+        """)
 
 
 # =============================================================================
-# 高度な新規授与品需要予測
+# 新規授与品の需要予測
 # =============================================================================
 
-def render_advanced_new_product_forecast():
-    """高度な新規授与品需要予測"""
+def render_new_product_forecast():
+    """新規授与品の需要予測"""
     
     st.markdown("""
-    <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
-                border-radius: 15px; padding: 20px; color: white; margin-bottom: 20px;">
-        <h2>✨ 新規授与品の需要予測（高度版）</h2>
-        <p>内部実績・外部環境・市場分析を統合した高精度な需要予測を行います。</p>
+    <div class="new-product-card">
+        <h2>✨ 新規授与品の需要予測</h2>
+        <p>まだ販売実績のない新しい授与品の需要を、類似商品のデータから予測します。</p>
     </div>
     """, unsafe_allow_html=True)
     
-    # ==========================================================================
-    # Step 1: 基本情報の入力
-    # ==========================================================================
-    st.markdown('<p class="section-header">① 授与品の基本情報</p>', unsafe_allow_html=True)
+    st.markdown('<p class="section-header">① 新規授与品の情報を入力</p>', unsafe_allow_html=True)
     
     col1, col2 = st.columns(2)
     
     with col1:
         new_product_name = st.text_input(
-            "授与品名 *",
+            "授与品名",
             placeholder="例: 縁結び水晶守",
             help="新しく作る授与品の名前"
         )
         
         new_product_category = st.selectbox(
-            "カテゴリー *",
-            ["お守り", "御朱印", "御朱印帳", "おみくじ", "絵馬", "お札", "縁起物", "その他"],
+            "カテゴリー",
+            list(CATEGORY_CHARACTERISTICS.keys()),
             help="最も近いカテゴリーを選んでください"
         )
         
         new_product_price = st.number_input(
-            "価格（円） *",
+            "価格（円）",
             min_value=100,
             max_value=50000,
             value=1000,
@@ -610,227 +2024,124 @@ def render_advanced_new_product_forecast():
     with col2:
         new_product_description = st.text_area(
             "特徴・コンセプト",
-            placeholder="例: 水晶を使用した縁結びのお守り。若い女性向け。恋愛成就に特化。SNS映えするデザイン。",
-            help="授与品の特徴を詳しく記述するほど、予測精度が向上します",
-            height=100
+            placeholder="例: 水晶を使用した縁結びのお守り。若い女性向け。",
+            help="授与品の特徴を記述"
         )
         
         target_audience = st.multiselect(
-            "ターゲット層 *",
+            "ターゲット層",
             ["若い女性", "若い男性", "中高年女性", "中高年男性", "家族連れ", "観光客", "地元の方"],
-            default=["若い女性", "観光客"],
-            help="主なターゲット層を選んでください（複数選択可）"
+            default=["若い女性", "観光客"]
         )
     
-    # ==========================================================================
-    # Step 2: 高度な分析
-    # ==========================================================================
-    st.markdown('<p class="section-header">② 市場分析・類似商品分析</p>', unsafe_allow_html=True)
+    st.markdown('<p class="section-header">② 類似商品を分析</p>', unsafe_allow_html=True)
     
-    if not new_product_name:
-        st.info("👆 授与品名を入力すると、分析が開始されます")
-        return
+    if new_product_name and new_product_name.strip():
+        similar_products = find_similar_products(
+            new_product_name, 
+            new_product_category, 
+            new_product_price,
+            new_product_description
+        )
+        
+        if similar_products:
+            st.write(f"**類似商品が {len(similar_products)} 件見つかりました**")
+            
+            for i, prod in enumerate(similar_products[:5], 1):
+                col1, col2, col3 = st.columns([3, 1, 1])
+                with col1:
+                    st.write(f"{i}. {prod['name']}")
+                with col2:
+                    st.write(f"平均 {prod['avg_daily']:.1f}体/日")
+                with col3:
+                    st.write(f"類似度 {prod['similarity']:.0f}%")
+        else:
+            st.info("類似商品が見つかりませんでした。カテゴリーの平均値から予測します。")
+    else:
+        similar_products = []
+        st.info("👆 授与品名を入力すると、類似商品を検索します")
     
-    # 分析エンジンを初期化
-    df_sales = st.session_state.data_loader.load_item_sales()
-    
-    try:
-        df_calendar = st.session_state.data_loader.load_calendar()
-    except:
-        df_calendar = None
-    
-    forecast_engine = DemandForecastEngine(df_sales, df_calendar)
-    
-    # 類似商品を検索
-    similar_products = find_similar_products(
-        df_sales, new_product_name, new_product_category, new_product_price
-    )
+    st.markdown('<p class="section-header">③ 需要予測</p>', unsafe_allow_html=True)
     
     col1, col2 = st.columns(2)
     
     with col1:
-        st.write("**📦 類似商品分析**")
-        
-        if similar_products:
-            st.success(f"{len(similar_products)}件の類似商品を発見")
-            
-            for i, prod in enumerate(similar_products[:5], 1):
-                similarity_bar = "█" * int(prod['similarity'] / 10)
-                st.markdown(f"""
-                <div class="analysis-card">
-                    <strong>{i}. {prod['name'][:25]}...</strong><br>
-                    平均: {prod['avg_daily']:.1f}体/日 | 類似度: {similarity_bar} {prod['similarity']:.0f}%
-                </div>
-                """, unsafe_allow_html=True)
-        else:
-            st.warning("類似商品が見つかりませんでした")
-    
-    with col2:
-        st.write("**📊 コンセプト評価**")
-        
-        # コンセプト評価
-        market = MarketAnalyzer(df_sales)
-        concept_score = market.score_concept({
-            'name': new_product_name,
-            'description': new_product_description,
-            'target_segments': target_audience,
-            'price': new_product_price,
-            'category': new_product_category
-        })
-        
-        # スコア表示
-        st.markdown(f"""
-        <div class="score-card">
-            <div style="font-size: 3rem; font-weight: bold;">{concept_score['total_score']}</div>
-            <div style="font-size: 1.2rem;">/100点</div>
-            <div style="margin-top: 10px; font-size: 1.5rem;">{concept_score['rank']}</div>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        # 強み・弱み
-        if concept_score['strengths']:
-            st.write("**💪 強み**")
-            for s in concept_score['strengths'][:3]:
-                st.markdown(f'<div class="strength-item">✓ {s}</div>', unsafe_allow_html=True)
-        
-        if concept_score['weaknesses']:
-            st.write("**⚠️ 改善点**")
-            for w in concept_score['weaknesses'][:3]:
-                st.markdown(f'<div class="weakness-item">△ {w}</div>', unsafe_allow_html=True)
-    
-    # ==========================================================================
-    # Step 3: 外部環境分析
-    # ==========================================================================
-    st.markdown('<p class="section-header">③ 外部環境分析</p>', unsafe_allow_html=True)
-    
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        st.write("**🔍 検索トレンド**")
-        trends = forecast_engine.external.fetch_google_trends(new_product_name)
-        
-        st.metric("現在の関心度", f"{trends['current_interest']:.0f}/100")
-        st.write(f"トレンド: {trends['trend_direction']}")
-        st.write(f"ピーク月: {trends['peak_month']}")
-        st.caption(trends['note'])
-    
-    with col2:
-        st.write("**🗓️ カレンダー効果**")
-        calendar_effect = forecast_engine.external.analyze_calendar_effect()
-        
-        if calendar_effect['available']:
-            st.metric("休日の影響", f"×{calendar_effect['holiday_impact']:.2f}")
-            
-            if calendar_effect['special_period_impact']:
-                top_period = max(calendar_effect['special_period_impact'].items(), 
-                                key=lambda x: x[1])
-                st.write(f"最大効果: {top_period[0]} (×{top_period[1]:.2f})")
-        else:
-            st.info("データなし")
-    
-    with col3:
-        st.write("**🌤️ 天気の影響**")
-        weather_effect = forecast_engine.external.analyze_weather_correlation()
-        
-        if weather_effect['available']:
-            rain_impact = weather_effect.get('rain_impact', 1.0)
-            st.metric("雨天時の影響", f"×{rain_impact:.2f}")
-            
-            if weather_effect['temperature_correlation'] != 0:
-                st.write(f"気温との相関: {weather_effect['temperature_correlation']:.2f}")
-        else:
-            st.info("データなし")
-    
-    # ==========================================================================
-    # Step 4: 需要予測
-    # ==========================================================================
-    st.markdown('<p class="section-header">④ 総合需要予測</p>', unsafe_allow_html=True)
-    
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
         forecast_period = st.selectbox(
             "予測期間",
-            ["1ヶ月（30日）", "3ヶ月（90日）", "6ヶ月（180日）", "1年（365日）"],
+            ["1ヶ月", "3ヶ月", "6ヶ月", "1年"],
             index=2
         )
-        period_days = {"1ヶ月（30日）": 30, "3ヶ月（90日）": 90, 
-                      "6ヶ月（180日）": 180, "1年（365日）": 365}[forecast_period]
     
     with col2:
         confidence_level = st.selectbox(
             "予測の保守性",
             ["楽観的", "標準", "保守的"],
-            index=1,
-            help="保守的を選ぶと、少なめに予測します"
+            index=1
         )
     
-    with col3:
-        include_learning = st.checkbox(
-            "学習データを活用",
-            value=True,
-            help="過去の予測精度データを活用して予測を補正"
-        )
-    
-    if st.button("🔮 **総合需要予測を実行**", type="primary", use_container_width=True):
-        if not target_audience:
-            st.error("ターゲット層を1つ以上選択してください")
+    if st.button("🔮 新規授与品の需要を予測", type="primary", use_container_width=True):
+        if not new_product_name or not new_product_name.strip():
+            st.error("授与品名を入力してください")
         else:
-            with st.spinner("複数の分析を統合して予測中..."):
-                # 総合予測を実行
-                result = forecast_engine.forecast_new_product(
-                    product_name=new_product_name,
-                    category=new_product_category,
-                    price=new_product_price,
-                    description=new_product_description,
-                    target_segments=target_audience,
-                    similar_products=similar_products,
-                    forecast_days=period_days,
-                    confidence_level=confidence_level
+            with st.spinner("予測中..."):
+                forecast_result = forecast_new_product(
+                    new_product_name,
+                    new_product_category,
+                    new_product_price,
+                    similar_products,
+                    forecast_period,
+                    confidence_level
                 )
                 
-                display_comprehensive_forecast_result(result, new_product_name, new_product_price)
+                display_new_product_forecast(forecast_result, new_product_name, new_product_price)
 
 
-def find_similar_products(df_sales: pd.DataFrame, name: str, category: str, price: int) -> list:
-    """類似商品を検索"""
+def find_similar_products(name: str, category: str, price: int, description: str) -> list:
+    """類似商品を探す"""
     
-    if df_sales.empty:
+    if not name or not name.strip():
+        return []
+    
+    if st.session_state.data_loader is None:
+        return []
+    
+    df_items = st.session_state.data_loader.load_item_sales()
+    
+    if df_items.empty:
         return []
     
     product_col = '商品名'
     qty_col = '販売商品数'
     sales_col = '販売総売上'
     
-    # 商品ごとの統計
-    product_stats = df_sales.groupby(product_col).agg({
+    product_stats = df_items.groupby(product_col).agg({
         qty_col: ['sum', 'mean', 'count'],
         sales_col: 'sum'
     }).reset_index()
     
     product_stats.columns = ['name', 'total_qty', 'avg_daily', 'days_count', 'total_sales']
-    product_stats['unit_price'] = product_stats['total_sales'] / product_stats['total_qty']
-    product_stats['unit_price'] = product_stats['unit_price'].replace([np.inf, -np.inf], np.nan).fillna(0)
     
-    # 類似度計算
+    product_stats['unit_price'] = product_stats['total_sales'] / product_stats['total_qty']
+    product_stats['unit_price'] = product_stats['unit_price'].fillna(0)
+    
     similar = []
+    
     keywords = set(re.findall(r'[\u4e00-\u9fff]+', name.lower()))
+    if description:
+        keywords.update(re.findall(r'[\u4e00-\u9fff]+', description.lower()))
     
     for _, row in product_stats.iterrows():
         prod_name = row['name']
         
-        # 名前の類似度
         name_keywords = set(re.findall(r'[\u4e00-\u9fff]+', prod_name.lower()))
         name_match = len(keywords & name_keywords) / max(len(keywords), 1) * 50
         
-        # 価格の類似度
         if row['unit_price'] > 0:
             price_diff = abs(price - row['unit_price']) / price
             price_match = max(0, (1 - price_diff)) * 30
         else:
             price_match = 0
         
-        # カテゴリーの類似度
         category_keywords = {
             "お守り": ["守", "お守り", "まもり"],
             "御朱印": ["御朱印", "朱印"],
@@ -838,6 +2149,7 @@ def find_similar_products(df_sales: pd.DataFrame, name: str, category: str, pric
             "おみくじ": ["おみくじ", "みくじ"],
             "絵馬": ["絵馬"],
             "お札": ["札", "お札"],
+            "縁起物": ["縁起", "だるま", "招き猫"],
         }
         
         cat_match = 0
@@ -864,223 +2176,315 @@ def find_similar_products(df_sales: pd.DataFrame, name: str, category: str, pric
     return similar[:10]
 
 
-def display_comprehensive_forecast_result(result: Dict, product_name: str, price: int):
-    """総合予測結果を表示"""
+def forecast_new_product(name: str, category: str, price: int, 
+                         similar_products: list, period: str, confidence: str) -> dict:
+    """新規授与品の需要を予測"""
     
-    st.success("✅ 総合需要予測が完了しました！")
+    period_days = {"1ヶ月": 30, "3ヶ月": 90, "6ヶ月": 180, "1年": 365}[period]
+    confidence_factor = {"楽観的": 1.2, "標準": 1.0, "保守的": 0.7}[confidence]
     
-    # メイン結果
-    st.markdown(f"### 📦 「{product_name}」の需要予測結果")
+    if similar_products:
+        weighted_sum = sum(p['avg_daily'] * p['similarity'] for p in similar_products[:5])
+        weight_total = sum(p['similarity'] for p in similar_products[:5])
+        base_daily = weighted_sum / weight_total if weight_total > 0 else 1.0
+    else:
+        base_daily = CATEGORY_CHARACTERISTICS.get(category, {}).get('base_daily', 1.0)
+    
+    cat_char = CATEGORY_CHARACTERISTICS.get(category, {})
+    seasonality = cat_char.get('seasonality', 'medium')
+    
+    if seasonality == 'high':
+        month_factors = {1: 3.0, 2: 0.7, 3: 0.9, 4: 0.9, 5: 1.0, 6: 0.8,
+                        7: 0.9, 8: 1.1, 9: 0.9, 10: 1.0, 11: 1.2, 12: 1.5}
+    elif seasonality == 'medium':
+        month_factors = {1: 1.5, 2: 0.9, 3: 1.0, 4: 1.0, 5: 1.1, 6: 0.9,
+                        7: 1.0, 8: 1.1, 9: 1.0, 10: 1.0, 11: 1.1, 12: 1.2}
+    else:
+        month_factors = {i: 1.0 for i in range(1, 13)}
+    
+    daily_forecast = []
+    total_qty = 0
+    
+    for i in range(period_days):
+        target_date = date.today() + timedelta(days=i)
+        month = target_date.month
+        weekday = target_date.weekday()
+        
+        weekday_factor = 1.5 if weekday >= 5 else 1.0
+        month_factor = month_factors.get(month, 1.0)
+        
+        pred = base_daily * weekday_factor * month_factor * confidence_factor
+        pred = max(0, round(pred))
+        
+        daily_forecast.append({
+            'date': target_date,
+            'predicted': pred
+        })
+        
+        total_qty += pred
+    
+    total_qty_rounded = round_up_to_50(total_qty)
+    
+    df_forecast = pd.DataFrame(daily_forecast)
+    df_forecast['month'] = pd.to_datetime(df_forecast['date']).dt.to_period('M')
+    monthly = df_forecast.groupby('month')['predicted'].sum().to_dict()
+    
+    return {
+        'daily_forecast': daily_forecast,
+        'total_qty': total_qty,
+        'total_qty_rounded': total_qty_rounded,
+        'avg_daily': total_qty / period_days,
+        'period_days': period_days,
+        'monthly': monthly,
+        'base_daily': base_daily,
+        'confidence': confidence,
+        'similar_count': len(similar_products)
+    }
+
+
+def display_new_product_forecast(result: dict, product_name: str, price: int):
+    """新規授与品の予測結果を表示"""
+    
+    st.success("✅ 予測完了！")
+    
+    st.write(f"### 📦 「{product_name}」の需要予測")
     
     col1, col2, col3, col4 = st.columns(4)
+    col1.metric("予測販売総数", f"{result['total_qty_rounded']:,}体")
+    col2.metric("予測売上", f"¥{result['total_qty_rounded'] * price:,.0f}")
+    col3.metric("平均日販", f"{result['avg_daily']:.1f}体/日")
+    col4.metric("予測期間", f"{result['period_days']}日間")
     
-    with col1:
-        st.markdown(f"""
-        <div class="score-card" style="background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);">
-            <div style="font-size: 0.9rem;">予測販売総数</div>
-            <div style="font-size: 2.5rem; font-weight: bold;">{result['total_qty_rounded']:,}</div>
-            <div style="font-size: 1rem;">体</div>
-        </div>
-        """, unsafe_allow_html=True)
+    if result['similar_count'] >= 3:
+        st.info(f"📊 類似商品 {result['similar_count']} 件のデータを基に予測しました。信頼度: ⭐⭐⭐")
+    elif result['similar_count'] >= 1:
+        st.warning(f"📊 類似商品 {result['similar_count']} 件のデータを基に予測しました。信頼度: ⭐⭐")
+    else:
+        st.warning("📊 類似商品がなかったため、カテゴリーの平均値から予測しました。信頼度: ⭐")
     
-    with col2:
-        st.markdown(f"""
-        <div class="score-card" style="background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);">
-            <div style="font-size: 0.9rem;">予測売上</div>
-            <div style="font-size: 2rem; font-weight: bold;">¥{result['total_qty_rounded'] * price:,}</div>
-        </div>
-        """, unsafe_allow_html=True)
+    monthly_data = []
+    for period, qty in result['monthly'].items():
+        monthly_data.append({'月': str(period), '予測販売数': qty})
     
-    with col3:
-        st.markdown(f"""
-        <div class="score-card" style="background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);">
-            <div style="font-size: 0.9rem;">平均日販</div>
-            <div style="font-size: 2.5rem; font-weight: bold;">{result['avg_daily']:.1f}</div>
-            <div style="font-size: 1rem;">体/日</div>
-        </div>
-        """, unsafe_allow_html=True)
+    df_monthly = pd.DataFrame(monthly_data)
     
-    with col4:
-        st.markdown(f"""
-        <div class="score-card" style="background: linear-gradient(135deg, #fa709a 0%, #fee140 100%);">
-            <div style="font-size: 0.9rem;">分析品質</div>
-            <div style="font-size: 1.5rem; font-weight: bold;">{result['analysis_quality']}</div>
-        </div>
-        """, unsafe_allow_html=True)
+    fig = px.bar(
+        df_monthly, x='月', y='予測販売数',
+        title='月別予測販売数',
+        color='予測販売数',
+        color_continuous_scale='Blues'
+    )
+    st.plotly_chart(fig, use_container_width=True)
     
-    # 信頼区間
-    ci = result['confidence_interval']
-    st.info(f"📊 95%信頼区間: **{ci['lower']:,}体** 〜 **{ci['upper']:,}体**")
-    
-    # 詳細分析
-    with st.expander("📊 **詳細な分析結果を見る**", expanded=True):
-        
-        tab1, tab2, tab3 = st.tabs(["📈 予測内訳", "🎯 調整係数", "📅 月別予測"])
-        
-        with tab1:
-            analysis = result['analysis']
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.write("**ベース予測**")
-                st.metric("基本日販", f"{analysis['base_daily']:.1f}体/日")
-                st.metric("総合調整係数", f"×{analysis['total_multiplier']:.2f}")
-                st.metric("調整後日販", f"{result['avg_daily']:.1f}体/日")
-            
-            with col2:
-                st.write("**コンセプト評価**")
-                cs = analysis['concept_score']
-                st.metric("総合スコア", f"{cs['total_score']}点")
-                st.write(f"ランク: {cs['rank']}")
-        
-        with tab2:
-            adj = analysis['adjustments']
-            
-            st.write("**適用された調整係数**")
-            
-            adj_data = [
-                {"要因": "ターゲット層", "係数": adj['target_multiplier'], 
-                 "説明": "選択したターゲット層に基づく調整"},
-                {"要因": "コンセプト評価", "係数": adj['concept_multiplier'], 
-                 "説明": "商品コンセプトの評価に基づく調整"},
-                {"要因": "検索トレンド", "係数": adj['trend_multiplier'], 
-                 "説明": "現在の検索関心度に基づく調整"},
-            ]
-            
-            df_adj = pd.DataFrame(adj_data)
-            st.dataframe(df_adj, use_container_width=True, hide_index=True)
-        
-        with tab3:
-            # 月別予測グラフ
-            daily = result['daily_forecast']
-            df_daily = pd.DataFrame(daily)
-            df_daily['month'] = pd.to_datetime(df_daily['date']).dt.to_period('M')
-            monthly = df_daily.groupby('month')['predicted'].sum().reset_index()
-            monthly['month'] = monthly['month'].astype(str)
-            
-            fig = px.bar(
-                monthly, x='month', y='predicted',
-                title='月別予測販売数',
-                labels={'month': '月', 'predicted': '予測販売数（体）'},
-                color='predicted',
-                color_continuous_scale='Viridis'
-            )
-            st.plotly_chart(fig, use_container_width=True)
-    
-    # 発注提案
-    st.markdown("### 📋 初回発注量の提案")
+    st.write("### 📋 初回発注量の提案")
     
     col1, col2, col3 = st.columns(3)
-    
-    one_month = round_up_to_50(int(result['avg_daily'] * 30))
-    three_months = round_up_to_50(int(result['avg_daily'] * 90))
-    six_months = round_up_to_50(int(result['avg_daily'] * 180))
-    
-    with col1:
-        st.metric("少なめ（1ヶ月分）", f"{one_month}体", help="リスクを抑えたい場合")
-    
-    with col2:
-        st.metric("標準（3ヶ月分）", f"{three_months}体", help="おすすめ", delta="推奨")
-    
-    with col3:
-        st.metric("多め（6ヶ月分）", f"{six_months}体", help="在庫切れを避けたい場合")
-    
-    st.caption("💡 新規授与品は売れ行きが不確実なため、最初は少なめに発注し、様子を見ることをおすすめします。")
-    
-    # 注意事項
-    with st.expander("⚠️ 予測の注意事項"):
-        st.markdown(f"""
-        **この予測は参考値です。以下の点にご注意ください：**
-        
-        1. **分析品質**: {result['analysis_quality']}
-           - 類似商品: {result['similar_count']}件のデータを参照
-           - 信頼区間: {ci['lower']:,}〜{ci['upper']:,}体
-        
-        2. **新規商品の不確実性**
-           - 実際の売れ行きは予測と大きく異なる可能性があります
-           - 発売後1ヶ月間の実績を見て、予測を修正してください
-        
-        3. **外部要因の影響**
-           - 天候、社会情勢、競合状況により変動します
-           - 特に正月・GW・お盆は予測以上に売れる可能性があります
-        
-        **おすすめの進め方：**
-        1. 初回は少なめ（1〜2ヶ月分）を発注
-        2. 発売後2週間の実績を確認
-        3. 実績を見て追加発注または在庫調整
-        """)
+    col1.metric("少なめ（1ヶ月分）", f"{round_up_to_50(int(result['avg_daily'] * 30))}体")
+    col2.metric("標準（3ヶ月分）", f"{round_up_to_50(int(result['avg_daily'] * 90))}体")
+    col3.metric("多め（6ヶ月分）", f"{round_up_to_50(int(result['avg_daily'] * 180))}体")
 
+
+# =============================================================================
+# 高度な分析
+# =============================================================================
+
+def render_advanced_analysis():
+    """高度な分析タブ"""
+    st.markdown('<p class="section-header">🔬 高度な分析</p>', unsafe_allow_html=True)
+    
+    if not ADVANCED_ANALYSIS_AVAILABLE:
+        st.warning("demand_analyzer.pyモジュールが見つかりません。")
+        return
+    
+    sales_data = st.session_state.get('sales_data')
+    
+    if sales_data is None or sales_data.empty:
+        st.info("「既存授与品の分析・予測」タブで授与品を選択してください。")
+        return
+    
+    try:
+        df_items = st.session_state.data_loader.load_item_sales()
+        internal = InternalAnalyzer(df_items)
+        external = ExternalAnalyzer(df_items, None)
+    except Exception as e:
+        st.error(f"分析モジュールの初期化に失敗しました: {e}")
+        return
+    
+    with st.expander("📊 **高度な分析を見る**", expanded=False):
+        tab1, tab2, tab3 = st.tabs(["📈 トレンド分析", "🗓️ 季節性分析", "🌤️ 外部要因分析"])
+        
+        with tab1:
+            render_trend_analysis(internal)
+        
+        with tab2:
+            render_seasonality_analysis(internal)
+        
+        with tab3:
+            render_external_analysis(external)
+
+
+def render_trend_analysis(internal):
+    """トレンド分析を表示"""
+    st.write("### 📈 販売トレンド分析")
+    
+    try:
+        trend = internal.analyze_sales_trend()
+        
+        col1, col2, col3 = st.columns(3)
+        col1.metric("トレンド方向", trend['trend_direction'])
+        col2.metric("成長率", f"{trend['growth_rate']}%")
+        col3.metric("変動性", f"{trend['volatility']:.2f}")
+        
+        if 'monthly_data' in trend and not trend['monthly_data'].empty:
+            fig = px.line(
+                trend['monthly_data'], 
+                x='period', 
+                y='販売商品数',
+                title='月別販売推移'
+            )
+            st.plotly_chart(fig, use_container_width=True)
+    except Exception as e:
+        st.warning(f"トレンド分析を実行できませんでした: {e}")
+
+
+def render_seasonality_analysis(internal):
+    """季節性分析を表示"""
+    st.write("### 🗓️ 季節性分析")
+    
+    try:
+        seasonality = internal.detect_seasonality()
+        
+        st.metric("季節性の強さ", f"{seasonality['seasonality_strength']:.2f}")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.write("**月別係数**")
+            monthly = seasonality['monthly_pattern']
+            df_monthly = pd.DataFrame({
+                '月': list(monthly.keys()),
+                '係数': list(monthly.values())
+            })
+            fig = px.bar(df_monthly, x='月', y='係数', title='月別販売係数')
+            fig.add_hline(y=1.0, line_dash="dash", line_color="red")
+            st.plotly_chart(fig, use_container_width=True)
+        
+        with col2:
+            st.write("**曜日別係数**")
+            weekday = seasonality['weekday_pattern']
+            df_weekday = pd.DataFrame({
+                '曜日': list(weekday.keys()),
+                '係数': list(weekday.values())
+            })
+            fig = px.bar(df_weekday, x='曜日', y='係数', title='曜日別販売係数')
+            fig.add_hline(y=1.0, line_dash="dash", line_color="red")
+            st.plotly_chart(fig, use_container_width=True)
+    except Exception as e:
+        st.warning(f"季節性分析を実行できませんでした: {e}")
+
+
+def render_external_analysis(external):
+    """外部要因分析を表示"""
+    st.write("### 🌤️ 外部要因分析")
+    
+    try:
+        calendar_effect = external.analyze_calendar_effect()
+        
+        if calendar_effect.get('available', False):
+            st.metric("休日の影響度", f"{calendar_effect['holiday_impact']:.2f}x")
+        else:
+            st.info("カレンダーデータがないため、外部要因分析は利用できません。")
+    except Exception as e:
+        st.warning(f"外部要因分析を実行できませんでした: {e}")
+
+
+# =============================================================================
+# 予測精度ダッシュボード
+# =============================================================================
 
 def render_accuracy_dashboard():
     """予測精度ダッシュボード"""
     
     st.markdown('<p class="section-header">📈 予測精度ダッシュボード</p>', unsafe_allow_html=True)
     
-    st.info("""
-    📊 予測精度ダッシュボードを表示するには、自動学習システムのセットアップが必要です。
-    
-    **セットアップ手順：**
-    1. GitHubにリポジトリをプッシュ
-    2. GitHub Secretsを設定
-    3. GitHub Actionsが毎日自動実行
-    4. 数日後にここにデータが表示されます
-    """)
-
-
-# =============================================================================
-# 予測関数
-# =============================================================================
-
-def forecast_with_seasonality(df: pd.DataFrame, periods: int) -> pd.DataFrame:
-    """季節性を考慮した予測"""
-    df = df.copy()
-    df['date'] = pd.to_datetime(df['date'])
-    df = df.sort_values('date')
-    
-    overall_mean = df['販売商品数'].mean()
-    
-    if pd.isna(overall_mean) or overall_mean == 0:
-        overall_mean = 1
-    
-    # 曜日係数
-    df['weekday'] = df['date'].dt.dayofweek
-    weekday_means = df.groupby('weekday')['販売商品数'].mean()
-    weekday_factor = {}
-    for wd in range(7):
-        if wd in weekday_means.index and weekday_means[wd] > 0:
-            weekday_factor[wd] = weekday_means[wd] / overall_mean
-        else:
-            weekday_factor[wd] = 1.0
-    
-    # 月係数
-    df['month'] = df['date'].dt.month
-    month_means = df.groupby('month')['販売商品数'].mean()
-    month_factor = {}
-    for m in range(1, 13):
-        if m in month_means.index and month_means[m] > 0:
-            month_factor[m] = month_means[m] / overall_mean
-        else:
-            month_factor[m] = 1.0
-    
-    # 予測
-    last_date = df['date'].max()
-    future_dates = pd.date_range(start=last_date + timedelta(days=1), periods=periods, freq='D')
-    
-    predictions = []
-    for d in future_dates:
-        weekday_f = weekday_factor.get(d.dayofweek, 1.0)
-        month_f = month_factor.get(d.month, 1.0)
+    try:
+        service = st.session_state.data_loader.service
+        result = service.spreadsheets().values().get(
+            spreadsheetId=st.session_state.data_loader.spreadsheet_id,
+            range="'forecast_accuracy'!A:H"
+        ).execute()
         
-        pred = overall_mean * weekday_f * month_f
-        pred = max(0.1, pred)
+        values = result.get('values', [])
         
-        predictions.append({
-            'date': d,
-            'predicted': round(pred)
-        })
+        if len(values) <= 1:
+            st.info("""
+            📊 まだ予測精度データがありません。
+            
+            自動学習システムが稼働すると、ここに予測精度が表示されます。
+            """)
+            return
+        
+        headers = values[0]
+        df = pd.DataFrame(values[1:], columns=headers)
+        
+        df['date'] = pd.to_datetime(df['date'], errors='coerce')
+        df['predicted_qty'] = pd.to_numeric(df['predicted_qty'], errors='coerce')
+        df['actual_qty'] = pd.to_numeric(df['actual_qty'], errors='coerce')
+        df['diff_pct'] = pd.to_numeric(df['diff_pct'], errors='coerce')
+        
+        st.write("### 過去30日間の予測精度")
+        
+        recent = df[df['date'] >= (datetime.now() - timedelta(days=30))]
+        
+        if not recent.empty:
+            avg_error = recent['diff_pct'].abs().mean()
+            total_predicted = recent['predicted_qty'].sum()
+            total_actual = recent['actual_qty'].sum()
+            accuracy = 100 - avg_error
+            
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("平均誤差率", f"{avg_error:.1f}%")
+            col2.metric("予測精度", f"{accuracy:.1f}%")
+            col3.metric("予測合計", f"{total_predicted:.0f}体")
+            col4.metric("実績合計", f"{total_actual:.0f}体")
+            
+            fig = go.Figure()
+            
+            daily = recent.groupby('date').agg({
+                'predicted_qty': 'sum',
+                'actual_qty': 'sum'
+            }).reset_index()
+            
+            fig.add_trace(go.Scatter(
+                x=daily['date'],
+                y=daily['predicted_qty'],
+                mode='lines+markers',
+                name='予測',
+                line=dict(color='#4285F4')
+            ))
+            
+            fig.add_trace(go.Scatter(
+                x=daily['date'],
+                y=daily['actual_qty'],
+                mode='lines+markers',
+                name='実績',
+                line=dict(color='#4CAF50')
+            ))
+            
+            fig.update_layout(
+                title='予測 vs 実績（日別）',
+                xaxis_title='日付',
+                yaxis_title='販売数（体）'
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("過去30日間のデータがありません")
     
-    return pd.DataFrame(predictions)
+    except Exception as e:
+        st.info("""
+        📊 予測精度ダッシュボードを表示するには、自動学習システムのセットアップが必要です。
+        """)
 
 
 # =============================================================================
@@ -1097,7 +2501,15 @@ def main():
     render_main_tabs()
     
     st.divider()
-    st.caption("⛩️ 酒列磯前神社 授与品管理システム v9")
+    
+    # バージョン情報
+    version_info = "v12 (Vertex AI AutoML Forecasting統合版)"
+    if VERTEX_AI_AVAILABLE:
+        version_info += " | 🚀 Vertex AI: 有効"
+    else:
+        version_info += " | ⚠️ Vertex AI: 未設定"
+    
+    st.caption(f"⛩️ 酒列磯前神社 授与品管理システム {version_info}")
 
 
 if __name__ == "__main__":

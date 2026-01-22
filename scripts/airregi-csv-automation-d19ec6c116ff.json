@@ -1,0 +1,13 @@
+{
+  "type": "service_account",
+  "project_id": "airregi-csv-automation",
+  "private_key_id": "d19ec6c116ff5854f09fe7ef2fee77a074b7b71e",
+  "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCNx9LKoZ6Mh/O7\nxxjDaxTtB6SGQHx3itARyuBW9uYcTBKn7dYh4mHoC6Ku7FWvX3zXOkmH3ahhp9ZS\nFyIrubiD0w0LoWieyj4vnRe+vERfm5A3QDa6rFBO8NphdiASCIROXp8nHfuvFmxg\nohgtfD+LjBXzmeGucSRINOiPEwtu16Cxrc0ZlTUd6h/x9hB1wzi1Mcz/48yWR75t\ns1FnKm/Rrn6r7T0h8WvvIO8tf2YQTP+vCY7LYoT78MXo6+DRPGoK2nAMQaSuwQjO\nMbge+soSYL28i9LPn/pElQAARlr0NWJmVAvZgq/xxVOpmuRP13O3/DFqoSNcLeKF\nUK/sY7cdAgMBAAECggEAASbo/w1+IM0v/UwaVuglVOG1hAO9HymJFEPuO7ao2v0B\nP80OatsQiZainUI9Vf30ITmPhGOYLSb0dllKxUkuhx+tYPVQSM4C4Fcp7LpR4eb9\nLn2+lBi3VFTfqWAQ1aStEofxShuTwnHvsn9Oq/vw9jzOptqOu2Ce91k6tILmmmFy\nC5HIGPH2b2KRl4jiK0uVoOQKjE79ovmGHAhCm9yGh7K0HNOp1UuZI3YUzvzZEgt7\nrCDiXdp7OthWWlp0iuNPygSHwDyrsbQsVAmtbcguTA7WltemYisWbYd9K163dHGJ\nML33M+Wm3IgMkxEemp1xO+8dDNvExWz+YNusoDkEzwKBgQDCglFULi5Wi+7NH34F\nTTlPbEyRblzXm0ovZ1ucB/Trl14nzIQokDX74971q4YfXeO/ZMr14klFrg9R6rfb\nBxDdV0cexyJ/i6eQWFc+d08/tEkQtHEf13c65CnTxCQt2Xs4/Xbf9oWEPBZOEA90\nx/4TAlGzDFQVc/5fhBTZeorDfwKBgQC6mivWE4QDLjlZ+9NJz3pS0k8G/5m7jBmk\nZCbYKvujXn+LQo2KX4bTxXFwdeE17BNVJik0zM6w2E4B9pp5AUlFZFadGaa//9P8\nkMXRpuVu2ZSZtvuVAoJchq2pTEsfzohW8oYumMhneaH9nJOGu/0GoNOa/I4iPtV3\nDqthMOBjYwKBgCKcqfg+14QTFoVtyzEKUt5tORrP9rlvKr5QuB6F0/FwWBLg88t8\nDf8qx2wT/6PpQzO1reAfSkaZ+KPtDpZtJXUdqMwzR1JG+aRX8/5roLCHVlEgqtit\nsMvL+h1y07VM8/5qLBMifRPQ1W9CsF1pkS60xPEFipjesS8yA7vHcJXlAoGAWTJe\n5+rWPKr40TGV8v9RSourKP4/Hy4+B520D7qkJJiEQS4j+FPnYA1OR2Khr6PULeya\n39lSp6gNydR2TIc33gqzeE8NrVN9oooVdTzhCRbKeJvGMJlNdSsPkhCdDGwuMdmm\nGFoB2ayDqXYR8uKjdWqlG73Dt0zvvwRtGX1ClV8CgYBRJ76caTB+XIinBiWfEN0m\nsXnJSoDx8+nYEhVCukRZoiJIFCEkyJGANchkMN4Jq3yDipw4WCWibx+I/yo9j8IC\nv7zWRCsX3wWmK4OYdklyj08mEDmx/q4rDT2qipt8WkXt9f4y6pvqKafQXHUHiloj\nYM926ym7trwgQ/kgurRh6Q==\n-----END PRIVATE KEY-----\n",
+  "client_email": "airregi-csv-automation@airregi-csv-automation.iam.gserviceaccount.com",
+  "client_id": "110910234242075142918",
+  "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+  "token_uri": "https://oauth2.googleapis.com/token",
+  "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+  "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/airregi-csv-automation%40airregi-csv-automation.iam.gserviceaccount.com",
+  "universe_domain": "googleapis.com"
+}

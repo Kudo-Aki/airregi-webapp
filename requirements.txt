@@ -10,3 +10,9 @@ scikit-learn>=1.3.0
 python-dateutil>=2.8.0
 requests>=2.31.0
 jpholiday>=0.1.8
+
+# ========================================
+# v12追加: Vertex AI AutoML Forecasting用
+# ========================================
+google-cloud-aiplatform>=1.38.0
+protobuf>=4.21.0
