@@ -1,0 +1,47 @@
+# .github/workflows/evening_learning.yml
+# 毎晩の予測vs実績比較・学習ワークフロー
+
+name: Evening Learning
+
+on:
+  schedule:
+    # 毎晩22時（JST）= UTC 13時
+    - cron: '0 13 * * *'
+  workflow_dispatch:  # 手動実行も可能
+
+jobs:
+  evening-compare:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          pip install pandas numpy requests google-auth google-auth-oauthlib google-api-python-client
+      
+      - name: Run evening comparison & learning
+        env:
+          GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: |
+          cd scripts
+          python evening_compare.py
+      
+      - name: Summary
+        if: always()
+        run: |
+          echo "## 学習結果サマリー" >> $GITHUB_STEP_SUMMARY
+          echo "- 実行日時: $(TZ='Asia/Tokyo' date)" >> $GITHUB_STEP_SUMMARY
+          echo "- ステータス: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
