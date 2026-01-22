@@ -660,6 +660,9 @@ st.set_page_config(
 # カスタムCSS
 st.markdown("""
 <style>
+    /* ============================================
+       基本スタイル
+       ============================================ */
     .main-header {
         font-size: 2.5rem;
         font-weight: bold;
@@ -725,59 +728,160 @@ st.markdown("""
         border: 1px solid #1E88E5;
     }
     
-    /* スマホ対応レスポンシブCSS */
+    /* ============================================
+       グローバル設定（横スクロール防止）
+       ============================================ */
+    .main .block-container {
+        max-width: 100%;
+        padding-left: 1rem;
+        padding-right: 1rem;
+        overflow-x: hidden;
+    }
+    
+    /* データフレームの横スクロール対応 */
+    [data-testid="stDataFrame"] {
+        width: 100%;
+    }
+    [data-testid="stDataFrame"] > div {
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+    }
+    
+    /* ============================================
+       スマホ対応（768px以下）
+       ============================================ */
     @media screen and (max-width: 768px) {
+        /* ヘッダー */
         .main-header {
-            font-size: 1.5rem;
+            font-size: 1.4rem;
+            text-align: center;
         }
         .section-header {
-            font-size: 1.2rem;
+            font-size: 1.1rem;
         }
-        /* Streamlitのカラムを縦並びに */
+        
+        /* カラムを縦並びに */
         [data-testid="column"] {
             width: 100% !important;
             flex: 1 1 100% !important;
             min-width: 100% !important;
         }
-        /* メトリクスを小さく */
+        
+        /* メトリクス（数値表示）をコンパクトに */
         [data-testid="metric-container"] {
-            padding: 10px 5px;
+            padding: 8px 5px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            margin: 4px 0;
         }
-        [data-testid="metric-container"] > div {
-            font-size: 0.9rem;
+        [data-testid="stMetricLabel"] {
+            font-size: 0.75rem !important;
         }
         [data-testid="stMetricValue"] {
-            font-size: 1.2rem !important;
+            font-size: 1.1rem !important;
         }
-        /* タブのフォントサイズ調整 */
+        
+        /* メトリクスを2列表示に */
+        [data-testid="stHorizontalBlock"] {
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        [data-testid="stHorizontalBlock"] > [data-testid="column"] {
+            flex: 1 1 45% !important;
+            min-width: 45% !important;
+            max-width: 48% !important;
+        }
+        
+        /* タブ */
+        .stTabs [data-baseweb="tab-list"] {
+            gap: 0;
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
+            scrollbar-width: none;
+        }
+        .stTabs [data-baseweb="tab-list"]::-webkit-scrollbar {
+            display: none;
+        }
         .stTabs [data-baseweb="tab"] {
-            font-size: 0.8rem;
-            padding: 8px 12px;
+            font-size: 0.75rem;
+            padding: 8px 10px;
+            white-space: nowrap;
         }
-        /* ボタンの幅を100%に */
+        
+        /* ボタン */
         .stButton > button {
             width: 100%;
-        }
-        /* セレクトボックスのフォントサイズ */
-        .stSelectbox label {
-            font-size: 0.85rem;
-        }
-        /* 期間選択を縦並びに */
-        .stSelectbox {
-            margin-bottom: 5px;
-        }
-        /* カード内のテキスト調整 */
-        .analysis-card, .method-card {
-            padding: 10px;
+            padding: 12px 16px;
             font-size: 0.9rem;
         }
-        /* グラフのマージン調整 */
+        
+        /* 入力フィールド */
+        .stSelectbox, .stNumberInput, .stTextInput {
+            margin-bottom: 8px;
+        }
+        .stSelectbox label, .stNumberInput label, .stTextInput label {
+            font-size: 0.8rem;
+        }
+        
+        /* ラジオボタンを縦並びに */
+        [data-testid="stRadio"] > div {
+            flex-direction: column;
+            gap: 8px;
+        }
+        [data-testid="stRadio"] label {
+            font-size: 0.85rem;
+        }
+        
+        /* カード */
+        .analysis-card, .method-card {
+            padding: 10px;
+            font-size: 0.85rem;
+        }
+        .new-product-card {
+            padding: 15px;
+        }
+        .new-product-card h2 {
+            font-size: 1.1rem;
+        }
+        .new-product-card p {
+            font-size: 0.85rem;
+        }
+        
+        /* グラフ */
         .js-plotly-plot {
-            margin: 0 -15px;
+            margin: 0 -10px;
+        }
+        .js-plotly-plot .plotly .modebar {
+            display: none !important;
+        }
+        
+        /* Expander */
+        .streamlit-expanderHeader {
+            font-size: 0.9rem;
+            padding: 10px;
+        }
+        
+        /* Info/Warning/Errorボックス */
+        [data-testid="stAlert"] {
+            padding: 10px;
+            font-size: 0.85rem;
+        }
+        
+        /* Divider */
+        hr {
+            margin: 15px 0;
+        }
+        
+        /* 選択中の授与品 */
+        .product-tag {
+            font-size: 0.8rem;
+            padding: 4px 10px;
         }
     }
     
-    /* タブレット対応 */
+    /* ============================================
+       タブレット対応（769px〜1024px）
+       ============================================ */
     @media screen and (min-width: 769px) and (max-width: 1024px) {
         .main-header {
             font-size: 2rem;
@@ -787,7 +891,9 @@ st.markdown("""
         }
     }
     
-    /* 選択中の授与品の削除ボタン */
+    /* ============================================
+       選択中の授与品の削除ボタン
+       ============================================ */
     .product-tag {
         display: inline-flex;
         align-items: center;
@@ -805,6 +911,17 @@ st.markdown("""
     }
     .product-tag-remove:hover {
         color: #f44336;
+    }
+    
+    /* ============================================
+       パフォーマンス最適化
+       ============================================ */
+    /* アニメーションを軽量化 */
+    * {
+        -webkit-tap-highlight-color: transparent;
+    }
+    .stApp {
+        -webkit-font-smoothing: antialiased;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -853,6 +970,43 @@ def get_available_forecast_methods() -> List[str]:
             continue
         methods.append(method_name)
     return methods
+
+
+def get_mobile_chart_config() -> dict:
+    """スマホ最適化されたPlotlyチャート設定を取得"""
+    return {
+        'displayModeBar': False,  # ツールバー非表示
+        'staticPlot': False,      # 操作は可能
+        'responsive': True,       # レスポンシブ
+        'scrollZoom': False,      # スクロールズーム無効
+    }
+
+
+def get_mobile_chart_layout(title: str = '', height: int = 300) -> dict:
+    """スマホ最適化されたPlotlyレイアウト設定を取得"""
+    return {
+        'title': dict(text=title, font=dict(size=14)),
+        'height': height,
+        'margin': dict(l=40, r=20, t=40, b=40),
+        'legend': dict(
+            orientation='h',
+            yanchor='bottom',
+            y=1.02,
+            xanchor='center',
+            x=0.5,
+            font=dict(size=10)
+        ),
+        'xaxis': dict(
+            tickfont=dict(size=10),
+            title=dict(font=dict(size=11))
+        ),
+        'yaxis': dict(
+            tickfont=dict(size=10),
+            title=dict(font=dict(size=11))
+        ),
+        'dragmode': False,
+        'hovermode': 'x unified',
+    }
 
 
 # =============================================================================
@@ -1607,7 +1761,7 @@ def render_forecast_section(sales_data: pd.DataFrame):
 
 
 def display_single_forecast_result_v12(forecast: pd.DataFrame, forecast_days: int, method: str, method_message: str):
-    """単一の予測結果を表示（v12）"""
+    """単一の予測結果を表示（v12 スマホ最適化）"""
     raw_total = int(forecast['predicted'].sum())
     rounded_total = round_up_to_50(raw_total)
     avg_predicted = forecast['predicted'].mean()
@@ -1625,7 +1779,7 @@ def display_single_forecast_result_v12(forecast: pd.DataFrame, forecast_days: in
     col2.metric("📈 平均日販（予測）", f"{avg_predicted:.1f}体/日")
     col3.metric("📅 予測期間", f"{forecast_days}日間")
     
-    # グラフ表示
+    # グラフ表示（スマホ最適化）
     method_info = FORECAST_METHODS.get(method, {"color": "#4285F4"})
     
     fig = go.Figure()
@@ -1634,7 +1788,7 @@ def display_single_forecast_result_v12(forecast: pd.DataFrame, forecast_days: in
         y=forecast['predicted'],
         mode='lines',
         name='予測',
-        line=dict(color=method_info.get('color', '#4285F4'))
+        line=dict(color=method_info.get('color', '#4285F4'), width=2)
     ))
     
     # 信頼区間があれば表示
@@ -1643,7 +1797,7 @@ def display_single_forecast_result_v12(forecast: pd.DataFrame, forecast_days: in
             x=forecast['date'],
             y=forecast['confidence_upper'],
             mode='lines',
-            name='上限（95%信頼区間）',
+            name='上限',
             line=dict(color='rgba(66, 133, 244, 0.3)', dash='dash'),
             showlegend=True
         ))
@@ -1651,26 +1805,27 @@ def display_single_forecast_result_v12(forecast: pd.DataFrame, forecast_days: in
             x=forecast['date'],
             y=forecast['confidence_lower'],
             mode='lines',
-            name='下限（95%信頼区間）',
+            name='下限',
             line=dict(color='rgba(66, 133, 244, 0.3)', dash='dash'),
             fill='tonexty',
             fillcolor='rgba(66, 133, 244, 0.1)',
             showlegend=True
         ))
     
-    fig.update_layout(
-        title=f'{method}による日別予測',
-        xaxis_title='日付',
-        yaxis_title='予測販売数（体）'
-    )
-    st.plotly_chart(fig, use_container_width=True)
+    # スマホ最適化レイアウト
+    layout = get_mobile_chart_layout(f'{method}による日別予測', height=280)
+    layout['xaxis_title'] = '日付'
+    layout['yaxis_title'] = '予測販売数（体）'
+    fig.update_layout(**layout)
+    
+    st.plotly_chart(fig, use_container_width=True, config=get_mobile_chart_config())
     
     st.session_state.forecast_data = forecast
     st.session_state.forecast_total = rounded_total
 
 
 def display_comparison_results_v12(all_results: Dict[str, Tuple[pd.DataFrame, str]], forecast_days: int):
-    """すべての予測方法の比較結果を表示（v12）"""
+    """すべての予測方法の比較結果を表示（v12 スマホ最適化）"""
     st.success("✅ すべての予測方法で比較完了！")
     
     st.write("### 📊 予測方法別サマリー")
@@ -1682,26 +1837,34 @@ def display_comparison_results_v12(all_results: Dict[str, Tuple[pd.DataFrame, st
         '指数平滑法': '#FF9800'
     }
     
-    # カラムで表示
-    cols = st.columns(len(all_results))
-    for i, (method_name, (forecast, message)) in enumerate(all_results.items()):
-        rounded_total = round_up_to_50(int(forecast['predicted'].sum()))
-        avg_predicted = forecast['predicted'].mean()
-        
-        css_class = "vertex-ai" if "Vertex" in method_name else "seasonality" if "季節" in method_name else "moving-avg" if "移動" in method_name else "exponential"
-        
-        with cols[i]:
-            is_vertex = "Vertex" in method_name
-            badge = "🚀 " if is_vertex else ""
-            st.markdown(f"""
-            <div class="method-card method-{css_class}">
-                <strong>{badge}{method_name}</strong><br>
-                📦 {rounded_total:,}体<br>
-                📈 {avg_predicted:.1f}体/日
-            </div>
-            """, unsafe_allow_html=True)
+    # スマホでは2列表示
+    num_results = len(all_results)
+    cols_per_row = 2 if num_results > 2 else num_results
     
-    # 比較グラフ
+    results_list = list(all_results.items())
+    for i in range(0, num_results, cols_per_row):
+        cols = st.columns(cols_per_row)
+        for j, col in enumerate(cols):
+            idx = i + j
+            if idx < num_results:
+                method_name, (forecast, message) = results_list[idx]
+                rounded_total = round_up_to_50(int(forecast['predicted'].sum()))
+                avg_predicted = forecast['predicted'].mean()
+                
+                css_class = "vertex-ai" if "Vertex" in method_name else "seasonality" if "季節" in method_name else "moving-avg" if "移動" in method_name else "exponential"
+                
+                with col:
+                    is_vertex = "Vertex" in method_name
+                    badge = "🚀 " if is_vertex else ""
+                    st.markdown(f"""
+                    <div class="method-card method-{css_class}">
+                        <strong>{badge}{method_name}</strong><br>
+                        📦 {rounded_total:,}体<br>
+                        📈 {avg_predicted:.1f}体/日
+                    </div>
+                    """, unsafe_allow_html=True)
+    
+    # 比較グラフ（スマホ最適化）
     st.write("### 📈 日別予測比較グラフ")
     
     fig = go.Figure()
@@ -1712,16 +1875,15 @@ def display_comparison_results_v12(all_results: Dict[str, Tuple[pd.DataFrame, st
             y=forecast['predicted'],
             mode='lines',
             name=method_name,
-            line=dict(color=method_colors.get(method_name, '#666666'))
+            line=dict(color=method_colors.get(method_name, '#666666'), width=2)
         ))
     
-    fig.update_layout(
-        title='予測方法別の日別予測比較',
-        xaxis_title='日付',
-        yaxis_title='予測販売数（体）',
-        legend=dict(orientation='h', yanchor='bottom', y=1.02)
-    )
-    st.plotly_chart(fig, use_container_width=True)
+    layout = get_mobile_chart_layout('予測方法別の日別予測比較', height=300)
+    layout['xaxis_title'] = '日付'
+    layout['yaxis_title'] = '予測販売数（体）'
+    fig.update_layout(**layout)
+    
+    st.plotly_chart(fig, use_container_width=True, config=get_mobile_chart_config())
     
     # 推奨
     if 'Vertex AI' in all_results:
@@ -1783,6 +1945,9 @@ def render_individual_analysis(start_date: date, end_date: date):
             col4.metric("📅 期間", f"{period_days}日間")
     
     render_individual_forecast_section()
+    
+    # 個別モードでも納品計画を表示
+    render_delivery_section()
 
 
 def render_individual_forecast_section():
@@ -1941,7 +2106,7 @@ def render_individual_forecast_section():
 
 
 def render_delivery_section():
-    """納品計画セクション"""
+    """納品計画セクション（スケジュール提案付き）"""
     st.markdown('<p class="section-header">⑤ 納品計画を立てる</p>', unsafe_allow_html=True)
     
     forecast = st.session_state.get('forecast_data')
@@ -1952,33 +2117,339 @@ def render_delivery_section():
     
     total_demand = st.session_state.get('forecast_total', 0)
     method_used = st.session_state.get('last_forecast_method', '')
+    forecast_data = forecast
     
     if method_used:
         st.info(f"📦 予測された需要数: **{total_demand:,}体** （{method_used}）")
     else:
         st.info(f"📦 予測された需要数: **{total_demand:,}体**")
     
-    col1, col2 = st.columns(2)
+    # 入力セクション
+    st.write("**📝 在庫・発注情報を入力**")
+    
+    col1, col2, col3 = st.columns(3)
     
     with col1:
-        current_stock = st.number_input("🏠 現在の在庫数", min_value=0, value=500, step=50, key="stock_existing")
+        current_stock = st.number_input(
+            "🏠 現在の在庫数", 
+            min_value=0, 
+            value=500, 
+            step=50, 
+            key="stock_existing"
+        )
     
     with col2:
-        min_stock = st.number_input("⚠️ 安全在庫数", min_value=0, value=100, step=50, key="min_stock_existing")
+        min_stock = st.number_input(
+            "⚠️ 安全在庫数", 
+            min_value=0, 
+            value=100, 
+            step=50, 
+            key="min_stock_existing"
+        )
     
-    needed = total_demand + min_stock - current_stock
-    recommended_order = round_up_to_50(max(0, needed))
+    with col3:
+        lead_time = st.number_input(
+            "🚚 リードタイム(日)", 
+            min_value=1, 
+            value=14, 
+            step=1, 
+            key="lead_time",
+            help="発注から納品までの日数"
+        )
     
-    st.metric("🛒 推奨発注数", f"{recommended_order:,}体")
+    # 自動計算 or 手入力選択
+    order_mode = st.radio(
+        "発注数の決め方",
+        ["🔮 予測から自動計算", "✏️ 手入力で指定"],
+        horizontal=True,
+        key="order_mode"
+    )
     
-    with st.expander("📝 計算詳細"):
-        st.write(f"""
-        - 予測需要: {total_demand:,}体
-        - 安全在庫: +{min_stock:,}体
-        - 現在在庫: -{current_stock:,}体
-        - **必要数量: {needed:,}体**
-        - **発注数（50の倍数）: {recommended_order:,}体**
-        """)
+    if order_mode == "🔮 予測から自動計算":
+        needed = total_demand + min_stock - current_stock
+        recommended_order = round_up_to_50(max(0, needed))
+        order_quantity = recommended_order
+        
+        st.metric("🛒 推奨発注数", f"{recommended_order:,}体")
+        
+        with st.expander("📝 計算詳細", expanded=False):
+            st.write(f"""
+            - 予測需要: {total_demand:,}体
+            - 安全在庫: +{min_stock:,}体
+            - 現在在庫: -{current_stock:,}体
+            - **必要数量: {needed:,}体**
+            - **発注数（50の倍数）: {recommended_order:,}体**
+            """)
+    else:
+        order_quantity = st.number_input(
+            "✏️ 発注数を入力",
+            min_value=0,
+            value=round_up_to_50(max(0, total_demand + min_stock - current_stock)),
+            step=50,
+            key="manual_order_qty"
+        )
+    
+    # 納品スケジュール提案
+    st.divider()
+    st.write("**📅 納品スケジュール提案**")
+    
+    delivery_mode = st.radio(
+        "納品方法",
+        ["一括納品", "分割納品（月別）", "分割納品（カスタム）"],
+        horizontal=True,
+        key="delivery_mode"
+    )
+    
+    if st.button("📊 納品スケジュールを作成", type="primary", use_container_width=True, key="create_schedule_btn"):
+        if order_quantity <= 0:
+            st.warning("発注数が0です。発注の必要がありません。")
+        else:
+            schedule = create_delivery_schedule(
+                order_quantity=order_quantity,
+                current_stock=current_stock,
+                min_stock=min_stock,
+                lead_time=lead_time,
+                forecast_data=forecast_data,
+                delivery_mode=delivery_mode
+            )
+            
+            display_delivery_schedule(schedule, current_stock, min_stock, forecast_data)
+
+
+def create_delivery_schedule(
+    order_quantity: int,
+    current_stock: int,
+    min_stock: int,
+    lead_time: int,
+    forecast_data: pd.DataFrame,
+    delivery_mode: str
+) -> List[Dict]:
+    """納品スケジュールを作成"""
+    
+    today = date.today()
+    
+    if delivery_mode == "一括納品":
+        delivery_date = today + timedelta(days=lead_time)
+        return [{
+            'date': delivery_date,
+            'quantity': order_quantity,
+            'type': '一括納品'
+        }]
+    
+    elif delivery_mode == "分割納品（月別）":
+        if forecast_data is None or forecast_data.empty:
+            months = 3
+        else:
+            forecast_days = len(forecast_data)
+            months = max(1, forecast_days // 30)
+            months = min(months, 6)
+        
+        schedule = []
+        qty_per_delivery = round_up_to_50(order_quantity // months)
+        remaining = order_quantity
+        
+        for i in range(months):
+            delivery_date = today + timedelta(days=lead_time + (i * 30))
+            qty = min(qty_per_delivery, remaining)
+            if qty > 0:
+                schedule.append({
+                    'date': delivery_date,
+                    'quantity': qty,
+                    'type': f'{i+1}回目'
+                })
+                remaining -= qty
+        
+        if remaining > 0 and schedule:
+            schedule[-1]['quantity'] += remaining
+        
+        return schedule
+    
+    else:  # カスタム分割
+        schedule = []
+        stock = current_stock
+        
+        if forecast_data is not None and not forecast_data.empty:
+            daily_demands = forecast_data['predicted'].tolist()
+        else:
+            daily_demands = [5] * 180
+        
+        delivery_qty = round_up_to_50(order_quantity // 3)
+        remaining = order_quantity
+        last_delivery_date = today
+        
+        for i, daily_demand in enumerate(daily_demands):
+            target_date = today + timedelta(days=i)
+            stock -= daily_demand
+            
+            if stock <= min_stock and remaining > 0:
+                order_date = target_date - timedelta(days=lead_time)
+                if order_date < last_delivery_date:
+                    order_date = last_delivery_date + timedelta(days=1)
+                
+                delivery_date = order_date + timedelta(days=lead_time)
+                qty = min(delivery_qty, remaining)
+                
+                schedule.append({
+                    'date': delivery_date,
+                    'quantity': qty,
+                    'type': f'{len(schedule)+1}回目'
+                })
+                
+                stock += qty
+                remaining -= qty
+                last_delivery_date = delivery_date
+        
+        if not schedule and remaining > 0:
+            schedule.append({
+                'date': today + timedelta(days=lead_time),
+                'quantity': remaining,
+                'type': '一括納品'
+            })
+        
+        return schedule
+
+
+def display_delivery_schedule(schedule: List[Dict], current_stock: int, min_stock: int, forecast_data: pd.DataFrame):
+    """納品スケジュールを表示"""
+    
+    st.success(f"✅ 納品スケジュールを作成しました（{len(schedule)}回納品）")
+    
+    st.write("**📋 納品スケジュール**")
+    
+    schedule_df = pd.DataFrame([
+        {
+            '納品日': s['date'].strftime('%Y/%m/%d'),
+            '曜日': ['月','火','水','木','金','土','日'][s['date'].weekday()],
+            '数量': f"{s['quantity']:,}体",
+            '備考': s['type']
+        }
+        for s in schedule
+    ])
+    
+    st.dataframe(schedule_df, use_container_width=True, hide_index=True)
+    
+    total_delivery = sum(s['quantity'] for s in schedule)
+    st.metric("📦 納品合計", f"{total_delivery:,}体")
+    
+    with st.expander("📈 在庫推移シミュレーション", expanded=True):
+        sim_data = simulate_inventory(
+            schedule=schedule,
+            current_stock=current_stock,
+            min_stock=min_stock,
+            forecast_data=forecast_data
+        )
+        
+        if sim_data:
+            display_inventory_chart(sim_data, min_stock)
+
+
+def simulate_inventory(schedule: List[Dict], current_stock: int, min_stock: int, forecast_data: pd.DataFrame) -> List[Dict]:
+    """在庫シミュレーションを実行"""
+    
+    today = date.today()
+    
+    if forecast_data is None or forecast_data.empty:
+        return []
+    
+    sim_data = []
+    stock = current_stock
+    
+    delivery_dict = {}
+    for s in schedule:
+        d = s['date']
+        if d not in delivery_dict:
+            delivery_dict[d] = 0
+        delivery_dict[d] += s['quantity']
+    
+    sim_days = min(len(forecast_data), 90)
+    
+    for i in range(sim_days):
+        target_date = today + timedelta(days=i)
+        
+        if target_date in delivery_dict:
+            stock += delivery_dict[target_date]
+        
+        if i < len(forecast_data):
+            daily_demand = forecast_data.iloc[i]['predicted']
+        else:
+            daily_demand = forecast_data['predicted'].mean()
+        
+        stock -= daily_demand
+        stock = max(0, stock)
+        
+        sim_data.append({
+            'date': target_date,
+            'stock': stock,
+            'demand': daily_demand,
+            'delivery': delivery_dict.get(target_date, 0)
+        })
+    
+    return sim_data
+
+
+def display_inventory_chart(sim_data: List[Dict], min_stock: int):
+    """在庫推移グラフを表示（スマホ最適化）"""
+    
+    df = pd.DataFrame(sim_data)
+    
+    fig = go.Figure()
+    
+    fig.add_trace(go.Scatter(
+        x=df['date'],
+        y=df['stock'],
+        mode='lines',
+        name='在庫数',
+        line=dict(color='#1E88E5', width=2),
+        fill='tozeroy',
+        fillcolor='rgba(30, 136, 229, 0.1)'
+    ))
+    
+    fig.add_hline(
+        y=min_stock, 
+        line_dash="dash", 
+        line_color="red",
+        annotation_text=f"安全在庫 {min_stock}",
+        annotation_position="right"
+    )
+    
+    deliveries = df[df['delivery'] > 0]
+    if not deliveries.empty:
+        fig.add_trace(go.Scatter(
+            x=deliveries['date'],
+            y=deliveries['stock'],
+            mode='markers',
+            name='納品',
+            marker=dict(color='green', size=12, symbol='triangle-up')
+        ))
+    
+    fig.update_layout(
+        title='在庫推移シミュレーション',
+        xaxis_title='日付',
+        yaxis_title='在庫数（体）',
+        height=300,
+        margin=dict(l=10, r=10, t=40, b=10),
+        legend=dict(
+            orientation='h',
+            yanchor='bottom',
+            y=1.02,
+            xanchor='center',
+            x=0.5
+        ),
+        dragmode=False,
+    )
+    
+    config = {
+        'displayModeBar': False,
+        'staticPlot': False,
+        'responsive': True
+    }
+    
+    st.plotly_chart(fig, use_container_width=True, config=config)
+    
+    stock_below_min = df[df['stock'] < min_stock]
+    if not stock_below_min.empty:
+        first_danger = stock_below_min.iloc[0]['date']
+        st.warning(f"⚠️ {first_danger.strftime('%Y/%m/%d')}頃に在庫が安全在庫を下回る可能性があります")
 
 
 # =============================================================================

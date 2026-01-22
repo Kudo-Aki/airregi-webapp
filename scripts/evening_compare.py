@@ -26,7 +26,8 @@ from googleapiclient.discovery import build
 
 # 設定
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "1wbx8zfP-n-mDnzVshIaFulinpFj-uoIGmNIsI_QTEVQ")
-SERVICE_ACCOUNT_FILE = "airregi-csv-automation-d19ec6c116ff.json"
+# ローカル用: サービスアカウントキーは環境変数またはカレントディレクトリから
+SERVICE_ACCOUNT_FILE = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
 
 # メール設定
 SMTP_SERVER = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
@@ -50,13 +51,13 @@ def get_service():
             json.loads(sa_info),
             scopes=['https://www.googleapis.com/auth/spreadsheets']
         )
-    elif Path(SERVICE_ACCOUNT_FILE).exists():
+    elif SERVICE_ACCOUNT_FILE and Path(SERVICE_ACCOUNT_FILE).exists():
         creds = Credentials.from_service_account_file(
             SERVICE_ACCOUNT_FILE,
             scopes=['https://www.googleapis.com/auth/spreadsheets']
         )
     else:
-        raise FileNotFoundError("サービスアカウントキーが見つかりません")
+        raise FileNotFoundError("サービスアカウントキーが見つかりません。環境変数 GCP_SERVICE_ACCOUNT または GOOGLE_APPLICATION_CREDENTIALS を設定してください。")
     
     return build('sheets', 'v4', credentials=creds)
 
