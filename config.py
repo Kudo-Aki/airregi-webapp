@@ -12,7 +12,7 @@ CALENDAR_SHEET = "calendar_data"  # 新規作成するシート
 ALLOWED_DOMAINS = ["gmail.com"]  # 許可するGoogleアカウントのドメイン
 
 # キャッシュ設定（秒）
-CACHE_TTL = 300  # 5分
+CACHE_TTL = 600  # 5分
 
 # 商品名正規化設定
 NORMALIZE_OPTIONS = {
