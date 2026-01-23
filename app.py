@@ -949,6 +949,12 @@ if 'individual_sales_data' not in st.session_state:
     st.session_state.individual_sales_data = {}
 if 'last_forecast_method' not in st.session_state:
     st.session_state.last_forecast_method = ""
+if 'product_to_remove' not in st.session_state:
+    st.session_state.product_to_remove = None
+if 'clear_all_flag' not in st.session_state:
+    st.session_state.clear_all_flag = False
+if 'individual_forecast_results' not in st.session_state:
+    st.session_state.individual_forecast_results = []
 
 
 # =============================================================================
@@ -1406,55 +1412,55 @@ def render_category_tab():
                 st.rerun()
 
 
+def clear_all_products_callback():
+    """すべての商品をクリア（コールバック）"""
+    st.session_state.selected_products = []
+    st.session_state.analysis_mode = "合算"
+    st.session_state.sales_data = None
+    st.session_state.forecast_data = None
+    st.session_state.individual_sales_data = {}
+    st.session_state.individual_forecast_results = []
+
+
+def remove_product_callback(product_name: str):
+    """指定商品を削除（コールバック）"""
+    if product_name in st.session_state.selected_products:
+        st.session_state.selected_products.remove(product_name)
+    st.session_state.sales_data = None
+    st.session_state.forecast_data = None
+    st.session_state.individual_sales_data = {}
+    st.session_state.individual_forecast_results = []
+
+
 def render_selected_products():
     """選択中の授与品を表示（個別削除ボタン付き）"""
     st.divider()
-    
-    # 削除フラグの処理（ページ上部で実行）
-    if 'product_to_remove' in st.session_state and st.session_state.product_to_remove:
-        product = st.session_state.product_to_remove
-        if product in st.session_state.selected_products:
-            st.session_state.selected_products.remove(product)
-        st.session_state.sales_data = None
-        st.session_state.forecast_data = None
-        st.session_state.individual_sales_data = {}
-        st.session_state.product_to_remove = None
-        st.rerun()
-    
-    if 'clear_all_flag' in st.session_state and st.session_state.clear_all_flag:
-        st.session_state.selected_products = []
-        st.session_state.analysis_mode = "合算"
-        st.session_state.sales_data = None
-        st.session_state.forecast_data = None
-        st.session_state.individual_sales_data = {}
-        st.session_state.clear_all_flag = False
-        st.rerun()
     
     if st.session_state.selected_products:
         col1, col2 = st.columns([3, 1])
         with col1:
             st.write(f"**✅ 選択中の授与品（{len(st.session_state.selected_products)}件）**")
         with col2:
-            if st.button("🗑️ すべてクリア", key="clear_all_products"):
-                st.session_state.clear_all_flag = True
-                st.rerun()
+            st.button(
+                "🗑️ すべてクリア", 
+                key="clear_all_btn",
+                on_click=clear_all_products_callback
+            )
         
-        # 個別削除可能な授与品リスト表示
-        st.markdown("""
-        <div style="background: #e3f2fd; border-radius: 10px; padding: 15px; margin: 10px 0;">
-        """, unsafe_allow_html=True)
+        # 個別削除可能な授与品リスト
+        st.markdown('<div style="background: #e3f2fd; border-radius: 10px; padding: 15px; margin: 10px 0;">', unsafe_allow_html=True)
         
-        # 各商品を表示
-        products = st.session_state.selected_products.copy()
-        
-        for idx, product in enumerate(products):
+        for idx, product in enumerate(st.session_state.selected_products):
             col_name, col_btn = st.columns([5, 1])
             with col_name:
                 st.markdown(f"📦 **{product}**")
             with col_btn:
-                if st.button("✕", key=f"rm_{idx}", help=f"{product}を削除"):
-                    st.session_state.product_to_remove = product
-                    st.rerun()
+                st.button(
+                    "✕", 
+                    key=f"del_{idx}_{hash(product) % 9999}",
+                    on_click=remove_product_callback,
+                    args=(product,)
+                )
         
         st.markdown("</div>", unsafe_allow_html=True)
     else:
@@ -2281,23 +2287,93 @@ def render_individual_forecast_section():
 
 
 def render_delivery_section():
-    """納品計画セクション（スケジュール提案付き）"""
+    """納品計画セクション（個別モード対応）"""
     st.markdown('<p class="section-header">⑤ 納品計画を立てる</p>', unsafe_allow_html=True)
     
+    # 個別予測結果があるかチェック
+    individual_results = st.session_state.get('individual_forecast_results', [])
     forecast = st.session_state.get('forecast_data')
     
-    if forecast is None or (isinstance(forecast, pd.DataFrame) and forecast.empty):
+    if (not individual_results) and (forecast is None or (isinstance(forecast, pd.DataFrame) and forecast.empty)):
         st.info("需要予測を実行すると、納品計画を立てられます")
         return
     
+    # 複数商品の個別予測結果がある場合
+    if individual_results and len(individual_results) >= 1:
+        if len(individual_results) > 1:
+            st.success(f"📦 **{len(individual_results)}件の商品**の予測結果があります")
+            
+            delivery_view = st.radio(
+                "納品計画の表示方法",
+                ["📊 全商品を合算して計画", "📦 商品ごとに個別計画"],
+                horizontal=True,
+                key="delivery_view_mode_main"
+            )
+            
+            if delivery_view == "📦 商品ごとに個別計画":
+                st.divider()
+                for idx, r in enumerate(individual_results):
+                    product = r['product']
+                    forecast_df = r['forecast']
+                    rounded_total = r['rounded_total']
+                    avg_predicted = r['avg_predicted']
+                    
+                    with st.expander(f"📦 **{product}**（予測: {rounded_total:,}体、日販: {avg_predicted:.1f}体）", expanded=(idx==0)):
+                        render_delivery_inputs_and_schedule(
+                            total_demand=rounded_total,
+                            forecast_data=forecast_df,
+                            product_name=product,
+                            avg_daily=avg_predicted
+                        )
+                return
+        else:
+            # 1商品のみの場合
+            r = individual_results[0]
+            st.success(f"📦 **{r['product']}** の予測結果")
+    
+    # 合算モード
     total_demand = st.session_state.get('forecast_total', 0)
     method_used = st.session_state.get('last_forecast_method', '')
     forecast_data = forecast
     
+    # 平均日販を計算
+    forecast_days = len(forecast_data) if forecast_data is not None and not forecast_data.empty else 180
+    avg_daily = total_demand / forecast_days if forecast_days > 0 else 0
+    
     if method_used:
-        st.info(f"📦 予測された需要数: **{total_demand:,}体** （{method_used}）")
+        st.info(f"📦 予測された需要数: **{total_demand:,}体**（{forecast_days}日間、日販{avg_daily:.1f}体） - {method_used}")
     else:
-        st.info(f"📦 予測された需要数: **{total_demand:,}体**")
+        st.info(f"📦 予測された需要数: **{total_demand:,}体**（{forecast_days}日間、日販{avg_daily:.1f}体）")
+    
+    render_delivery_inputs_and_schedule(total_demand, forecast_data, "合算", avg_daily)
+
+
+def render_individual_delivery_plans(results: list):
+    """個別商品ごとの納品計画を表示"""
+    for idx, r in enumerate(results):
+        product = r['product']
+        forecast = r['forecast']
+        rounded_total = r['rounded_total']
+        avg_predicted = r['avg_predicted']
+        
+        with st.expander(f"📦 **{product}** の納品計画（予測: {rounded_total:,}体）", expanded=(idx==0)):
+            render_delivery_inputs_and_schedule(
+                total_demand=rounded_total,
+                forecast_data=forecast,
+                product_name=product,
+                avg_daily=avg_predicted
+            )
+
+
+def render_delivery_inputs_and_schedule(total_demand: int, forecast_data: pd.DataFrame, product_name: str, avg_daily: float = 0):
+    """納品計画の入力と計算を表示"""
+    
+    key_suffix = f"{product_name.replace(' ', '_')[:8]}_{hash(product_name) % 999}"
+    
+    # 予測期間（日数）を取得
+    forecast_days = len(forecast_data) if forecast_data is not None and not forecast_data.empty else 180
+    if avg_daily == 0:
+        avg_daily = total_demand / forecast_days if forecast_days > 0 else 0
     
     # 入力セクション
     st.write("**📝 在庫・発注情報を入力**")
@@ -2310,7 +2386,7 @@ def render_delivery_section():
             min_value=0, 
             value=500, 
             step=50, 
-            key="stock_existing"
+            key=f"stk_{key_suffix}"
         )
     
     with col2:
@@ -2319,7 +2395,7 @@ def render_delivery_section():
             min_value=0, 
             value=100, 
             step=50, 
-            key="min_stock_existing"
+            key=f"minstk_{key_suffix}"
         )
     
     with col3:
@@ -2328,40 +2404,57 @@ def render_delivery_section():
             min_value=1, 
             value=14, 
             step=1, 
-            key="lead_time",
+            key=f"lt_{key_suffix}",
             help="発注から納品までの日数"
         )
     
-    # 自動計算 or 手入力選択
+    # 発注数の計算
+    needed = total_demand + min_stock - current_stock
+    recommended_order = round_up_to_50(max(0, needed))
+    
+    # 推奨発注数と計算ロジックを常に表示
+    st.divider()
+    st.write("**🧮 発注推奨数の計算**")
+    
+    # 計算過程を表形式で表示
+    col_calc1, col_calc2 = st.columns([2, 1])
+    
+    with col_calc1:
+        st.markdown(f"""
+        | 計算項目 | 数値 | 説明 |
+        |:---------|-----:|:-----|
+        | ① 予測需要 | **{total_demand:,}体** | {forecast_days}日間 × {avg_daily:.1f}体/日 |
+        | ② 安全在庫 | **+{min_stock:,}体** | 欠品防止の余裕分 |
+        | ③ 現在在庫 | **-{current_stock:,}体** | 既にある在庫 |
+        | **必要数量** | **{needed:,}体** | ① + ② - ③ |
+        | **発注推奨数** | **{recommended_order:,}体** | 50の倍数に切り上げ |
+        """)
+    
+    with col_calc2:
+        if needed <= 0:
+            st.success(f"✅ 発注不要\n\n在庫で{forecast_days}日間カバー可能")
+        else:
+            days_until_stockout = int(current_stock / avg_daily) if avg_daily > 0 else 999
+            st.warning(f"⚠️ 要発注\n\n約{days_until_stockout}日で在庫切れ")
+    
+    # 発注数入力方法
     order_mode = st.radio(
         "発注数の決め方",
         ["🔮 予測から自動計算", "✏️ 手入力で指定"],
         horizontal=True,
-        key="order_mode"
+        key=f"ordmode_{key_suffix}"
     )
     
     if order_mode == "🔮 予測から自動計算":
-        needed = total_demand + min_stock - current_stock
-        recommended_order = round_up_to_50(max(0, needed))
         order_quantity = recommended_order
-        
-        st.metric("🛒 推奨発注数", f"{recommended_order:,}体")
-        
-        with st.expander("📝 計算詳細", expanded=False):
-            st.write(f"""
-            - 予測需要: {total_demand:,}体
-            - 安全在庫: +{min_stock:,}体
-            - 現在在庫: -{current_stock:,}体
-            - **必要数量: {needed:,}体**
-            - **発注数（50の倍数）: {recommended_order:,}体**
-            """)
+        st.metric("🛒 発注数（自動計算）", f"{recommended_order:,}体")
     else:
         order_quantity = st.number_input(
             "✏️ 発注数を入力",
             min_value=0,
-            value=round_up_to_50(max(0, total_demand + min_stock - current_stock)),
+            value=recommended_order,
             step=50,
-            key="manual_order_qty"
+            key=f"manord_{key_suffix}"
         )
     
     # 納品スケジュール提案
@@ -2372,10 +2465,10 @@ def render_delivery_section():
         "納品方法",
         ["一括納品", "分割納品（月別）", "分割納品（カスタム）"],
         horizontal=True,
-        key="delivery_mode"
+        key=f"delivery_mode_{key_suffix}"
     )
     
-    if st.button("📊 納品スケジュールを作成", type="primary", use_container_width=True, key="create_schedule_btn"):
+    if st.button("📊 納品スケジュールを作成", type="primary", use_container_width=True, key=f"create_schedule_btn_{key_suffix}"):
         if order_quantity <= 0:
             st.warning("発注数が0です。発注の必要がありません。")
         else:
@@ -3139,6 +3232,7 @@ def render_accuracy_dashboard():
 
 def main():
     """メイン関数"""
+    
     if not init_data():
         st.stop()
     
@@ -3149,7 +3243,7 @@ def main():
     st.divider()
     
     # バージョン情報
-    version_info = "v12 (Vertex AI AutoML Forecasting統合版)"
+    version_info = "v16 (個別納品計画・発注ロジック強化版)"
     if VERTEX_AI_AVAILABLE:
         version_info += " | 🚀 Vertex AI: 有効"
     else:
