@@ -1412,28 +1412,8 @@ def render_category_tab():
                 st.rerun()
 
 
-def clear_all_products_callback():
-    """すべての商品をクリア（コールバック）"""
-    st.session_state.selected_products = []
-    st.session_state.analysis_mode = "合算"
-    st.session_state.sales_data = None
-    st.session_state.forecast_data = None
-    st.session_state.individual_sales_data = {}
-    st.session_state.individual_forecast_results = []
-
-
-def remove_product_callback(product_name: str):
-    """指定商品を削除（コールバック）"""
-    if product_name in st.session_state.selected_products:
-        st.session_state.selected_products.remove(product_name)
-    st.session_state.sales_data = None
-    st.session_state.forecast_data = None
-    st.session_state.individual_sales_data = {}
-    st.session_state.individual_forecast_results = []
-
-
 def render_selected_products():
-    """選択中の授与品を表示（個別削除ボタン付き）"""
+    """選択中の授与品を表示（個別削除機能付き）"""
     st.divider()
     
     if st.session_state.selected_products:
@@ -1441,28 +1421,40 @@ def render_selected_products():
         with col1:
             st.write(f"**✅ 選択中の授与品（{len(st.session_state.selected_products)}件）**")
         with col2:
-            st.button(
-                "🗑️ すべてクリア", 
-                key="clear_all_btn",
-                on_click=clear_all_products_callback
-            )
+            if st.button("🗑️ すべてクリア", key="clear_all_btn_main"):
+                st.session_state.selected_products = []
+                st.session_state.analysis_mode = "合算"
+                st.session_state.sales_data = None
+                st.session_state.forecast_data = None
+                st.session_state.individual_sales_data = {}
+                st.session_state.individual_forecast_results = []
+                st.rerun()
         
-        # 個別削除可能な授与品リスト
+        # 選択中の商品を表示
         st.markdown('<div style="background: #e3f2fd; border-radius: 10px; padding: 15px; margin: 10px 0;">', unsafe_allow_html=True)
         
-        for idx, product in enumerate(st.session_state.selected_products):
-            col_name, col_btn = st.columns([5, 1])
-            with col_name:
-                st.markdown(f"📦 **{product}**")
-            with col_btn:
-                st.button(
-                    "✕", 
-                    key=f"del_{idx}_{hash(product) % 9999}",
-                    on_click=remove_product_callback,
-                    args=(product,)
-                )
+        for product in st.session_state.selected_products:
+            st.markdown(f"📦 **{product}**")
         
         st.markdown("</div>", unsafe_allow_html=True)
+        
+        # 削除用セレクトボックス
+        st.write("**🗑️ 商品を個別に削除**")
+        product_to_delete = st.selectbox(
+            "削除する商品を選択",
+            options=["（選択してください）"] + st.session_state.selected_products,
+            key="product_delete_select",
+            label_visibility="collapsed"
+        )
+        
+        if product_to_delete != "（選択してください）":
+            if st.button(f"「{product_to_delete}」を削除", key="delete_selected_product_btn", type="secondary"):
+                st.session_state.selected_products.remove(product_to_delete)
+                st.session_state.sales_data = None
+                st.session_state.forecast_data = None
+                st.session_state.individual_sales_data = {}
+                st.session_state.individual_forecast_results = []
+                st.rerun()
     else:
         st.warning("👆 上から授与品を選んでください")
 
@@ -1970,10 +1962,55 @@ def display_forecast_logic_explanation(method: str, sales_data: pd.DataFrame, fo
 
 
 def display_comparison_results_v12(all_results: Dict[str, Tuple[pd.DataFrame, str]], forecast_days: int, sales_data: pd.DataFrame = None):
-    """すべての予測方法の比較結果を表示（v12 スマホ最適化）"""
+    """すべての予測方法の比較結果を表示（v12 スマホ最適化 + 予測総数一覧）"""
     st.success("✅ すべての予測方法で比較完了！")
     
-    st.write("### 📊 予測方法別サマリー")
+    # 各予測方法の予測総数を計算
+    method_totals = {}
+    for method_name, (forecast, message) in all_results.items():
+        raw_total = int(forecast['predicted'].sum())
+        rounded_total = round_up_to_50(raw_total)
+        avg_predicted = forecast['predicted'].mean()
+        method_totals[method_name] = {
+            'raw': raw_total,
+            'rounded': rounded_total,
+            'avg': avg_predicted
+        }
+    
+    # ========== 予測総数サマリー表 ==========
+    st.write("### 📊 予測方法別 予測総数サマリー")
+    
+    # 表形式で表示
+    summary_rows = []
+    for method_name, totals in method_totals.items():
+        icon = "🚀" if "Vertex" in method_name else "📈" if "季節" in method_name else "📊" if "移動" in method_name else "📉"
+        summary_rows.append({
+            '予測方法': f"{icon} {method_name}",
+            '予測総数（生値）': f"{totals['raw']:,}体",
+            '発注推奨数（50倍数）': f"{totals['rounded']:,}体",
+            '平均日販': f"{totals['avg']:.1f}体/日"
+        })
+    
+    summary_df = pd.DataFrame(summary_rows)
+    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+    
+    # 4つの方法の統計
+    all_rounded = [t['rounded'] for t in method_totals.values()]
+    all_raw = [t['raw'] for t in method_totals.values()]
+    
+    st.write("### 📈 予測値の統計")
+    
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("📊 最小値", f"{min(all_rounded):,}体")
+    col2.metric("📊 最大値", f"{max(all_rounded):,}体")
+    col3.metric("📊 平均値", f"{round_up_to_50(int(sum(all_raw) / len(all_raw))):,}体")
+    col4.metric("📊 中央値", f"{round_up_to_50(int(sorted(all_raw)[len(all_raw)//2])):,}体")
+    
+    # 差分の表示
+    if len(all_rounded) >= 2:
+        diff = max(all_rounded) - min(all_rounded)
+        diff_pct = (max(all_raw) - min(all_raw)) / min(all_raw) * 100 if min(all_raw) > 0 else 0
+        st.info(f"📏 **予測値の幅**: 最小〜最大で **{diff:,}体** の差（{diff_pct:.1f}%）")
     
     method_colors = {
         'Vertex AI': '#4285F4',
@@ -1981,33 +2018,6 @@ def display_comparison_results_v12(all_results: Dict[str, Tuple[pd.DataFrame, st
         '移動平均法': '#1E88E5',
         '指数平滑法': '#FF9800'
     }
-    
-    # スマホでは2列表示
-    num_results = len(all_results)
-    cols_per_row = 2 if num_results > 2 else num_results
-    
-    results_list = list(all_results.items())
-    for i in range(0, num_results, cols_per_row):
-        cols = st.columns(cols_per_row)
-        for j, col in enumerate(cols):
-            idx = i + j
-            if idx < num_results:
-                method_name, (forecast, message) = results_list[idx]
-                rounded_total = round_up_to_50(int(forecast['predicted'].sum()))
-                avg_predicted = forecast['predicted'].mean()
-                
-                css_class = "vertex-ai" if "Vertex" in method_name else "seasonality" if "季節" in method_name else "moving-avg" if "移動" in method_name else "exponential"
-                
-                with col:
-                    is_vertex = "Vertex" in method_name
-                    badge = "🚀 " if is_vertex else ""
-                    st.markdown(f"""
-                    <div class="method-card method-{css_class}">
-                        <strong>{badge}{method_name}</strong><br>
-                        📦 {rounded_total:,}体<br>
-                        📈 {avg_predicted:.1f}体/日
-                    </div>
-                    """, unsafe_allow_html=True)
     
     # 比較グラフ（スマホ最適化）
     st.write("### 📈 日別予測比較グラフ")
@@ -2039,10 +2049,10 @@ def display_comparison_results_v12(all_results: Dict[str, Tuple[pd.DataFrame, st
     # セッション状態に保存（Vertex AIがあればそれ、なければ季節性考慮）
     if 'Vertex AI' in all_results:
         st.session_state.forecast_data = all_results['Vertex AI'][0]
-        st.session_state.forecast_total = round_up_to_50(int(all_results['Vertex AI'][0]['predicted'].sum()))
+        st.session_state.forecast_total = method_totals['Vertex AI']['rounded']
     elif '季節性考慮' in all_results:
         st.session_state.forecast_data = all_results['季節性考慮'][0]
-        st.session_state.forecast_total = round_up_to_50(int(all_results['季節性考慮'][0]['predicted'].sum()))
+        st.session_state.forecast_total = method_totals['季節性考慮']['rounded']
     
     st.session_state.forecast_results = {k: v[0] for k, v in all_results.items()}
 
