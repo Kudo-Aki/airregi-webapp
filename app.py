@@ -1410,64 +1410,55 @@ def render_selected_products():
     """選択中の授与品を表示（個別削除ボタン付き）"""
     st.divider()
     
+    # 削除フラグの処理（ページ上部で実行）
+    if 'product_to_remove' in st.session_state and st.session_state.product_to_remove:
+        product = st.session_state.product_to_remove
+        if product in st.session_state.selected_products:
+            st.session_state.selected_products.remove(product)
+        st.session_state.sales_data = None
+        st.session_state.forecast_data = None
+        st.session_state.individual_sales_data = {}
+        st.session_state.product_to_remove = None
+        st.rerun()
+    
+    if 'clear_all_flag' in st.session_state and st.session_state.clear_all_flag:
+        st.session_state.selected_products = []
+        st.session_state.analysis_mode = "合算"
+        st.session_state.sales_data = None
+        st.session_state.forecast_data = None
+        st.session_state.individual_sales_data = {}
+        st.session_state.clear_all_flag = False
+        st.rerun()
+    
     if st.session_state.selected_products:
         col1, col2 = st.columns([3, 1])
         with col1:
             st.write(f"**✅ 選択中の授与品（{len(st.session_state.selected_products)}件）**")
         with col2:
-            if st.button("🗑️ すべてクリア", key="clear_all_products", on_click=clear_all_selected_products):
-                pass  # callbackで処理
+            if st.button("🗑️ すべてクリア", key="clear_all_products"):
+                st.session_state.clear_all_flag = True
+                st.rerun()
         
         # 個別削除可能な授与品リスト表示
         st.markdown("""
         <div style="background: #e3f2fd; border-radius: 10px; padding: 15px; margin: 10px 0;">
         """, unsafe_allow_html=True)
         
-        # 3列で表示（スマホでは1列になる）
-        cols_per_row = 3
+        # 各商品を表示
         products = st.session_state.selected_products.copy()
         
-        for i in range(0, len(products), cols_per_row):
-            cols = st.columns(cols_per_row)
-            for j, col in enumerate(cols):
-                idx = i + j
-                if idx < len(products):
-                    product = products[idx]
-                    with col:
-                        col_inner1, col_inner2 = st.columns([4, 1])
-                        with col_inner1:
-                            st.markdown(f"📦 **{product}**")
-                        with col_inner2:
-                            # callback関数で削除処理
-                            st.button(
-                                "✕", 
-                                key=f"remove_product_{hash(product) % 10000}_{idx}", 
-                                help=f"{product}を削除",
-                                on_click=remove_single_product,
-                                args=(product,)
-                            )
+        for idx, product in enumerate(products):
+            col_name, col_btn = st.columns([5, 1])
+            with col_name:
+                st.markdown(f"📦 **{product}**")
+            with col_btn:
+                if st.button("✕", key=f"rm_{idx}", help=f"{product}を削除"):
+                    st.session_state.product_to_remove = product
+                    st.rerun()
         
         st.markdown("</div>", unsafe_allow_html=True)
     else:
         st.warning("👆 上から授与品を選んでください")
-
-
-def clear_all_selected_products():
-    """すべての選択をクリア（callback用）"""
-    st.session_state.selected_products = []
-    st.session_state.analysis_mode = "合算"
-    st.session_state.sales_data = None
-    st.session_state.forecast_data = None
-    st.session_state.individual_sales_data = {}
-
-
-def remove_single_product(product: str):
-    """単一の授与品を削除（callback用）"""
-    if product in st.session_state.selected_products:
-        st.session_state.selected_products.remove(product)
-    st.session_state.sales_data = None
-    st.session_state.forecast_data = None
-    st.session_state.individual_sales_data = {}
 
 
 def render_period_selection():
@@ -1508,30 +1499,81 @@ def render_period_selection():
         default_end = today
     
     with col2:
-        st.write("**期間指定**")
+        # 開始日
+        st.write("**開始日**")
+        col_sy, col_sm, col_sd = st.columns(3)
         
-        # カレンダーピッカーで選択（スマホでも使いやすい）
-        col_start, col_end = st.columns(2)
+        years = list(range(2022, today.year + 2))
+        months_jp = ["1月", "2月", "3月", "4月", "5月", "6月", "7月", "8月", "9月", "10月", "11月", "12月"]
         
-        with col_start:
-            start_date = st.date_input(
-                "開始日",
-                value=default_start,
-                min_value=date(2022, 1, 1),
-                max_value=today,
-                key="analysis_start_date",
-                format="YYYY/MM/DD"
+        with col_sy:
+            start_year = st.selectbox(
+                "年",
+                years,
+                index=years.index(default_start.year) if default_start.year in years else 0,
+                key="start_year",
+                label_visibility="collapsed"
             )
-        
-        with col_end:
-            end_date = st.date_input(
-                "終了日",
-                value=default_end,
-                min_value=date(2022, 1, 1),
-                max_value=today,
-                key="analysis_end_date",
-                format="YYYY/MM/DD"
+            st.caption("年")
+        with col_sm:
+            start_month = st.selectbox(
+                "月",
+                list(range(1, 13)),
+                index=default_start.month - 1,
+                format_func=lambda x: months_jp[x-1],
+                key="start_month",
+                label_visibility="collapsed"
             )
+            st.caption("月")
+        with col_sd:
+            max_day_start = calendar.monthrange(start_year, start_month)[1]
+            start_day = st.number_input(
+                "日",
+                min_value=1,
+                max_value=max_day_start,
+                value=min(default_start.day, max_day_start),
+                key="start_day",
+                label_visibility="collapsed"
+            )
+            st.caption("日")
+        
+        # 終了日
+        st.write("**終了日**")
+        col_ey, col_em, col_ed = st.columns(3)
+        
+        with col_ey:
+            end_year = st.selectbox(
+                "年",
+                years,
+                index=years.index(default_end.year) if default_end.year in years else 0,
+                key="end_year",
+                label_visibility="collapsed"
+            )
+            st.caption("年")
+        with col_em:
+            end_month = st.selectbox(
+                "月",
+                list(range(1, 13)),
+                index=default_end.month - 1,
+                format_func=lambda x: months_jp[x-1],
+                key="end_month",
+                label_visibility="collapsed"
+            )
+            st.caption("月")
+        with col_ed:
+            max_day_end = calendar.monthrange(end_year, end_month)[1]
+            end_day = st.number_input(
+                "日",
+                min_value=1,
+                max_value=max_day_end,
+                value=min(default_end.day, max_day_end),
+                key="end_day",
+                label_visibility="collapsed"
+            )
+            st.caption("日")
+    
+    start_date = date(start_year, start_month, start_day)
+    end_date = date(end_year, end_month, end_day)
     
     if start_date > end_date:
         st.error("⚠️ 開始日が終了日より後になっています")
@@ -1574,11 +1616,30 @@ def render_sales_analysis(start_date: date, end_date: date):
     period_days = (end_date - start_date).days + 1
     avg_daily = total_qty / period_days
     
+    # 平日・休日の平均を計算
+    df_agg['weekday'] = pd.to_datetime(df_agg['date']).dt.dayofweek
+    df_weekday = df_agg[df_agg['weekday'] < 5]  # 月〜金
+    df_weekend = df_agg[df_agg['weekday'] >= 5]  # 土日
+    
+    avg_weekday = df_weekday['販売商品数'].mean() if not df_weekday.empty else 0
+    avg_weekend = df_weekend['販売商品数'].mean() if not df_weekend.empty else 0
+    
+    # メトリクス表示（2行に分ける）
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("🛒 販売数量", f"{total_qty:,}体")
     col2.metric("💰 売上合計", f"¥{total_sales:,.0f}")
     col3.metric("📈 平均日販", f"{avg_daily:.1f}体/日")
     col4.metric("📅 期間", f"{period_days}日間")
+    
+    # 平日・休日の平均を表示
+    col5, col6, col7, col8 = st.columns(4)
+    col5.metric("📅 平日平均", f"{avg_weekday:.1f}体/日", help="月〜金曜日の平均")
+    col6.metric("🎌 休日平均", f"{avg_weekend:.1f}体/日", help="土・日曜日の平均")
+    
+    # 休日/平日比率
+    if avg_weekday > 0:
+        ratio = avg_weekend / avg_weekday
+        col7.metric("📊 休日/平日比", f"{ratio:.2f}倍")
     
     st.session_state.sales_data = df_agg
     
@@ -1718,14 +1779,14 @@ def render_forecast_section(sales_data: pd.DataFrame):
                     # すべての方法で予測
                     product_id = "_".join(st.session_state.selected_products[:3])
                     all_results = forecast_all_methods_with_vertex_ai(sales_data, forecast_days, product_id)
-                    display_comparison_results_v12(all_results, forecast_days)
+                    display_comparison_results_v12(all_results, forecast_days, sales_data)
                 else:
                     # 単一の予測方法
                     product_id = "_".join(st.session_state.selected_products[:3])
                     forecast, method_message = forecast_with_vertex_ai(sales_data, forecast_days, method, product_id)
                     
                     if forecast is not None and not forecast.empty:
-                        display_single_forecast_result_v12(forecast, forecast_days, method, method_message)
+                        display_single_forecast_result_v12(forecast, forecast_days, method, method_message, sales_data)
                     else:
                         st.error("予測結果が空です。データを確認してください。")
             except Exception as e:
@@ -1733,8 +1794,8 @@ def render_forecast_section(sales_data: pd.DataFrame):
                 logger.error(f"予測エラー: {e}")
 
 
-def display_single_forecast_result_v12(forecast: pd.DataFrame, forecast_days: int, method: str, method_message: str):
-    """単一の予測結果を表示（v12 スマホ最適化）"""
+def display_single_forecast_result_v12(forecast: pd.DataFrame, forecast_days: int, method: str, method_message: str, sales_data: pd.DataFrame = None):
+    """単一の予測結果を表示（v12 スマホ最適化 + ロジック説明）"""
     raw_total = int(forecast['predicted'].sum())
     rounded_total = round_up_to_50(raw_total)
     avg_predicted = forecast['predicted'].mean()
@@ -1751,6 +1812,10 @@ def display_single_forecast_result_v12(forecast: pd.DataFrame, forecast_days: in
     col1.metric("📦 予測販売総数", f"{rounded_total:,}体")
     col2.metric("📈 平均日販（予測）", f"{avg_predicted:.1f}体/日")
     col3.metric("📅 予測期間", f"{forecast_days}日間")
+    
+    # 予測ロジックの説明を追加
+    with st.expander("📊 予測ロジックの詳細", expanded=False):
+        display_forecast_logic_explanation(method, sales_data, forecast, forecast_days, avg_predicted)
     
     # グラフ表示（スマホ最適化）
     method_info = FORECAST_METHODS.get(method, {"color": "#4285F4"})
@@ -1797,7 +1862,108 @@ def display_single_forecast_result_v12(forecast: pd.DataFrame, forecast_days: in
     st.session_state.forecast_total = rounded_total
 
 
-def display_comparison_results_v12(all_results: Dict[str, Tuple[pd.DataFrame, str]], forecast_days: int):
+def display_forecast_logic_explanation(method: str, sales_data: pd.DataFrame, forecast: pd.DataFrame, forecast_days: int, avg_predicted: float):
+    """予測ロジックの詳細説明を表示"""
+    
+    if sales_data is None or sales_data.empty:
+        st.write("入力データがありません")
+        return
+    
+    # 入力データの統計
+    total_days = len(sales_data)
+    total_qty = int(sales_data['販売商品数'].sum())
+    avg_daily = sales_data['販売商品数'].mean()
+    max_daily = sales_data['販売商品数'].max()
+    min_daily = sales_data['販売商品数'].min()
+    
+    st.write("#### 📥 入力データ（過去の実績）")
+    st.write(f"""
+    - **分析期間**: {total_days}日間
+    - **総販売数**: {total_qty:,}体
+    - **平均日販**: {avg_daily:.1f}体/日
+    - **最大日販**: {max_daily:.0f}体/日
+    - **最小日販**: {min_daily:.0f}体/日
+    """)
+    
+    st.write("#### 🔮 予測ロジック")
+    
+    if "Vertex AI" in method:
+        st.write(f"""
+        **Vertex AI AutoML Forecasting**
+        1. 過去{total_days}日間のデータを機械学習モデルに入力
+        2. 時系列パターン（トレンド・周期性）を自動検出
+        3. 天気・六曜・イベント情報も考慮（共変量）
+        4. {forecast_days}日間の日別予測を生成
+        
+        **計算結果**:
+        - 予測平均日販: {avg_predicted:.1f}体/日
+        - 実績平均との差: {avg_predicted - avg_daily:+.1f}体/日 ({((avg_predicted/avg_daily)-1)*100:+.1f}%)
+        """)
+    
+    elif "季節性" in method:
+        # 曜日別平均を計算
+        if 'date' in sales_data.columns:
+            sales_data_copy = sales_data.copy()
+            sales_data_copy['weekday'] = pd.to_datetime(sales_data_copy['date']).dt.dayofweek
+            weekday_avg = sales_data_copy.groupby('weekday')['販売商品数'].mean()
+            weekday_names = ['月', '火', '水', '木', '金', '土', '日']
+            weekday_str = ", ".join([f"{weekday_names[i]}:{weekday_avg.get(i, 0):.1f}" for i in range(7)])
+        else:
+            weekday_str = "データなし"
+        
+        st.write(f"""
+        **季節性考慮予測**
+        1. 曜日別の平均販売数を計算
+        2. 月別の季節係数を算出
+        3. 曜日パターン × 季節係数で日別予測
+        
+        **曜日別平均**: {weekday_str}
+        
+        **計算結果**:
+        - 予測平均日販: {avg_predicted:.1f}体/日
+        - 実績平均との差: {avg_predicted - avg_daily:+.1f}体/日 ({((avg_predicted/avg_daily)-1)*100:+.1f}%)
+        """)
+    
+    elif "移動平均" in method:
+        # 直近30日の平均
+        recent_30 = sales_data.tail(30)['販売商品数'].mean() if len(sales_data) >= 30 else avg_daily
+        
+        st.write(f"""
+        **移動平均法**
+        1. 直近30日間の販売データを使用
+        2. 30日間の平均値を基準として予測
+        
+        **直近30日平均**: {recent_30:.1f}体/日
+        
+        **計算式**: 予測日販 = 直近30日平均 = {recent_30:.1f}体/日
+        **予測総数**: {recent_30:.1f} × {forecast_days}日 = {recent_30 * forecast_days:.0f}体
+        """)
+    
+    elif "指数平滑" in method:
+        alpha = 0.3  # 平滑化係数
+        recent_7 = sales_data.tail(7)['販売商品数'].mean() if len(sales_data) >= 7 else avg_daily
+        
+        st.write(f"""
+        **指数平滑法**
+        1. 直近のデータを重視（平滑化係数 α={alpha}）
+        2. 新しいデータほど高い重みで計算
+        
+        **直近7日平均**: {recent_7:.1f}体/日
+        **全期間平均**: {avg_daily:.1f}体/日
+        
+        **計算式**: 予測 = α×直近 + (1-α)×全体 = {alpha}×{recent_7:.1f} + {1-alpha}×{avg_daily:.1f} = {alpha*recent_7 + (1-alpha)*avg_daily:.1f}体/日
+        """)
+    
+    else:
+        st.write(f"""
+        **予測方法**: {method}
+        - 入力データ: {total_days}日間の実績
+        - 予測期間: {forecast_days}日間
+        - 予測平均日販: {avg_predicted:.1f}体/日
+        """)
+
+
+def display_comparison_results_v12(all_results: Dict[str, Tuple[pd.DataFrame, str]], forecast_days: int, sales_data: pd.DataFrame = None):
     """すべての予測方法の比較結果を表示（v12 スマホ最適化）"""
     st.success("✅ すべての予測方法で比較完了！")
     
@@ -1911,11 +2077,18 @@ def render_individual_analysis(start_date: date, end_date: date):
             period_days = (end_date - start_date).days + 1
             avg_daily = total_qty / period_days if period_days > 0 else 0
             
+            # 平日・休日の平均を計算
+            df_agg['weekday'] = pd.to_datetime(df_agg['date']).dt.dayofweek
+            df_weekday = df_agg[df_agg['weekday'] < 5]
+            df_weekend = df_agg[df_agg['weekday'] >= 5]
+            avg_weekday = df_weekday['販売商品数'].mean() if not df_weekday.empty else 0
+            avg_weekend = df_weekend['販売商品数'].mean() if not df_weekend.empty else 0
+            
             col1, col2, col3, col4 = st.columns(4)
             col1.metric("🛒 販売数量", f"{total_qty:,}体")
             col2.metric("💰 売上合計", f"¥{total_sales:,.0f}")
-            col3.metric("📈 平均日販", f"{avg_daily:.1f}体/日")
-            col4.metric("📅 期間", f"{period_days}日間")
+            col3.metric("📅 平日平均", f"{avg_weekday:.1f}体/日")
+            col4.metric("🎌 休日平均", f"{avg_weekend:.1f}体/日")
     
     render_individual_forecast_section()
     
@@ -1944,8 +2117,7 @@ def render_individual_forecast_section():
     
     with col2:
         available_methods = get_available_forecast_methods()
-        # 「すべての方法で比較」は個別モードでは除外
-        available_methods = [m for m in available_methods if "すべて" not in m]
+        # 個別モードでも「すべての方法で比較」を使用可能に
         
         method = st.selectbox(
             "予測方法",
@@ -2061,24 +2233,7 @@ def render_individual_forecast_section():
                     st.warning(f"{product}の予測に失敗: {e}")
             
             if results:
-                st.success(f"✅ {len(results)}件の授与品の予測が完了しました！")
-                
-                summary_df = pd.DataFrame([
-                    {
-                        '授与品': r['product'],
-                        '予測総数': f"{r['rounded_total']:,}体",
-                        '平均日販': f"{r['avg_predicted']:.1f}体/日",
-                        '発注推奨数（50倍数）': r['rounded_total']
-                    }
-                    for r in results
-                ])
-                st.dataframe(summary_df, use_container_width=True, hide_index=True)
-                
-                total_all = sum(r['rounded_total'] for r in results)
-                st.metric("📦 全体の予測総数", f"{total_all:,}体")
-                
                 # 納品計画で使えるようにsession_stateに保存
-                # 複数商品の予測を合算したDataFrameを作成
                 if len(results) == 1:
                     st.session_state.forecast_data = results[0]['forecast']
                 else:
@@ -2099,8 +2254,30 @@ def render_individual_forecast_section():
                     combined_forecast = combined_forecast.rename(columns={'predicted_sum': 'predicted'})
                     st.session_state.forecast_data = combined_forecast
                 
+                total_all = sum(r['rounded_total'] for r in results)
                 st.session_state.forecast_total = total_all
                 st.session_state.last_forecast_method = results[0]['method_message'] if results else ""
+                st.session_state.individual_forecast_results = results  # 結果を保存
+                st.rerun()  # 納品セクションを更新するため再描画
+    
+    # 予測結果の表示（session_stateから）
+    if 'individual_forecast_results' in st.session_state and st.session_state.individual_forecast_results:
+        results = st.session_state.individual_forecast_results
+        st.success(f"✅ {len(results)}件の授与品の予測が完了しました！")
+        
+        summary_df = pd.DataFrame([
+            {
+                '授与品': r['product'],
+                '予測総数': f"{r['rounded_total']:,}体",
+                '平均日販': f"{r['avg_predicted']:.1f}体/日",
+                '発注推奨数（50倍数）': r['rounded_total']
+            }
+            for r in results
+        ])
+        st.dataframe(summary_df, use_container_width=True, hide_index=True)
+        
+        total_all = sum(r['rounded_total'] for r in results)
+        st.metric("📦 全体の予測総数", f"{total_all:,}体")
 
 
 def render_delivery_section():
