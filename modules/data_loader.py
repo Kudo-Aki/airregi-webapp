@@ -174,9 +174,12 @@ class SheetsDataLoader:
             return pd.DataFrame()
         
         try:
+            # シート名を設定から取得
+            sheet_name = getattr(config, 'MAIL_ORDER_SHEET_NAME', 'フォームの回答 1')
+            
             result = _self.service.spreadsheets().values().get(
                 spreadsheetId=mail_order_id,
-                range="'フォームの回答 1'!A:BZ"  # 十分広い範囲
+                range=f"'{sheet_name}'!A:BZ"  # 十分広い範囲
             ).execute()
             
             values = result.get('values', [])
@@ -220,7 +223,7 @@ class SheetsDataLoader:
         # タイムスタンプ列を探す
         timestamp_col = None
         for col in df.columns:
-            if 'タイムスタンプ' in col or 'timestamp' in col.lower():
+            if 'タイムスタンプ' in str(col):
                 timestamp_col = col
                 break
         
@@ -233,7 +236,14 @@ class SheetsDataLoader:
             try:
                 # 日付を解析
                 if timestamp_col and pd.notna(row.get(timestamp_col)):
-                    timestamp = pd.to_datetime(row[timestamp_col], errors='coerce')
+                    timestamp_val = row[timestamp_col]
+                    
+                    # すでにTimestamp型の場合はそのまま使用
+                    if isinstance(timestamp_val, pd.Timestamp):
+                        timestamp = timestamp_val
+                    else:
+                        timestamp = pd.to_datetime(timestamp_val, errors='coerce')
+                    
                     if pd.isna(timestamp):
                         continue
                     order_date = timestamp.date()
@@ -245,25 +255,40 @@ class SheetsDataLoader:
                     if system_name is None:
                         continue
                     
-                    # フォームの列を探す
+                    # フォームの列を探す（完全一致または部分一致）
                     matched_col = None
                     for col in df.columns:
-                        if form_col in col:
+                        # 完全一致を優先
+                        if col == form_col:
                             matched_col = col
                             break
+                        # 部分一致（スペースの違いを吸収）
+                        elif form_col.strip() in col or col in form_col:
+                            matched_col = col
                     
                     if matched_col is None:
                         continue
                     
-                    qty_str = row.get(matched_col, '')
-                    if pd.isna(qty_str) or qty_str == '':
+                    qty_val = row.get(matched_col, '')
+                    
+                    # 空チェック
+                    if pd.isna(qty_val) or qty_val == '' or qty_val is None:
                         continue
                     
-                    # 数量を解析（数字のみ抽出）
-                    import re
-                    numbers = re.findall(r'\d+', str(qty_str))
-                    if numbers:
-                        qty = int(numbers[0])
+                    # 数量を解析
+                    try:
+                        # 数値型（float/int）の場合
+                        if isinstance(qty_val, (int, float)):
+                            qty = int(qty_val)
+                        else:
+                            # 文字列の場合は数字を抽出
+                            import re
+                            numbers = re.findall(r'\d+', str(qty_val))
+                            if numbers:
+                                qty = int(numbers[0])
+                            else:
+                                continue
+                        
                         if qty > 0:
                             results.append({
                                 'date': pd.Timestamp(order_date),
@@ -273,6 +298,8 @@ class SheetsDataLoader:
                                 '返品商品数': 0,
                                 'source': 'mail_order'
                             })
+                    except (ValueError, TypeError):
+                        continue
             
             except Exception as e:
                 continue
