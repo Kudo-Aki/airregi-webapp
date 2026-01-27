@@ -164,6 +164,134 @@ class SheetsDataLoader:
             max_date = df['date'].max()
             return min_date, max_date
         return None, None
+    
+    @st.cache_data(ttl=config.CACHE_TTL)
+    def load_mail_orders(_self) -> pd.DataFrame:
+        """郵送フォームデータを読み込み"""
+        mail_order_id = getattr(config, 'MAIL_ORDER_SPREADSHEET_ID', '')
+        
+        if not mail_order_id:
+            return pd.DataFrame()
+        
+        try:
+            result = _self.service.spreadsheets().values().get(
+                spreadsheetId=mail_order_id,
+                range="'フォームの回答 1'!A:BZ"  # 十分広い範囲
+            ).execute()
+            
+            values = result.get('values', [])
+            if not values or len(values) < 2:
+                return pd.DataFrame()
+            
+            # ヘッダーとデータを取得
+            headers = values[0]
+            data = values[1:]
+            
+            # 行の長さを揃える
+            max_cols = len(headers)
+            normalized_data = []
+            for row in data:
+                if len(row) < max_cols:
+                    row = row + [''] * (max_cols - len(row))
+                normalized_data.append(row[:max_cols])
+            
+            df = pd.DataFrame(normalized_data, columns=headers)
+            
+            return df
+        
+        except HttpError as e:
+            st.warning(f"郵送フォームデータの読み込みエラー: {e}")
+            return pd.DataFrame()
+        except Exception as e:
+            return pd.DataFrame()
+    
+    def get_mail_order_summary(_self) -> pd.DataFrame:
+        """郵送フォームから商品別・日付別の販売数を集計"""
+        df = _self.load_mail_orders()
+        
+        if df.empty:
+            return pd.DataFrame()
+        
+        product_columns = getattr(config, 'MAIL_ORDER_PRODUCT_COLUMNS', {})
+        
+        if not product_columns:
+            return pd.DataFrame()
+        
+        # タイムスタンプ列を探す
+        timestamp_col = None
+        for col in df.columns:
+            if 'タイムスタンプ' in col or 'timestamp' in col.lower():
+                timestamp_col = col
+                break
+        
+        if timestamp_col is None and len(df.columns) > 0:
+            timestamp_col = df.columns[0]  # 最初の列をタイムスタンプとして使用
+        
+        results = []
+        
+        for idx, row in df.iterrows():
+            try:
+                # 日付を解析
+                if timestamp_col and pd.notna(row.get(timestamp_col)):
+                    timestamp = pd.to_datetime(row[timestamp_col], errors='coerce')
+                    if pd.isna(timestamp):
+                        continue
+                    order_date = timestamp.date()
+                else:
+                    continue
+                
+                # 各商品の数量を取得
+                for form_col, system_name in product_columns.items():
+                    if system_name is None:
+                        continue
+                    
+                    # フォームの列を探す
+                    matched_col = None
+                    for col in df.columns:
+                        if form_col in col:
+                            matched_col = col
+                            break
+                    
+                    if matched_col is None:
+                        continue
+                    
+                    qty_str = row.get(matched_col, '')
+                    if pd.isna(qty_str) or qty_str == '':
+                        continue
+                    
+                    # 数量を解析（数字のみ抽出）
+                    import re
+                    numbers = re.findall(r'\d+', str(qty_str))
+                    if numbers:
+                        qty = int(numbers[0])
+                        if qty > 0:
+                            results.append({
+                                'date': pd.Timestamp(order_date),
+                                '商品名': system_name,
+                                '販売商品数': qty,
+                                '販売総売上': 0,  # 価格情報がないため0
+                                '返品商品数': 0,
+                                'source': 'mail_order'
+                            })
+            
+            except Exception as e:
+                continue
+        
+        if not results:
+            return pd.DataFrame()
+        
+        result_df = pd.DataFrame(results)
+        
+        # 日付・商品名でグループ化して集計
+        summary = result_df.groupby(['date', '商品名']).agg({
+            '販売商品数': 'sum',
+            '販売総売上': 'sum',
+            '返品商品数': 'sum'
+        }).reset_index()
+        
+        summary['source'] = 'mail_order'
+        
+        return summary
 
 
 def merge_with_calendar(sales_df: pd.DataFrame, calendar_df: pd.DataFrame) -> pd.DataFrame:
