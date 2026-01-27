@@ -14,7 +14,7 @@ CALENDAR_SHEET = "calendar_data"  # 新規作成するシート
 # 郵送依頼フォームの回答スプレッドシートID
 # フォームの回答シートのURLからIDを取得してください
 # 例: https://docs.google.com/spreadsheets/d/XXXXXX/edit → XXXXXX の部分
-MAIL_ORDER_SPREADSHEET_ID = ""  # ここに郵送フォームのスプレッドシートIDを設定
+MAIL_ORDER_SPREADSHEET_ID = "1Z_UU2oZIqNlFOnxN0G4A53YYyOP0AAVhLfDP2Bc0udI"  # ここに郵送フォームのスプレッドシートIDを設定
 
 # 郵送フォームのシート名
 MAIL_ORDER_SHEET_NAME = "フォームの回答 1"
