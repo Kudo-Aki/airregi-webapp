@@ -971,6 +971,80 @@ def round_up_to_50(value: int) -> int:
     return ((value + 49) // 50) * 50
 
 
+def match_mail_product_to_airregi(mail_product: str, airregi_names: list) -> Optional[str]:
+    """
+    郵送の商品名をAirレジの商品名にマッチングする共通関数
+    
+    Args:
+        mail_product: 郵送データの商品名
+        airregi_names: Airレジの商品名リスト（オリジナル名）
+    
+    Returns:
+        マッチしたAirレジの商品名、マッチしない場合はNone
+    """
+    mail_product = str(mail_product).strip()
+    
+    for airregi_name in airregi_names:
+        airregi_name_str = str(airregi_name).strip()
+        
+        # 1. 完全一致
+        if mail_product == airregi_name_str:
+            return airregi_name_str
+        
+        # 2. 郵送の商品名がAirレジの商品名に含まれている
+        # 例: 「うまくいく守」が「【午年アクリル】緑うまくいく守」に含まれる
+        if mail_product in airregi_name_str:
+            return airregi_name_str
+        
+        # 3. Airレジの商品名が郵送の商品名に含まれている（逆パターン）
+        if airregi_name_str in mail_product:
+            return airregi_name_str
+        
+        # 4. 【】（大括弧）を除去してマッチング
+        # 例: 「【午年アクリル】緑うまくいく守」→「緑うまくいく守」
+        clean_name = re.sub(r'【[^】]*】', '', airregi_name_str).strip()
+        if clean_name:
+            if mail_product in clean_name or clean_name in mail_product:
+                return airregi_name_str
+            if mail_product == clean_name:
+                return airregi_name_str
+        
+        # 5. 色名を除去してマッチング
+        # 例: 「緑うまくいく守」→「うまくいく守」
+        colors = ['緑', '白', '赤', '青', '黄', '金', '銀', 'ピンク', '紫', '黒', '茶', '水色', 'オレンジ']
+        clean_name_no_color = clean_name
+        for color in colors:
+            if clean_name_no_color.startswith(color):
+                clean_name_no_color = clean_name_no_color[len(color):]
+                break
+        
+        if clean_name_no_color and clean_name_no_color != clean_name:
+            if mail_product == clean_name_no_color:
+                return airregi_name_str
+            if mail_product in clean_name_no_color or clean_name_no_color in mail_product:
+                return airregi_name_str
+        
+        # 6. ()（丸括弧）も除去してマッチング
+        # 例: 「金運守（大）」→「金運守」
+        clean_name_no_paren = re.sub(r'[（(][^）)]*[）)]', '', clean_name).strip()
+        if clean_name_no_paren and clean_name_no_paren != clean_name:
+            if mail_product == clean_name_no_paren:
+                return airregi_name_str
+            if mail_product in clean_name_no_paren or clean_name_no_paren in mail_product:
+                return airregi_name_str
+        
+        # 7. 「守」「守り」の表記ゆれに対応
+        # 例: 「うまくいく守」と「うまくいく守り」
+        mail_normalized = mail_product.replace('守り', '守').replace('お守り', 'お守')
+        airregi_normalized = clean_name.replace('守り', '守').replace('お守り', 'お守')
+        if mail_normalized == airregi_normalized:
+            return airregi_name_str
+        if mail_normalized in airregi_normalized or airregi_normalized in mail_normalized:
+            return airregi_name_str
+    
+    return None
+
+
 def get_available_forecast_methods() -> List[str]:
     """利用可能な予測方法のリストを取得"""
     methods = []
@@ -1415,6 +1489,26 @@ def render_category_tab():
                 st.rerun()
 
 
+def clear_all_selected_products():
+    """すべての選択をクリア（callback用）"""
+    st.session_state.selected_products = []
+    st.session_state.analysis_mode = "合算"
+    st.session_state.sales_data = None
+    st.session_state.forecast_data = None
+    st.session_state.individual_sales_data = {}
+    st.session_state.individual_forecast_results = []
+
+
+def remove_single_product(product: str):
+    """単一の授与品を削除（callback用）"""
+    if product in st.session_state.selected_products:
+        st.session_state.selected_products.remove(product)
+    st.session_state.sales_data = None
+    st.session_state.forecast_data = None
+    st.session_state.individual_sales_data = {}
+    st.session_state.individual_forecast_results = []
+
+
 def render_selected_products():
     """選択中の授与品を表示（×ボタンで個別削除）"""
     st.divider()
@@ -1424,34 +1518,31 @@ def render_selected_products():
         with col1:
             st.write(f"**✅ 選択中の授与品（{len(st.session_state.selected_products)}件）**")
         with col2:
-            if st.button("🗑️ すべてクリア", key="clear_all_btn_main"):
-                st.session_state.selected_products = []
-                st.session_state.analysis_mode = "合算"
-                st.session_state.sales_data = None
-                st.session_state.forecast_data = None
-                st.session_state.individual_sales_data = {}
-                st.session_state.individual_forecast_results = []
-                st.rerun()
+            # callback方式で「すべてクリア」
+            st.button(
+                "🗑️ すべてクリア", 
+                key="clear_all_btn_main",
+                on_click=clear_all_selected_products
+            )
         
         # 選択中の商品リスト（×ボタン付き）
         st.markdown('<div style="background: #e3f2fd; border-radius: 10px; padding: 15px; margin: 10px 0;">', unsafe_allow_html=True)
         
-        # 各商品に×ボタンを付ける
+        # 各商品に×ボタンを付ける（callback方式）
         products_to_display = st.session_state.selected_products.copy()
         for i, product in enumerate(products_to_display):
             col_product, col_delete = st.columns([5, 1])
             with col_product:
                 st.markdown(f"📦 **{product}**")
             with col_delete:
-                # 個別削除ボタン
-                if st.button("✕", key=f"delete_btn_{i}_{product}", help=f"{product}を削除"):
-                    if product in st.session_state.selected_products:
-                        st.session_state.selected_products.remove(product)
-                        st.session_state.sales_data = None
-                        st.session_state.forecast_data = None
-                        st.session_state.individual_sales_data = {}
-                        st.session_state.individual_forecast_results = []
-                        st.rerun()
+                # callback方式で個別削除ボタン
+                st.button(
+                    "✕", 
+                    key=f"remove_product_{i}_{hash(product) % 10000}", 
+                    help=f"{product}を削除",
+                    on_click=remove_single_product,
+                    args=(product,)
+                )
         
         st.markdown("</div>", unsafe_allow_html=True)
     else:
@@ -1636,57 +1727,13 @@ def render_sales_analysis(start_date: date, end_date: date):
             for _, mail_row in df_mail.iterrows():
                 mail_product = str(mail_row['商品名']).strip()
                 
-                # オリジナル名（正規化前のAirレジ商品名）と比較
-                for orig_name in original_names:
-                    orig_name_str = str(orig_name).strip()
-                    
-                    # 1. 完全一致
-                    if mail_product == orig_name_str:
-                        new_row = mail_row.copy()
-                        matched_rows.append(new_row)
-                        break
-                    
-                    # 2. 郵送の商品名がAirレジの商品名に含まれている場合
-                    # 例: 「うまくいく守」が「【午年アクリル】緑うまくいく守」に含まれる
-                    elif mail_product in orig_name_str:
-                        new_row = mail_row.copy()
-                        new_row['商品名'] = orig_name_str  # Airレジの商品名に置き換え
-                        matched_rows.append(new_row)
-                        break
-                    
-                    # 3. Airレジの商品名が郵送の商品名に含まれている場合（逆パターン）
-                    elif orig_name_str in mail_product:
-                        new_row = mail_row.copy()
-                        new_row['商品名'] = orig_name_str
-                        matched_rows.append(new_row)
-                        break
-                    
-                    # 4. 【】を除去した名前でマッチング
-                    else:
-                        # 【】を除去
-                        clean_name = re.sub(r'【[^】]*】', '', orig_name_str).strip()
-                        if clean_name and (mail_product in clean_name or clean_name in mail_product):
-                            new_row = mail_row.copy()
-                            new_row['商品名'] = orig_name_str
-                            matched_rows.append(new_row)
-                            break
-                        
-                        # 5. さらに色名などを除去してマッチング（緑、白、赤など）
-                        # 例: 「緑うまくいく守」→「うまくいく守」
-                        colors = ['緑', '白', '赤', '青', '黄', '金', '銀', 'ピンク', '紫', '黒', '茶']
-                        clean_name_no_color = clean_name
-                        for color in colors:
-                            if clean_name_no_color.startswith(color):
-                                clean_name_no_color = clean_name_no_color[len(color):]
-                                break
-                        
-                        if clean_name_no_color and (mail_product == clean_name_no_color or 
-                                                     mail_product in clean_name_no_color or 
-                                                     clean_name_no_color in mail_product):
-                            new_row = mail_row.copy()
-                            new_row['商品名'] = orig_name_str
-                            matched_rows.append(new_row)
-                            break
+                # 共通マッチング関数を使用
+                matched_name = match_mail_product_to_airregi(mail_product, original_names)
+                
+                if matched_name:
+                    new_row = mail_row.copy()
+                    new_row['商品名'] = matched_name
+                    matched_rows.append(new_row)
             
             if matched_rows:
                 df_mail_matched = pd.DataFrame(matched_rows)
@@ -1764,12 +1811,194 @@ def render_sales_analysis(start_date: date, end_date: date):
             ratio = avg_weekend / avg_weekday
             col7.metric("📊 休日/平日比", f"{ratio:.2f}倍")
     
+    # ========== 過去との比較セクション ==========
+    render_period_comparison(df_items, original_names, start_date, end_date, total_qty)
+    
     st.session_state.sales_data = df_agg
     
     return df_agg
 
 
-def render_forecast_section(sales_data: pd.DataFrame):
+def render_period_comparison(df_items: pd.DataFrame, original_names: list, start_date: date, end_date: date, current_total: int):
+    """過去との比較（月次・年次）を表示"""
+    
+    with st.expander("📊 **過去との比較（月次・年次）**", expanded=False):
+        comparison_type = st.radio(
+            "比較タイプ",
+            ["昨年同期比較", "月次推移", "年次推移"],
+            horizontal=True,
+            key="comparison_type"
+        )
+        
+        if comparison_type == "昨年同期比較":
+            render_year_over_year_comparison(df_items, original_names, start_date, end_date, current_total)
+        elif comparison_type == "月次推移":
+            render_monthly_trend(df_items, original_names)
+        else:
+            render_yearly_trend(df_items, original_names)
+
+
+def render_year_over_year_comparison(df_items: pd.DataFrame, original_names: list, start_date: date, end_date: date, current_total: int):
+    """昨年同期との比較"""
+    st.write("### 📈 昨年同期との比較")
+    
+    # 昨年同期の期間を計算
+    last_year_start = date(start_date.year - 1, start_date.month, start_date.day)
+    last_year_end = date(end_date.year - 1, end_date.month, min(end_date.day, 28))  # 月末対策
+    
+    # 昨年同期のデータを取得
+    mask_last_year = (df_items['date'] >= pd.Timestamp(last_year_start)) & \
+                     (df_items['date'] <= pd.Timestamp(last_year_end))
+    df_last_year = df_items[mask_last_year]
+    df_last_year_agg = aggregate_by_products(df_last_year, original_names, aggregate=True)
+    
+    last_year_total = int(df_last_year_agg['販売商品数'].sum()) if not df_last_year_agg.empty else 0
+    
+    # 増減を計算
+    if last_year_total > 0:
+        diff = current_total - last_year_total
+        diff_pct = (diff / last_year_total) * 100
+        
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("📅 今期", f"{current_total:,}体")
+        col2.metric("📅 昨年同期", f"{last_year_total:,}体")
+        col3.metric("📊 増減数", f"{diff:+,}体", delta=f"{diff_pct:+.1f}%")
+        
+        if diff > 0:
+            col4.metric("📈 評価", "増加 ⬆️", delta=f"{diff_pct:.1f}%増")
+        elif diff < 0:
+            col4.metric("📉 評価", "減少 ⬇️", delta=f"{diff_pct:.1f}%減")
+        else:
+            col4.metric("➡️ 評価", "横ばい")
+        
+        # 詳細説明
+        st.info(f"""
+        **比較期間**
+        - 今期: {start_date.strftime('%Y年%m月%d日')} 〜 {end_date.strftime('%Y年%m月%d日')}
+        - 昨年同期: {last_year_start.strftime('%Y年%m月%d日')} 〜 {last_year_end.strftime('%Y年%m月%d日')}
+        
+        **結果**: 昨年同期と比べて **{abs(diff):,}体** {'増加' if diff > 0 else '減少'}（{abs(diff_pct):.1f}%{'増' if diff > 0 else '減'}）
+        """)
+    else:
+        st.warning("昨年同期のデータがありません")
+
+
+def render_monthly_trend(df_items: pd.DataFrame, original_names: list):
+    """月次推移を表示"""
+    st.write("### 📊 月次推移")
+    
+    # 全期間のデータを月別に集計
+    df_all = aggregate_by_products(df_items, original_names, aggregate=True)
+    
+    if df_all.empty:
+        st.warning("データがありません")
+        return
+    
+    df_all['date'] = pd.to_datetime(df_all['date'])
+    df_all['年月'] = df_all['date'].dt.to_period('M')
+    
+    monthly = df_all.groupby('年月').agg({
+        '販売商品数': 'sum',
+        '販売総売上': 'sum'
+    }).reset_index()
+    monthly['年月'] = monthly['年月'].astype(str)
+    
+    # 直近12ヶ月に絞る
+    monthly = monthly.tail(24)
+    
+    # 前月比を計算
+    monthly['前月比'] = monthly['販売商品数'].pct_change() * 100
+    
+    # グラフ
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=monthly['年月'],
+        y=monthly['販売商品数'],
+        name='販売数',
+        marker_color='#4285F4'
+    ))
+    
+    fig.update_layout(
+        title='月別販売数推移',
+        xaxis_title='年月',
+        yaxis_title='販売数（体）',
+        height=350
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # 表形式でも表示
+    st.write("**月別データ**")
+    display_df = monthly[['年月', '販売商品数', '前月比']].copy()
+    display_df.columns = ['年月', '販売数（体）', '前月比（%）']
+    display_df['販売数（体）'] = display_df['販売数（体）'].apply(lambda x: f"{int(x):,}")
+    display_df['前月比（%）'] = display_df['前月比（%）'].apply(lambda x: f"{x:+.1f}%" if pd.notna(x) else "-")
+    st.dataframe(display_df.tail(12), use_container_width=True, hide_index=True)
+
+
+def render_yearly_trend(df_items: pd.DataFrame, original_names: list):
+    """年次推移を表示"""
+    st.write("### 📊 年次推移")
+    
+    # 全期間のデータを年別に集計
+    df_all = aggregate_by_products(df_items, original_names, aggregate=True)
+    
+    if df_all.empty:
+        st.warning("データがありません")
+        return
+    
+    df_all['date'] = pd.to_datetime(df_all['date'])
+    df_all['年'] = df_all['date'].dt.year
+    
+    yearly = df_all.groupby('年').agg({
+        '販売商品数': 'sum',
+        '販売総売上': 'sum'
+    }).reset_index()
+    
+    # 前年比を計算
+    yearly['前年比'] = yearly['販売商品数'].pct_change() * 100
+    yearly['増減'] = yearly['販売商品数'].diff()
+    
+    # グラフ
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=yearly['年'].astype(str),
+        y=yearly['販売商品数'],
+        name='販売数',
+        marker_color='#4CAF50',
+        text=yearly['販売商品数'].apply(lambda x: f"{int(x):,}"),
+        textposition='outside'
+    ))
+    
+    fig.update_layout(
+        title='年別販売数推移',
+        xaxis_title='年',
+        yaxis_title='販売数（体）',
+        height=350
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # 表形式でも表示
+    st.write("**年別データ**")
+    display_df = yearly[['年', '販売商品数', '増減', '前年比']].copy()
+    display_df.columns = ['年', '販売数（体）', '増減（体）', '前年比（%）']
+    display_df['販売数（体）'] = display_df['販売数（体）'].apply(lambda x: f"{int(x):,}")
+    display_df['増減（体）'] = display_df['増減（体）'].apply(lambda x: f"{int(x):+,}" if pd.notna(x) else "-")
+    display_df['前年比（%）'] = display_df['前年比（%）'].apply(lambda x: f"{x:+.1f}%" if pd.notna(x) else "-")
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    
+    # サマリー
+    if len(yearly) >= 2:
+        latest_year = yearly.iloc[-1]
+        prev_year = yearly.iloc[-2]
+        diff = int(latest_year['販売商品数'] - prev_year['販売商品数'])
+        diff_pct = latest_year['前年比']
+        
+        st.info(f"""
+        **{int(latest_year['年'])}年 vs {int(prev_year['年'])}年**
+        - {int(prev_year['年'])}年: {int(prev_year['販売商品数']):,}体
+        - {int(latest_year['年'])}年: {int(latest_year['販売商品数']):,}体
+        - 増減: **{diff:+,}体** ({diff_pct:+.1f}%)
+        """)
     """需要予測セクション（Vertex AI対応）"""
     st.markdown('<p class="section-header">④ 需要を予測する</p>', unsafe_allow_html=True)
     
@@ -2208,7 +2437,7 @@ def display_comparison_results_v12(all_results: Dict[str, Tuple[pd.DataFrame, st
 
 
 def render_individual_analysis(start_date: date, end_date: date):
-    """個別分析モード"""
+    """個別分析モード（郵送データの内訳表示対応）"""
     st.markdown('<p class="section-header">③ 個別売上分析</p>', unsafe_allow_html=True)
     
     if not st.session_state.selected_products:
@@ -2221,24 +2450,84 @@ def render_individual_analysis(start_date: date, end_date: date):
         st.warning("データがありません")
         return
     
+    # 郵送データ統合オプション
+    mail_order_enabled = hasattr(config, 'MAIL_ORDER_SPREADSHEET_ID') and config.MAIL_ORDER_SPREADSHEET_ID
+    include_mail_orders = False
+    
+    if mail_order_enabled:
+        include_mail_orders = st.checkbox(
+            "📬 郵送注文データを含める",
+            value=True,
+            help="Googleフォームからの郵送依頼も需要に含めます",
+            key="individual_include_mail"
+        )
+    
     mask = (df_items['date'] >= pd.Timestamp(start_date)) & (df_items['date'] <= pd.Timestamp(end_date))
     df_filtered = df_items[mask]
     
+    # 郵送データを取得
+    df_mail = pd.DataFrame()
+    if include_mail_orders:
+        df_mail = st.session_state.data_loader.get_mail_order_summary()
+    
     individual_data = {}
+    individual_counts = {}  # エアレジ・郵送の内訳を保存
     
     for product in st.session_state.selected_products:
         original_names = st.session_state.normalizer.get_all_original_names([product])
-        df_agg = aggregate_by_products(df_filtered, original_names, aggregate=True)
+        df_agg_airregi = aggregate_by_products(df_filtered, original_names, aggregate=True)
+        
+        airregi_count = int(df_agg_airregi['販売商品数'].sum()) if not df_agg_airregi.empty else 0
+        mail_order_count = 0
+        
+        # 郵送データのマッチング処理（共通関数を使用）
+        df_mail_matched = pd.DataFrame()
+        if include_mail_orders and not df_mail.empty:
+            matched_rows = []
+            
+            for _, mail_row in df_mail.iterrows():
+                mail_product = str(mail_row['商品名']).strip()
+                
+                # 共通マッチング関数を使用
+                matched_name = match_mail_product_to_airregi(mail_product, original_names)
+                
+                if matched_name:
+                    new_row = mail_row.copy()
+                    new_row['商品名'] = matched_name
+                    matched_rows.append(new_row)
+            
+            if matched_rows:
+                df_mail_matched = pd.DataFrame(matched_rows)
+                if 'date' in df_mail_matched.columns:
+                    df_mail_matched['date'] = pd.to_datetime(df_mail_matched['date'], errors='coerce')
+                    mail_mask = (df_mail_matched['date'] >= pd.Timestamp(start_date)) & \
+                               (df_mail_matched['date'] <= pd.Timestamp(end_date))
+                    df_mail_matched = df_mail_matched[mail_mask]
+                mail_order_count = int(df_mail_matched['販売商品数'].sum()) if not df_mail_matched.empty else 0
+        
+        # データを結合
+        if not df_mail_matched.empty and include_mail_orders:
+            df_mail_for_merge = df_mail_matched[['date', '商品名', '販売商品数', '販売総売上', '返品商品数']].copy()
+            df_combined = pd.concat([df_agg_airregi, df_mail_for_merge], ignore_index=True)
+            df_agg = df_combined.groupby('date').agg({
+                '販売商品数': 'sum',
+                '販売総売上': 'sum',
+                '返品商品数': 'sum'
+            }).reset_index()
+        else:
+            df_agg = df_agg_airregi
         
         if not df_agg.empty:
             df_agg = df_agg.sort_values('date').reset_index(drop=True)
             individual_data[product] = df_agg
+            individual_counts[product] = {'airregi': airregi_count, 'mail': mail_order_count}
     
     st.session_state.individual_sales_data = individual_data
     
     for product, df_agg in individual_data.items():
         with st.expander(f"📦 **{product}**", expanded=True):
-            total_qty = int(df_agg['販売商品数'].sum())
+            counts = individual_counts.get(product, {'airregi': 0, 'mail': 0})
+            total_qty = counts['airregi'] + counts['mail']
             total_sales = df_agg['販売総売上'].sum()
             period_days = (end_date - start_date).days + 1
             avg_daily = total_qty / period_days if period_days > 0 else 0
@@ -2251,10 +2540,26 @@ def render_individual_analysis(start_date: date, end_date: date):
             avg_weekend = df_weekend['販売商品数'].mean() if not df_weekend.empty else 0
             
             col1, col2, col3, col4 = st.columns(4)
-            col1.metric("🛒 販売数量", f"{total_qty:,}体")
+            col1.metric("🛒 販売数量合計", f"{total_qty:,}体")
             col2.metric("💰 売上合計", f"¥{total_sales:,.0f}")
-            col3.metric("📅 平日平均", f"{avg_weekday:.1f}体/日")
-            col4.metric("🎌 休日平均", f"{avg_weekend:.1f}体/日")
+            col3.metric("📈 平均日販", f"{avg_daily:.1f}体/日")
+            col4.metric("📅 期間", f"{period_days}日間")
+            
+            # エアレジと郵送の内訳を表示
+            if include_mail_orders:
+                col5, col6, col7, col8 = st.columns(4)
+                col5.metric("🏪 Airレジ", f"{counts['airregi']:,}体")
+                col6.metric("📬 郵送", f"{counts['mail']:,}体")
+                if avg_weekday > 0:
+                    ratio = avg_weekend / avg_weekday
+                    col7.metric("📊 休日/平日比", f"{ratio:.2f}倍")
+            else:
+                col5, col6, col7, col8 = st.columns(4)
+                col5.metric("📅 平日平均", f"{avg_weekday:.1f}体/日")
+                col6.metric("🎌 休日平均", f"{avg_weekend:.1f}体/日")
+                if avg_weekday > 0:
+                    ratio = avg_weekend / avg_weekday
+                    col7.metric("📊 休日/平日比", f"{ratio:.2f}倍")
     
     render_individual_forecast_section()
     
