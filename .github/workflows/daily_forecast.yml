@@ -22,6 +22,7 @@ on:
 jobs:
   morning-forecast:
     runs-on: ubuntu-latest
+    # スケジュール実行時、または手動でmorning/bothを選択した時に実行
     if: github.event_name == 'schedule' || github.event.inputs.task == 'morning' || github.event.inputs.task == 'both'
     
     steps:
@@ -42,17 +43,16 @@ jobs:
           GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
         run: |
+          echo "Starting morning forecast..."
+          echo "SPREADSHEET_ID is set: $([[ -n \"$SPREADSHEET_ID\" ]] && echo 'Yes' || echo 'No')"
+          echo "GCP_SERVICE_ACCOUNT is set: $([[ -n \"$GCP_SERVICE_ACCOUNT\" ]] && echo 'Yes' || echo 'No')"
           cd scripts
           python morning_forecast.py
 
   evening-compare:
     runs-on: ubuntu-latest
-    needs: morning-forecast
-    # morning-forecastが成功またはスキップされた場合に実行（手動でeveningを選んだ場合も含む）
-    if: |
-      always() && 
-      (needs.morning-forecast.result == 'success' || needs.morning-forecast.result == 'skipped') &&
-      (github.event.inputs.task == 'evening' || github.event.inputs.task == 'both')
+    # morning-forecastの結果に関係なく、条件を満たせば実行
+    if: always() && (github.event_name == 'schedule' || github.event.inputs.task == 'evening' || github.event.inputs.task == 'both')
     
     steps:
       - name: Checkout repository
@@ -77,5 +77,8 @@ jobs:
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
         run: |
+          echo "Starting evening compare..."
+          echo "SPREADSHEET_ID is set: $([[ -n \"$SPREADSHEET_ID\" ]] && echo 'Yes' || echo 'No')"
+          echo "GCP_SERVICE_ACCOUNT is set: $([[ -n \"$GCP_SERVICE_ACCOUNT\" ]] && echo 'Yes' || echo 'No')"
           cd scripts
           python evening_compare.py
