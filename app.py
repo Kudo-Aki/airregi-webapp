@@ -1433,29 +1433,27 @@ def render_selected_products():
                 st.session_state.individual_forecast_results = []
                 st.rerun()
         
-        # 選択中の商品リスト
+        # 選択中の商品リスト（×ボタン付き）
         st.markdown('<div style="background: #e3f2fd; border-radius: 10px; padding: 15px; margin: 10px 0;">', unsafe_allow_html=True)
         
-        for product in st.session_state.selected_products:
-            st.markdown(f"📦 **{product}**")
+        # 各商品に×ボタンを付ける
+        products_to_display = st.session_state.selected_products.copy()
+        for i, product in enumerate(products_to_display):
+            col_product, col_delete = st.columns([5, 1])
+            with col_product:
+                st.markdown(f"📦 **{product}**")
+            with col_delete:
+                # 個別削除ボタン
+                if st.button("✕", key=f"delete_btn_{i}_{product}", help=f"{product}を削除"):
+                    if product in st.session_state.selected_products:
+                        st.session_state.selected_products.remove(product)
+                        st.session_state.sales_data = None
+                        st.session_state.forecast_data = None
+                        st.session_state.individual_sales_data = {}
+                        st.session_state.individual_forecast_results = []
+                        st.rerun()
         
         st.markdown("</div>", unsafe_allow_html=True)
-        
-        # 削除用のセレクトボックス
-        with st.expander("🗑️ 個別に削除する", expanded=False):
-            delete_product = st.selectbox(
-                "削除する授与品を選択",
-                options=st.session_state.selected_products,
-                key="delete_product_select"
-            )
-            if st.button("選択した授与品を削除", key="delete_single_btn"):
-                if delete_product in st.session_state.selected_products:
-                    st.session_state.selected_products.remove(delete_product)
-                    st.session_state.sales_data = None
-                    st.session_state.forecast_data = None
-                    st.session_state.individual_sales_data = {}
-                    st.session_state.individual_forecast_results = []
-                    st.rerun()
     else:
         st.warning("👆 上から授与品を選んでください")
 
@@ -1632,44 +1630,73 @@ def render_sales_analysis(start_date: date, end_date: date):
         df_mail = st.session_state.data_loader.get_mail_order_summary()
         
         if not df_mail.empty:
-            # 郵送データの商品名をAirレジの商品名にマッチング
+            # 郵送データの商品名をAirレジの商品名（オリジナル名）にマッチング
             matched_rows = []
             
             for _, mail_row in df_mail.iterrows():
-                mail_product = mail_row['商品名']
+                mail_product = str(mail_row['商品名']).strip()
                 
-                # 選択された商品名と郵送データの商品名をマッチング
-                for selected_product in st.session_state.selected_products:
-                    # 完全一致
-                    if mail_product == selected_product:
-                        matched_rows.append(mail_row)
-                        break
-                    # 郵送の商品名がAirレジの商品名に含まれている場合
-                    # 例: 「うまくいく守」が「【午年アクリル】緑うまくいく守」に含まれる
-                    elif mail_product in selected_product:
+                # オリジナル名（正規化前のAirレジ商品名）と比較
+                for orig_name in original_names:
+                    orig_name_str = str(orig_name).strip()
+                    
+                    # 1. 完全一致
+                    if mail_product == orig_name_str:
                         new_row = mail_row.copy()
-                        new_row['商品名'] = selected_product  # Airレジの商品名に置き換え
                         matched_rows.append(new_row)
                         break
-                    # Airレジの商品名から括弧を除いた部分でマッチ
-                    # 例: 「【午年アクリル】緑うまくいく守」→「緑うまくいく守」
+                    
+                    # 2. 郵送の商品名がAirレジの商品名に含まれている場合
+                    # 例: 「うまくいく守」が「【午年アクリル】緑うまくいく守」に含まれる
+                    elif mail_product in orig_name_str:
+                        new_row = mail_row.copy()
+                        new_row['商品名'] = orig_name_str  # Airレジの商品名に置き換え
+                        matched_rows.append(new_row)
+                        break
+                    
+                    # 3. Airレジの商品名が郵送の商品名に含まれている場合（逆パターン）
+                    elif orig_name_str in mail_product:
+                        new_row = mail_row.copy()
+                        new_row['商品名'] = orig_name_str
+                        matched_rows.append(new_row)
+                        break
+                    
+                    # 4. 【】を除去した名前でマッチング
                     else:
-                        import re
-                        # 【】を除去した名前を取得
-                        clean_name = re.sub(r'【[^】]*】', '', selected_product).strip()
-                        if mail_product in clean_name or clean_name in mail_product:
+                        # 【】を除去
+                        clean_name = re.sub(r'【[^】]*】', '', orig_name_str).strip()
+                        if clean_name and (mail_product in clean_name or clean_name in mail_product):
                             new_row = mail_row.copy()
-                            new_row['商品名'] = selected_product
+                            new_row['商品名'] = orig_name_str
+                            matched_rows.append(new_row)
+                            break
+                        
+                        # 5. さらに色名などを除去してマッチング（緑、白、赤など）
+                        # 例: 「緑うまくいく守」→「うまくいく守」
+                        colors = ['緑', '白', '赤', '青', '黄', '金', '銀', 'ピンク', '紫', '黒', '茶']
+                        clean_name_no_color = clean_name
+                        for color in colors:
+                            if clean_name_no_color.startswith(color):
+                                clean_name_no_color = clean_name_no_color[len(color):]
+                                break
+                        
+                        if clean_name_no_color and (mail_product == clean_name_no_color or 
+                                                     mail_product in clean_name_no_color or 
+                                                     clean_name_no_color in mail_product):
+                            new_row = mail_row.copy()
+                            new_row['商品名'] = orig_name_str
                             matched_rows.append(new_row)
                             break
             
             if matched_rows:
                 df_mail_matched = pd.DataFrame(matched_rows)
                 # 期間フィルタ
-                mail_mask = (df_mail_matched['date'] >= pd.Timestamp(start_date)) & \
-                           (df_mail_matched['date'] <= pd.Timestamp(end_date))
-                df_mail_matched = df_mail_matched[mail_mask]
-                mail_order_count = int(df_mail_matched['販売商品数'].sum())
+                if 'date' in df_mail_matched.columns:
+                    df_mail_matched['date'] = pd.to_datetime(df_mail_matched['date'], errors='coerce')
+                    mail_mask = (df_mail_matched['date'] >= pd.Timestamp(start_date)) & \
+                               (df_mail_matched['date'] <= pd.Timestamp(end_date))
+                    df_mail_matched = df_mail_matched[mail_mask]
+                mail_order_count = int(df_mail_matched['販売商品数'].sum()) if not df_mail_matched.empty else 0
     
     # データを結合
     if not df_mail_matched.empty and include_mail_orders:
@@ -2075,8 +2102,18 @@ def display_comparison_results_v12(all_results: Dict[str, Tuple[pd.DataFrame, st
             'avg': avg_predicted
         }
     
-    # ========== 各予測方法の予測総数を大きく表示 ==========
-    st.write("### 📊 各予測方法の予測総数")
+    # ========== 各予測方法の予測総数を明確に表示 ==========
+    st.write("### 📊 各予測方法の予測総数（発注推奨数）")
+    
+    # 分かりやすいリスト形式で表示
+    st.markdown("---")
+    for method_name, totals in method_totals.items():
+        icon = "🚀" if "Vertex" in method_name else "📈" if "季節" in method_name else "📊" if "移動" in method_name else "📉"
+        short_name = method_name.replace("（統計）", "").replace("（推奨）", "")
+        st.markdown(f"""
+        **{icon} {short_name}**: **{totals['rounded']:,}体**（日販 {totals['avg']:.1f}体、生値 {totals['raw']:,}体）
+        """)
+    st.markdown("---")
     
     # メトリクスで大きく表示
     num_methods = len(method_totals)
