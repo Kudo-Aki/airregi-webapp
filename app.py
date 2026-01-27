@@ -29,6 +29,7 @@ import re
 import os
 import json
 import logging
+import hashlib
 
 # ロギング設定
 logging.basicConfig(level=logging.INFO)
@@ -955,6 +956,8 @@ if 'clear_all_flag' not in st.session_state:
     st.session_state.clear_all_flag = False
 if 'individual_forecast_results' not in st.session_state:
     st.session_state.individual_forecast_results = []
+if 'pending_delete_product' not in st.session_state:
+    st.session_state.pending_delete_product = None
 
 
 # =============================================================================
@@ -1413,7 +1416,7 @@ def render_category_tab():
 
 
 def render_selected_products():
-    """選択中の授与品を表示（個別削除機能付き）"""
+    """選択中の授与品を表示（×ボタンで個別削除）"""
     st.divider()
     
     if st.session_state.selected_products:
@@ -1430,31 +1433,33 @@ def render_selected_products():
                 st.session_state.individual_forecast_results = []
                 st.rerun()
         
-        # 選択中の商品を表示
+        # 選択中の商品を×ボタン付きで表示
         st.markdown('<div style="background: #e3f2fd; border-radius: 10px; padding: 15px; margin: 10px 0;">', unsafe_allow_html=True)
         
-        for product in st.session_state.selected_products:
-            st.markdown(f"📦 **{product}**")
+        # 削除対象を追跡
+        delete_target = None
+        
+        # 商品リストを表示
+        for i, product in enumerate(st.session_state.selected_products):
+            col_name, col_btn = st.columns([6, 1])
+            with col_name:
+                st.markdown(f"📦 **{product}**")
+            with col_btn:
+                # 商品名をエンコードしてユニークキーを生成
+                btn_key = f"x_{i}_{abs(hash(product)) % 99999}"
+                if st.button("✕", key=btn_key, help=f"「{product}」を削除"):
+                    delete_target = product
         
         st.markdown("</div>", unsafe_allow_html=True)
         
-        # 削除用セレクトボックス
-        st.write("**🗑️ 商品を個別に削除**")
-        product_to_delete = st.selectbox(
-            "削除する商品を選択",
-            options=["（選択してください）"] + st.session_state.selected_products,
-            key="product_delete_select",
-            label_visibility="collapsed"
-        )
-        
-        if product_to_delete != "（選択してください）":
-            if st.button(f"「{product_to_delete}」を削除", key="delete_selected_product_btn", type="secondary"):
-                st.session_state.selected_products.remove(product_to_delete)
-                st.session_state.sales_data = None
-                st.session_state.forecast_data = None
-                st.session_state.individual_sales_data = {}
-                st.session_state.individual_forecast_results = []
-                st.rerun()
+        # 削除処理（ループの外で実行）
+        if delete_target is not None:
+            st.session_state.selected_products.remove(delete_target)
+            st.session_state.sales_data = None
+            st.session_state.forecast_data = None
+            st.session_state.individual_sales_data = {}
+            st.session_state.individual_forecast_results = []
+            st.rerun()
     else:
         st.warning("👆 上から授与品を選んでください")
 
@@ -1594,6 +1599,34 @@ def render_sales_analysis(start_date: date, end_date: date):
         st.warning("データがありません")
         return None
     
+    # 郵送データ統合オプション
+    mail_order_enabled = hasattr(config, 'MAIL_ORDER_SPREADSHEET_ID') and config.MAIL_ORDER_SPREADSHEET_ID
+    include_mail_orders = False
+    mail_order_count = 0
+    
+    if mail_order_enabled:
+        include_mail_orders = st.checkbox(
+            "📬 郵送注文データを含める",
+            value=True,
+            help="Googleフォームからの郵送依頼も需要に含めます"
+        )
+        
+        if include_mail_orders:
+            # 郵送データを読み込み
+            df_mail = st.session_state.data_loader.get_mail_order_summary()
+            
+            if not df_mail.empty:
+                # 郵送データにsource列がなければ追加
+                if 'source' not in df_items.columns:
+                    df_items['source'] = 'airregi'
+                
+                # 郵送データをマージ
+                df_items = pd.concat([df_items, df_mail], ignore_index=True)
+                
+                # 期間内の郵送注文数をカウント
+                mail_mask = (df_mail['date'] >= pd.Timestamp(start_date)) & (df_mail['date'] <= pd.Timestamp(end_date))
+                mail_order_count = int(df_mail[mail_mask]['販売商品数'].sum())
+    
     mask = (df_items['date'] >= pd.Timestamp(start_date)) & (df_items['date'] <= pd.Timestamp(end_date))
     df_filtered = df_items[mask]
     
@@ -1629,7 +1662,7 @@ def render_sales_analysis(start_date: date, end_date: date):
     col3.metric("📈 平均日販", f"{avg_daily:.1f}体/日")
     col4.metric("📅 期間", f"{period_days}日間")
     
-    # 平日・休日の平均を表示
+    # 平日・休日の平均と郵送注文を表示
     col5, col6, col7, col8 = st.columns(4)
     col5.metric("📅 平日平均", f"{avg_weekday:.1f}体/日", help="月〜金曜日の平均")
     col6.metric("🎌 休日平均", f"{avg_weekend:.1f}体/日", help="土・日曜日の平均")
@@ -1638,6 +1671,10 @@ def render_sales_analysis(start_date: date, end_date: date):
     if avg_weekday > 0:
         ratio = avg_weekend / avg_weekday
         col7.metric("📊 休日/平日比", f"{ratio:.2f}倍")
+    
+    # 郵送注文数を表示
+    if include_mail_orders and mail_order_count > 0:
+        col8.metric("📬 うち郵送", f"{mail_order_count:,}体", help="郵送依頼分の数量")
     
     st.session_state.sales_data = df_agg
     
