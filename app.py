@@ -1433,33 +1433,29 @@ def render_selected_products():
                 st.session_state.individual_forecast_results = []
                 st.rerun()
         
-        # 選択中の商品を×ボタン付きで表示
+        # 選択中の商品リスト
         st.markdown('<div style="background: #e3f2fd; border-radius: 10px; padding: 15px; margin: 10px 0;">', unsafe_allow_html=True)
         
-        # 削除対象を追跡
-        delete_target = None
-        
-        # 商品リストを表示
-        for i, product in enumerate(st.session_state.selected_products):
-            col_name, col_btn = st.columns([6, 1])
-            with col_name:
-                st.markdown(f"📦 **{product}**")
-            with col_btn:
-                # 商品名をエンコードしてユニークキーを生成
-                btn_key = f"x_{i}_{abs(hash(product)) % 99999}"
-                if st.button("✕", key=btn_key, help=f"「{product}」を削除"):
-                    delete_target = product
+        for product in st.session_state.selected_products:
+            st.markdown(f"📦 **{product}**")
         
         st.markdown("</div>", unsafe_allow_html=True)
         
-        # 削除処理（ループの外で実行）
-        if delete_target is not None:
-            st.session_state.selected_products.remove(delete_target)
-            st.session_state.sales_data = None
-            st.session_state.forecast_data = None
-            st.session_state.individual_sales_data = {}
-            st.session_state.individual_forecast_results = []
-            st.rerun()
+        # 削除用のセレクトボックス
+        with st.expander("🗑️ 個別に削除する", expanded=False):
+            delete_product = st.selectbox(
+                "削除する授与品を選択",
+                options=st.session_state.selected_products,
+                key="delete_product_select"
+            )
+            if st.button("選択した授与品を削除", key="delete_single_btn"):
+                if delete_product in st.session_state.selected_products:
+                    st.session_state.selected_products.remove(delete_product)
+                    st.session_state.sales_data = None
+                    st.session_state.forecast_data = None
+                    st.session_state.individual_sales_data = {}
+                    st.session_state.individual_forecast_results = []
+                    st.rerun()
     else:
         st.warning("👆 上から授与品を選んでください")
 
@@ -1599,9 +1595,15 @@ def render_sales_analysis(start_date: date, end_date: date):
         st.warning("データがありません")
         return None
     
+    # Airレジデータにsource列を追加
+    if 'source' not in df_items.columns:
+        df_items = df_items.copy()
+        df_items['source'] = 'airregi'
+    
     # 郵送データ統合オプション
     mail_order_enabled = hasattr(config, 'MAIL_ORDER_SPREADSHEET_ID') and config.MAIL_ORDER_SPREADSHEET_ID
     include_mail_orders = False
+    airregi_count = 0
     mail_order_count = 0
     
     if mail_order_enabled:
@@ -1610,31 +1612,85 @@ def render_sales_analysis(start_date: date, end_date: date):
             value=True,
             help="Googleフォームからの郵送依頼も需要に含めます"
         )
-        
-        if include_mail_orders:
-            # 郵送データを読み込み
-            df_mail = st.session_state.data_loader.get_mail_order_summary()
-            
-            if not df_mail.empty:
-                # 郵送データにsource列がなければ追加
-                if 'source' not in df_items.columns:
-                    df_items['source'] = 'airregi'
-                
-                # 郵送データをマージ
-                df_items = pd.concat([df_items, df_mail], ignore_index=True)
-                
-                # 期間内の郵送注文数をカウント
-                mail_mask = (df_mail['date'] >= pd.Timestamp(start_date)) & (df_mail['date'] <= pd.Timestamp(end_date))
-                mail_order_count = int(df_mail[mail_mask]['販売商品数'].sum())
     
-    mask = (df_items['date'] >= pd.Timestamp(start_date)) & (df_items['date'] <= pd.Timestamp(end_date))
-    df_filtered = df_items[mask]
-    
+    # 選択された商品のオリジナル名を取得
     original_names = st.session_state.normalizer.get_all_original_names(
         st.session_state.selected_products
     )
     
-    df_agg = aggregate_by_products(df_filtered, original_names, aggregate=True)
+    # Airレジデータをフィルタ
+    mask = (df_items['date'] >= pd.Timestamp(start_date)) & (df_items['date'] <= pd.Timestamp(end_date))
+    df_filtered_airregi = df_items[mask]
+    df_agg_airregi = aggregate_by_products(df_filtered_airregi, original_names, aggregate=True)
+    
+    if not df_agg_airregi.empty:
+        airregi_count = int(df_agg_airregi['販売商品数'].sum())
+    
+    # 郵送データを処理
+    df_mail_matched = pd.DataFrame()
+    if include_mail_orders:
+        df_mail = st.session_state.data_loader.get_mail_order_summary()
+        
+        if not df_mail.empty:
+            # 郵送データの商品名をAirレジの商品名にマッチング
+            matched_rows = []
+            
+            for _, mail_row in df_mail.iterrows():
+                mail_product = mail_row['商品名']
+                
+                # 選択された商品名と郵送データの商品名をマッチング
+                for selected_product in st.session_state.selected_products:
+                    # 完全一致
+                    if mail_product == selected_product:
+                        matched_rows.append(mail_row)
+                        break
+                    # 郵送の商品名がAirレジの商品名に含まれている場合
+                    # 例: 「うまくいく守」が「【午年アクリル】緑うまくいく守」に含まれる
+                    elif mail_product in selected_product:
+                        new_row = mail_row.copy()
+                        new_row['商品名'] = selected_product  # Airレジの商品名に置き換え
+                        matched_rows.append(new_row)
+                        break
+                    # Airレジの商品名から括弧を除いた部分でマッチ
+                    # 例: 「【午年アクリル】緑うまくいく守」→「緑うまくいく守」
+                    else:
+                        import re
+                        # 【】を除去した名前を取得
+                        clean_name = re.sub(r'【[^】]*】', '', selected_product).strip()
+                        if mail_product in clean_name or clean_name in mail_product:
+                            new_row = mail_row.copy()
+                            new_row['商品名'] = selected_product
+                            matched_rows.append(new_row)
+                            break
+            
+            if matched_rows:
+                df_mail_matched = pd.DataFrame(matched_rows)
+                # 期間フィルタ
+                mail_mask = (df_mail_matched['date'] >= pd.Timestamp(start_date)) & \
+                           (df_mail_matched['date'] <= pd.Timestamp(end_date))
+                df_mail_matched = df_mail_matched[mail_mask]
+                mail_order_count = int(df_mail_matched['販売商品数'].sum())
+    
+    # データを結合
+    if not df_mail_matched.empty and include_mail_orders:
+        # 郵送データをAirレジ形式に変換して結合
+        df_mail_for_merge = df_mail_matched[['date', '商品名', '販売商品数', '販売総売上', '返品商品数']].copy()
+        df_mail_for_merge['source'] = 'mail_order'
+        
+        # Airレジデータ
+        df_airregi_for_merge = df_filtered_airregi[df_filtered_airregi['商品名'].isin(original_names)].copy()
+        if 'source' not in df_airregi_for_merge.columns:
+            df_airregi_for_merge['source'] = 'airregi'
+        
+        # 結合
+        df_combined = pd.concat([df_airregi_for_merge, df_mail_for_merge], ignore_index=True)
+        df_agg = df_combined.groupby('date').agg({
+            '販売商品数': 'sum',
+            '販売総売上': 'sum',
+            '返品商品数': 'sum'
+        }).reset_index()
+    else:
+        df_agg = df_agg_airregi
     
     if df_agg.empty:
         st.warning("該当期間にデータがありません")
@@ -1642,39 +1698,44 @@ def render_sales_analysis(start_date: date, end_date: date):
     
     df_agg = df_agg.sort_values('date').reset_index(drop=True)
     
-    total_qty = int(df_agg['販売商品数'].sum())
+    total_qty = airregi_count + mail_order_count
     total_sales = df_agg['販売総売上'].sum()
     period_days = (end_date - start_date).days + 1
-    avg_daily = total_qty / period_days
+    avg_daily = total_qty / period_days if period_days > 0 else 0
     
     # 平日・休日の平均を計算
     df_agg['weekday'] = pd.to_datetime(df_agg['date']).dt.dayofweek
-    df_weekday = df_agg[df_agg['weekday'] < 5]  # 月〜金
-    df_weekend = df_agg[df_agg['weekday'] >= 5]  # 土日
+    df_weekday = df_agg[df_agg['weekday'] < 5]
+    df_weekend = df_agg[df_agg['weekday'] >= 5]
     
     avg_weekday = df_weekday['販売商品数'].mean() if not df_weekday.empty else 0
     avg_weekend = df_weekend['販売商品数'].mean() if not df_weekend.empty else 0
     
-    # メトリクス表示（2行に分ける）
+    # メトリクス表示
+    st.write("**📊 販売実績**")
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("🛒 販売数量", f"{total_qty:,}体")
+    col1.metric("🛒 販売数量合計", f"{total_qty:,}体")
     col2.metric("💰 売上合計", f"¥{total_sales:,.0f}")
     col3.metric("📈 平均日販", f"{avg_daily:.1f}体/日")
     col4.metric("📅 期間", f"{period_days}日間")
     
-    # 平日・休日の平均と郵送注文を表示
-    col5, col6, col7, col8 = st.columns(4)
-    col5.metric("📅 平日平均", f"{avg_weekday:.1f}体/日", help="月〜金曜日の平均")
-    col6.metric("🎌 休日平均", f"{avg_weekend:.1f}体/日", help="土・日曜日の平均")
-    
-    # 休日/平日比率
-    if avg_weekday > 0:
-        ratio = avg_weekend / avg_weekday
-        col7.metric("📊 休日/平日比", f"{ratio:.2f}倍")
-    
-    # 郵送注文数を表示
-    if include_mail_orders and mail_order_count > 0:
-        col8.metric("📬 うち郵送", f"{mail_order_count:,}体", help="郵送依頼分の数量")
+    # エアレジと郵送の内訳を表示
+    if include_mail_orders:
+        col5, col6, col7, col8 = st.columns(4)
+        col5.metric("🏪 Airレジ", f"{airregi_count:,}体")
+        col6.metric("📬 郵送", f"{mail_order_count:,}体")
+        
+        # 休日/平日比率
+        if avg_weekday > 0:
+            ratio = avg_weekend / avg_weekday
+            col7.metric("📊 休日/平日比", f"{ratio:.2f}倍")
+    else:
+        col5, col6, col7, col8 = st.columns(4)
+        col5.metric("📅 平日平均", f"{avg_weekday:.1f}体/日")
+        col6.metric("🎌 休日平均", f"{avg_weekend:.1f}体/日")
+        if avg_weekday > 0:
+            ratio = avg_weekend / avg_weekday
+            col7.metric("📊 休日/平日比", f"{ratio:.2f}倍")
     
     st.session_state.sales_data = df_agg
     
@@ -2014,33 +2075,48 @@ def display_comparison_results_v12(all_results: Dict[str, Tuple[pd.DataFrame, st
             'avg': avg_predicted
         }
     
-    # ========== 予測総数サマリー表 ==========
-    st.write("### 📊 予測方法別 予測総数サマリー")
+    # ========== 各予測方法の予測総数を大きく表示 ==========
+    st.write("### 📊 各予測方法の予測総数")
     
-    # 表形式で表示
-    summary_rows = []
-    for method_name, totals in method_totals.items():
+    # メトリクスで大きく表示
+    num_methods = len(method_totals)
+    cols = st.columns(num_methods)
+    
+    for i, (method_name, totals) in enumerate(method_totals.items()):
         icon = "🚀" if "Vertex" in method_name else "📈" if "季節" in method_name else "📊" if "移動" in method_name else "📉"
-        summary_rows.append({
-            '予測方法': f"{icon} {method_name}",
-            '予測総数（生値）': f"{totals['raw']:,}体",
-            '発注推奨数（50倍数）': f"{totals['rounded']:,}体",
-            '平均日販': f"{totals['avg']:.1f}体/日"
-        })
+        short_name = method_name.replace("（統計）", "").replace("（推奨）", "")
+        with cols[i]:
+            st.metric(
+                f"{icon} {short_name}",
+                f"{totals['rounded']:,}体",
+                f"日販 {totals['avg']:.1f}体"
+            )
     
-    summary_df = pd.DataFrame(summary_rows)
-    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+    # 詳細表
+    with st.expander("📋 詳細データを表示", expanded=False):
+        summary_rows = []
+        for method_name, totals in method_totals.items():
+            icon = "🚀" if "Vertex" in method_name else "📈" if "季節" in method_name else "📊" if "移動" in method_name else "📉"
+            summary_rows.append({
+                '予測方法': f"{icon} {method_name}",
+                '予測総数（生値）': f"{totals['raw']:,}体",
+                '発注推奨数（50倍数）': f"{totals['rounded']:,}体",
+                '平均日販': f"{totals['avg']:.1f}体/日"
+            })
+        
+        summary_df = pd.DataFrame(summary_rows)
+        st.dataframe(summary_df, use_container_width=True, hide_index=True)
     
-    # 4つの方法の統計
+    # 統計サマリー
     all_rounded = [t['rounded'] for t in method_totals.values()]
     all_raw = [t['raw'] for t in method_totals.values()]
     
     st.write("### 📈 予測値の統計")
     
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("📊 最小値", f"{min(all_rounded):,}体")
-    col2.metric("📊 最大値", f"{max(all_rounded):,}体")
-    col3.metric("📊 平均値", f"{round_up_to_50(int(sum(all_raw) / len(all_raw))):,}体")
+    col1.metric("📉 最小", f"{min(all_rounded):,}体")
+    col2.metric("📈 最大", f"{max(all_rounded):,}体")
+    col3.metric("📊 平均", f"{round_up_to_50(int(sum(all_raw) / len(all_raw))):,}体")
     col4.metric("📊 中央値", f"{round_up_to_50(int(sorted(all_raw)[len(all_raw)//2])):,}体")
     
     # 差分の表示
