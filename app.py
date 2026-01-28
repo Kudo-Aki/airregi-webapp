@@ -1588,12 +1588,26 @@ def render_selected_products():
         with col1:
             st.write(f"**✅ 選択中の授与品（{len(st.session_state.selected_products)}件）**")
         with col2:
-            # すべてクリアボタン（on_click callback方式）
-            st.button(
-                "🗑️ すべてクリア", 
-                key="clear_all_btn_main",
-                on_click=clear_all_selected_products
-            )
+            # すべてクリアボタン
+            if st.button("🗑️ すべてクリア", key="clear_all_btn_main"):
+                # 全商品のチェックボックス状態をリセット
+                for product in st.session_state.selected_products:
+                    checkbox_key = f"search_{product}"
+                    if checkbox_key in st.session_state:
+                        st.session_state[checkbox_key] = False
+                    mail_checkbox_key = f"mail_search_{product}"
+                    if mail_checkbox_key in st.session_state:
+                        st.session_state[mail_checkbox_key] = False
+                
+                st.session_state.selected_products = []
+                st.session_state.product_groups = {}
+                st.session_state.analysis_mode = "合算"
+                st.session_state.sales_data = None
+                st.session_state.forecast_data = None
+                st.session_state.individual_sales_data = {}
+                st.session_state.individual_forecast_results = []
+                st.session_state.individual_all_methods_results = {}
+                st.rerun()
         
         # グループ機能の説明
         if len(st.session_state.selected_products) > 1:
@@ -1630,14 +1644,29 @@ def render_selected_products():
                     st.rerun()
             
             with col_delete:
-                # ×ボタン（on_click callback方式）
-                st.button(
-                    "✕", 
-                    key=f"remove_btn_{i}_{hash(product) % 10000}",
-                    on_click=remove_single_product,
-                    args=(product,),
-                    help=f"{product}を削除"
-                )
+                # ×ボタン（フラグ方式 + チェックボックス状態リセット）
+                if st.button("✕", key=f"del_{i}_{hash(product) % 10000}", help=f"{product}を削除"):
+                    # 検索結果のチェックボックス状態をリセット
+                    checkbox_key = f"search_{product}"
+                    if checkbox_key in st.session_state:
+                        st.session_state[checkbox_key] = False
+                    mail_checkbox_key = f"mail_search_{product}"
+                    if mail_checkbox_key in st.session_state:
+                        st.session_state[mail_checkbox_key] = False
+                    
+                    # 商品を削除
+                    if product in st.session_state.selected_products:
+                        st.session_state.selected_products.remove(product)
+                    if product in st.session_state.product_groups:
+                        del st.session_state.product_groups[product]
+                    
+                    # 関連データをクリア
+                    st.session_state.sales_data = None
+                    st.session_state.forecast_data = None
+                    st.session_state.individual_sales_data = {}
+                    st.session_state.individual_forecast_results = []
+                    st.session_state.individual_all_methods_results = {}
+                    st.rerun()
         
         st.markdown("</div>", unsafe_allow_html=True)
         
@@ -3028,12 +3057,32 @@ def render_individual_forecast_section():
                     # session_stateに保存
                     st.session_state.individual_all_methods_results = matrix_results
                     
+                    # 納品計画用のデータを設定（季節性考慮を優先）
+                    preferred_method = '季節性考慮' if '季節性考慮' in method_names else method_names[0]
+                    
+                    # individual_forecast_resultsを設定（納品計画で使用）
+                    forecast_results_for_delivery = []
+                    for product, methods in matrix_results.items():
+                        forecast_results_for_delivery.append({
+                            'product': product,
+                            'forecast': None,  # 日別データは無いが、合計は使える
+                            'raw_total': methods.get(preferred_method, 0),
+                            'rounded_total': methods.get(preferred_method, 0),
+                            'avg_predicted': methods.get(preferred_method, 0) / forecast_days if forecast_days > 0 else 0,
+                            'method_message': f'{preferred_method}（すべての方法で比較から）'
+                        })
+                    
+                    st.session_state.individual_forecast_results = forecast_results_for_delivery
+                    
                     # 季節性考慮の結果を保存（納品計画用）
                     if '季節性考慮' in method_totals:
                         st.session_state.forecast_total = method_totals['季節性考慮']
                     elif method_totals:
                         first_method = method_names[0]
                         st.session_state.forecast_total = method_totals[first_method]
+                    
+                    st.session_state.last_forecast_method = f'{preferred_method}（すべての方法で比較）'
+                    st.rerun()
             else:
                 # 通常の単一予測方法の場合
                 results = []
@@ -3087,7 +3136,53 @@ def render_individual_forecast_section():
                     st.rerun()  # 納品セクションを更新するため再描画
     
     # 予測結果の表示（session_stateから）
-    if 'individual_forecast_results' in st.session_state and st.session_state.individual_forecast_results:
+    # 「すべての方法で比較」のマトリックス結果がある場合
+    if st.session_state.get('individual_all_methods_results'):
+        matrix_results = st.session_state.individual_all_methods_results
+        method_names = []
+        for product_methods in matrix_results.values():
+            for method_name in product_methods.keys():
+                if method_name not in method_names:
+                    method_names.append(method_name)
+        
+        st.success("✅ すべての予測方法で比較完了！")
+        
+        # マトリックス形式の表を作成
+        st.write("### 📊 商品×予測方法 マトリックス表")
+        
+        table_data = []
+        method_totals = {m: 0 for m in method_names}
+        
+        for product, methods in matrix_results.items():
+            row = {'商品名': product}
+            for method_name in method_names:
+                value = methods.get(method_name, 0)
+                row[method_name] = f"{value:,}体"
+                method_totals[method_name] += value
+            table_data.append(row)
+        
+        # 合計行を追加
+        total_row = {'商品名': '**合計**'}
+        for method_name in method_names:
+            total_row[method_name] = f"**{method_totals[method_name]:,}体**"
+        table_data.append(total_row)
+        
+        df_matrix = pd.DataFrame(table_data)
+        st.dataframe(df_matrix, use_container_width=True, hide_index=True)
+        
+        # 予測方法ごとの合計をメトリクスで表示
+        st.write("### 📈 予測方法別 合計")
+        
+        num_methods = len(method_names)
+        cols = st.columns(min(num_methods, 4))
+        for i, method_name in enumerate(method_names):
+            icon = "🚀" if "Vertex" in method_name else "📈" if "季節" in method_name else "📊" if "移動" in method_name else "📉"
+            short_name = method_name.replace("（統計）", "").replace("（推奨）", "")
+            with cols[i % 4]:
+                st.metric(f"{icon} {short_name}", f"{method_totals[method_name]:,}体")
+    
+    # 通常の予測結果がある場合
+    elif 'individual_forecast_results' in st.session_state and st.session_state.individual_forecast_results:
         results = st.session_state.individual_forecast_results
         st.success(f"✅ {len(results)}件の授与品の予測が完了しました！")
         
@@ -3110,11 +3205,21 @@ def render_delivery_section():
     """納品計画セクション（個別モード対応）"""
     st.markdown('<p class="section-header">⑤ 納品計画を立てる</p>', unsafe_allow_html=True)
     
-    # 個別予測結果があるかチェック
+    # 予測結果があるかチェック
     individual_results = st.session_state.get('individual_forecast_results', [])
     forecast = st.session_state.get('forecast_data')
+    forecast_total = st.session_state.get('forecast_total', 0)
+    all_methods_results = st.session_state.get('individual_all_methods_results', {})
     
-    if (not individual_results) and (forecast is None or (isinstance(forecast, pd.DataFrame) and forecast.empty)):
+    # 予測結果がない場合（individual_results、forecast、forecast_total、all_methods_resultsのいずれもない）
+    has_any_forecast = (
+        (individual_results and len(individual_results) > 0) or
+        (forecast is not None and not (isinstance(forecast, pd.DataFrame) and forecast.empty)) or
+        (forecast_total > 0) or
+        (all_methods_results and len(all_methods_results) > 0)
+    )
+    
+    if not has_any_forecast:
         st.info("需要予測を実行すると、納品計画を立てられます")
         return
     
@@ -4053,6 +4158,20 @@ def render_accuracy_dashboard():
 def main():
     """メイン関数"""
     
+    # ========== 削除フラグの処理（ページ先頭で実行） ==========
+    if st.session_state.get('pending_delete_product'):
+        product_to_delete = st.session_state.pending_delete_product
+        if product_to_delete in st.session_state.selected_products:
+            st.session_state.selected_products.remove(product_to_delete)
+        if product_to_delete in st.session_state.product_groups:
+            del st.session_state.product_groups[product_to_delete]
+        st.session_state.sales_data = None
+        st.session_state.forecast_data = None
+        st.session_state.individual_sales_data = {}
+        st.session_state.individual_forecast_results = []
+        st.session_state.individual_all_methods_results = {}
+        st.session_state.pending_delete_product = None
+    
     if not init_data():
         st.stop()
     
@@ -4063,7 +4182,7 @@ def main():
     st.divider()
     
     # バージョン情報
-    version_info = "v16 (個別納品計画・発注ロジック強化版)"
+    version_info = "v17 (グループ機能・年次比較・マトリックス予測版)"
     if VERTEX_AI_AVAILABLE:
         version_info += " | 🚀 Vertex AI: 有効"
     else:
