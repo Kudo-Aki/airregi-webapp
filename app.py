@@ -964,6 +964,9 @@ if 'product_groups' not in st.session_state:
 # 個別モードでの全予測方法の結果（マトリックス形式）
 if 'individual_all_methods_results' not in st.session_state:
     st.session_state.individual_all_methods_results = {}
+# 削除カウンター（チェックボックスのキーをリセットするため）
+if 'delete_counter' not in st.session_state:
+    st.session_state.delete_counter = 0
 
 
 # =============================================================================
@@ -1492,7 +1495,9 @@ def render_search_tab():
                         if bracket:
                             label += f" ({bracket})"
                         
-                        if st.checkbox(label, value=is_selected, key=f"search_{name}"):
+                        # キーに削除カウンターを含めることで、×ボタン後にリセット
+                        cb_key = f"search_{name}_{st.session_state.delete_counter}"
+                        if st.checkbox(label, value=is_selected, key=cb_key):
                             if name not in st.session_state.selected_products:
                                 st.session_state.selected_products.append(name)
                         else:
@@ -1510,7 +1515,9 @@ def render_search_tab():
                     with cols[i % 3]:
                         is_selected = name in st.session_state.selected_products
                         
-                        if st.checkbox(f"📬 {name}", value=is_selected, key=f"mail_search_{name}"):
+                        # キーに削除カウンターを含めることで、×ボタン後にリセット
+                        cb_key = f"mail_search_{name}_{st.session_state.delete_counter}"
+                        if st.checkbox(f"📬 {name}", value=is_selected, key=cb_key):
                             if name not in st.session_state.selected_products:
                                 st.session_state.selected_products.append(name)
                         else:
@@ -1590,15 +1597,6 @@ def render_selected_products():
         with col2:
             # すべてクリアボタン
             if st.button("🗑️ すべてクリア", key="clear_all_btn_main"):
-                # 全商品のチェックボックス状態をリセット
-                for product in st.session_state.selected_products:
-                    checkbox_key = f"search_{product}"
-                    if checkbox_key in st.session_state:
-                        st.session_state[checkbox_key] = False
-                    mail_checkbox_key = f"mail_search_{product}"
-                    if mail_checkbox_key in st.session_state:
-                        st.session_state[mail_checkbox_key] = False
-                
                 st.session_state.selected_products = []
                 st.session_state.product_groups = {}
                 st.session_state.analysis_mode = "合算"
@@ -1607,6 +1605,8 @@ def render_selected_products():
                 st.session_state.individual_sales_data = {}
                 st.session_state.individual_forecast_results = []
                 st.session_state.individual_all_methods_results = {}
+                # 削除カウンターをインクリメント（チェックボックスのキーをリセット）
+                st.session_state.delete_counter += 1
                 st.rerun()
         
         # グループ機能の説明
@@ -1644,21 +1644,16 @@ def render_selected_products():
                     st.rerun()
             
             with col_delete:
-                # ×ボタン（フラグ方式 + チェックボックス状態リセット）
+                # ×ボタン
                 if st.button("✕", key=f"del_{i}_{hash(product) % 10000}", help=f"{product}を削除"):
-                    # 検索結果のチェックボックス状態をリセット
-                    checkbox_key = f"search_{product}"
-                    if checkbox_key in st.session_state:
-                        st.session_state[checkbox_key] = False
-                    mail_checkbox_key = f"mail_search_{product}"
-                    if mail_checkbox_key in st.session_state:
-                        st.session_state[mail_checkbox_key] = False
-                    
                     # 商品を削除
                     if product in st.session_state.selected_products:
                         st.session_state.selected_products.remove(product)
                     if product in st.session_state.product_groups:
                         del st.session_state.product_groups[product]
+                    
+                    # 削除カウンターをインクリメント（チェックボックスのキーをリセット）
+                    st.session_state.delete_counter += 1
                     
                     # 関連データをクリア
                     st.session_state.sales_data = None
