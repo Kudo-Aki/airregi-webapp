@@ -958,6 +958,12 @@ if 'individual_forecast_results' not in st.session_state:
     st.session_state.individual_forecast_results = []
 if 'pending_delete_product' not in st.session_state:
     st.session_state.pending_delete_product = None
+# グループ管理用: {商品名: グループ番号} の辞書
+if 'product_groups' not in st.session_state:
+    st.session_state.product_groups = {}
+# 個別モードでの全予測方法の結果（マトリックス形式）
+if 'individual_all_methods_results' not in st.session_state:
+    st.session_state.individual_all_methods_results = {}
 
 
 # =============================================================================
@@ -1550,25 +1556,31 @@ def render_category_tab():
 def clear_all_selected_products():
     """すべての選択をクリア（callback用）"""
     st.session_state.selected_products = []
+    st.session_state.product_groups = {}  # グループ情報もクリア
     st.session_state.analysis_mode = "合算"
     st.session_state.sales_data = None
     st.session_state.forecast_data = None
     st.session_state.individual_sales_data = {}
     st.session_state.individual_forecast_results = []
+    st.session_state.individual_all_methods_results = {}
 
 
 def remove_single_product(product: str):
     """単一の授与品を削除（callback用）"""
     if product in st.session_state.selected_products:
         st.session_state.selected_products.remove(product)
+    # グループ情報からも削除
+    if product in st.session_state.product_groups:
+        del st.session_state.product_groups[product]
     st.session_state.sales_data = None
     st.session_state.forecast_data = None
     st.session_state.individual_sales_data = {}
     st.session_state.individual_forecast_results = []
+    st.session_state.individual_all_methods_results = {}
 
 
 def render_selected_products():
-    """選択中の授与品を表示（チェックボックスで選択解除）"""
+    """選択中の授与品を表示（×ボタンで削除、グループ選択機能付き）"""
     st.divider()
     
     if st.session_state.selected_products:
@@ -1576,40 +1588,77 @@ def render_selected_products():
         with col1:
             st.write(f"**✅ 選択中の授与品（{len(st.session_state.selected_products)}件）**")
         with col2:
-            # すべてクリアボタン
-            if st.button("🗑️ すべてクリア", key="clear_all_btn_main"):
-                st.session_state.selected_products = []
-                st.session_state.analysis_mode = "合算"
-                st.session_state.sales_data = None
-                st.session_state.forecast_data = None
-                st.session_state.individual_sales_data = {}
-                st.session_state.individual_forecast_results = []
-                st.rerun()
+            # すべてクリアボタン（on_click callback方式）
+            st.button(
+                "🗑️ すべてクリア", 
+                key="clear_all_btn_main",
+                on_click=clear_all_selected_products
+            )
         
-        # 選択中の商品をチェックボックス形式で表示（チェックを外すと削除される）
+        # グループ機能の説明
+        if len(st.session_state.selected_products) > 1:
+            st.caption("💡 同じグループ番号の商品は合算して分析されます。グループ0は単独扱いです。")
+        
+        # 選択中の商品リスト（×ボタン＋グループ選択付き）
         st.markdown('<div style="background: #e3f2fd; border-radius: 10px; padding: 15px; margin: 10px 0;">', unsafe_allow_html=True)
         
         products_copy = st.session_state.selected_products.copy()
-        products_to_keep = []
         
-        # 3列で表示
-        cols = st.columns(3)
+        # 各商品に×ボタンとグループ選択を付ける
         for i, product in enumerate(products_copy):
-            with cols[i % 3]:
-                # チェックボックスで表示（チェックを外すと削除）
-                if st.checkbox(f"📦 {product}", value=True, key=f"selected_product_cb_{i}_{hash(product) % 10000}"):
-                    products_to_keep.append(product)
+            # 現在のグループ番号を取得（デフォルトは0=単独）
+            current_group = st.session_state.product_groups.get(product, 0)
+            
+            col_product, col_group, col_delete = st.columns([4, 2, 1])
+            
+            with col_product:
+                st.markdown(f"📦 **{product}**")
+            
+            with col_group:
+                # グループ選択ドロップダウン
+                new_group = st.selectbox(
+                    "グループ",
+                    options=[0, 1, 2, 3, 4, 5],
+                    index=current_group,
+                    format_func=lambda x: "単独" if x == 0 else f"グループ{x}",
+                    key=f"group_select_{i}_{hash(product) % 10000}",
+                    label_visibility="collapsed"
+                )
+                # グループが変更された場合、session_stateを更新
+                if new_group != current_group:
+                    st.session_state.product_groups[product] = new_group
+                    st.rerun()
+            
+            with col_delete:
+                # ×ボタン（on_click callback方式）
+                st.button(
+                    "✕", 
+                    key=f"remove_btn_{i}_{hash(product) % 10000}",
+                    on_click=remove_single_product,
+                    args=(product,),
+                    help=f"{product}を削除"
+                )
         
         st.markdown("</div>", unsafe_allow_html=True)
         
-        # 選択が変更された場合
-        if set(products_to_keep) != set(products_copy):
-            st.session_state.selected_products = products_to_keep
-            st.session_state.sales_data = None
-            st.session_state.forecast_data = None
-            st.session_state.individual_sales_data = {}
-            st.session_state.individual_forecast_results = []
-            st.rerun()
+        # グループのサマリーを表示
+        groups_summary = {}
+        for product in st.session_state.selected_products:
+            group_num = st.session_state.product_groups.get(product, 0)
+            if group_num not in groups_summary:
+                groups_summary[group_num] = []
+            groups_summary[group_num].append(product)
+        
+        # グループが1つ以上ある場合のみ表示
+        has_groups = any(g != 0 for g in groups_summary.keys())
+        if has_groups:
+            st.write("**📊 グループ構成:**")
+            for group_num, products in sorted(groups_summary.items()):
+                if group_num == 0:
+                    for p in products:
+                        st.write(f"  - 単独: {p}")
+                else:
+                    st.write(f"  - グループ{group_num}: {', '.join(products)}（合算）")
     else:
         st.warning("👆 上から授与品を選んでください")
 
@@ -2543,7 +2592,7 @@ def display_comparison_results_v12(all_results: Dict[str, Tuple[pd.DataFrame, st
 
 
 def render_individual_analysis(start_date: date, end_date: date):
-    """個別分析モード（郵送データの内訳表示対応）"""
+    """個別分析モード（グループ対応・年次比較・郵送のみ商品対応）"""
     st.markdown('<p class="section-header">③ 個別売上分析</p>', unsafe_allow_html=True)
     
     if not st.session_state.selected_products:
@@ -2551,10 +2600,6 @@ def render_individual_analysis(start_date: date, end_date: date):
         return
     
     df_items = st.session_state.data_loader.load_item_sales()
-    
-    if df_items.empty:
-        st.warning("データがありません")
-        return
     
     # 郵送データ統合オプション
     mail_order_enabled = hasattr(config, 'MAIL_ORDER_SPREADSHEET_ID') and config.MAIL_ORDER_SPREADSHEET_ID
@@ -2568,72 +2613,140 @@ def render_individual_analysis(start_date: date, end_date: date):
             key="individual_include_mail"
         )
     
-    mask = (df_items['date'] >= pd.Timestamp(start_date)) & (df_items['date'] <= pd.Timestamp(end_date))
-    df_filtered = df_items[mask]
+    # Airレジデータのフィルタリング
+    if not df_items.empty:
+        mask = (df_items['date'] >= pd.Timestamp(start_date)) & (df_items['date'] <= pd.Timestamp(end_date))
+        df_filtered = df_items[mask]
+    else:
+        df_filtered = pd.DataFrame()
     
     # 郵送データを取得
     df_mail = pd.DataFrame()
-    if include_mail_orders:
+    if include_mail_orders or mail_order_enabled:
         df_mail = st.session_state.data_loader.get_mail_order_summary()
     
-    individual_data = {}
-    individual_counts = {}  # エアレジ・郵送の内訳を保存
-    
+    # グループ構成を取得
+    groups_dict = {}  # {グループ番号: [商品リスト]}
     for product in st.session_state.selected_products:
-        original_names = st.session_state.normalizer.get_all_original_names([product])
-        df_agg_airregi = aggregate_by_products(df_filtered, original_names, aggregate=True)
+        group_num = st.session_state.product_groups.get(product, 0)
+        if group_num not in groups_dict:
+            groups_dict[group_num] = []
+        groups_dict[group_num].append(product)
+    
+    individual_data = {}
+    individual_counts = {}
+    
+    # 分析単位を構築（グループ0の商品は個別、それ以外はグループごと）
+    analysis_units = []
+    for group_num, products in sorted(groups_dict.items()):
+        if group_num == 0:
+            # 単独の商品は個別に分析
+            for product in products:
+                analysis_units.append({
+                    'name': product,
+                    'products': [product],
+                    'is_group': False
+                })
+        else:
+            # グループはまとめて分析
+            analysis_units.append({
+                'name': f"グループ{group_num}: {', '.join(products)}",
+                'products': products,
+                'is_group': True
+            })
+    
+    # 各分析単位のデータを集計
+    for unit in analysis_units:
+        unit_name = unit['name']
+        products_in_unit = unit['products']
         
-        airregi_count = int(df_agg_airregi['販売商品数'].sum()) if not df_agg_airregi.empty else 0
+        airregi_count = 0
         mail_order_count = 0
+        df_agg_combined = pd.DataFrame()
         
-        # 郵送データのマッチング処理（共通関数を使用）
-        df_mail_matched = pd.DataFrame()
-        if include_mail_orders and not df_mail.empty:
-            matched_rows = []
+        for product in products_in_unit:
+            # Airレジからのデータ取得を試みる
+            original_names = []
+            if st.session_state.normalizer:
+                original_names = st.session_state.normalizer.get_all_original_names([product])
             
-            for _, mail_row in df_mail.iterrows():
-                mail_product = str(mail_row['商品名']).strip()
-                
-                # 共通マッチング関数を使用
-                matched_name = match_mail_product_to_airregi(mail_product, original_names)
-                
-                if matched_name:
-                    new_row = mail_row.copy()
-                    new_row['商品名'] = matched_name
-                    matched_rows.append(new_row)
+            # Airレジデータの集計
+            df_agg_airregi = pd.DataFrame()
+            if not df_filtered.empty and original_names:
+                df_agg_airregi = aggregate_by_products(df_filtered, original_names, aggregate=True)
             
-            if matched_rows:
-                df_mail_matched = pd.DataFrame(matched_rows)
-                if 'date' in df_mail_matched.columns:
-                    df_mail_matched['date'] = pd.to_datetime(df_mail_matched['date'], errors='coerce')
-                    mail_mask = (df_mail_matched['date'] >= pd.Timestamp(start_date)) & \
-                               (df_mail_matched['date'] <= pd.Timestamp(end_date))
-                    df_mail_matched = df_mail_matched[mail_mask]
-                mail_order_count = int(df_mail_matched['販売商品数'].sum()) if not df_mail_matched.empty else 0
+            product_airregi_count = int(df_agg_airregi['販売商品数'].sum()) if not df_agg_airregi.empty else 0
+            airregi_count += product_airregi_count
+            
+            # 郵送データの集計
+            df_mail_matched = pd.DataFrame()
+            if (include_mail_orders or (product_airregi_count == 0 and mail_order_enabled)) and not df_mail.empty:
+                matched_rows = []
+                
+                for _, mail_row in df_mail.iterrows():
+                    mail_product = str(mail_row['商品名']).strip()
+                    
+                    # 商品名が完全一致（郵送シートのみの商品の場合）
+                    if mail_product == product:
+                        matched_rows.append(mail_row.copy())
+                    # Airレジの商品名とマッチング
+                    elif original_names:
+                        matched_name = match_mail_product_to_airregi(mail_product, original_names)
+                        if matched_name:
+                            new_row = mail_row.copy()
+                            new_row['商品名'] = matched_name
+                            matched_rows.append(new_row)
+                
+                if matched_rows:
+                    df_mail_matched = pd.DataFrame(matched_rows)
+                    if 'date' in df_mail_matched.columns:
+                        df_mail_matched['date'] = pd.to_datetime(df_mail_matched['date'], errors='coerce')
+                        mail_mask = (df_mail_matched['date'] >= pd.Timestamp(start_date)) & \
+                                   (df_mail_matched['date'] <= pd.Timestamp(end_date))
+                        df_mail_matched = df_mail_matched[mail_mask]
+                    product_mail_count = int(df_mail_matched['販売商品数'].sum()) if not df_mail_matched.empty else 0
+                    mail_order_count += product_mail_count
+            
+            # データを結合
+            if not df_agg_airregi.empty:
+                if df_agg_combined.empty:
+                    df_agg_combined = df_agg_airregi.copy()
+                else:
+                    df_agg_combined = pd.concat([df_agg_combined, df_agg_airregi], ignore_index=True)
+            
+            if not df_mail_matched.empty and (include_mail_orders or product_airregi_count == 0):
+                required_cols = ['date', '販売商品数', '販売総売上', '返品商品数']
+                available_cols = [c for c in required_cols if c in df_mail_matched.columns]
+                if 'date' in available_cols and '販売商品数' in available_cols:
+                    df_mail_for_merge = df_mail_matched[available_cols].copy()
+                    if '販売総売上' not in df_mail_for_merge.columns:
+                        df_mail_for_merge['販売総売上'] = 0
+                    if '返品商品数' not in df_mail_for_merge.columns:
+                        df_mail_for_merge['返品商品数'] = 0
+                    if df_agg_combined.empty:
+                        df_agg_combined = df_mail_for_merge.copy()
+                    else:
+                        df_agg_combined = pd.concat([df_agg_combined, df_mail_for_merge], ignore_index=True)
         
-        # データを結合
-        if not df_mail_matched.empty and include_mail_orders:
-            df_mail_for_merge = df_mail_matched[['date', '商品名', '販売商品数', '販売総売上', '返品商品数']].copy()
-            df_combined = pd.concat([df_agg_airregi, df_mail_for_merge], ignore_index=True)
-            df_agg = df_combined.groupby('date').agg({
+        # 日付ごとに集約
+        if not df_agg_combined.empty:
+            df_agg = df_agg_combined.groupby('date').agg({
                 '販売商品数': 'sum',
                 '販売総売上': 'sum',
                 '返品商品数': 'sum'
             }).reset_index()
-        else:
-            df_agg = df_agg_airregi
-        
-        if not df_agg.empty:
             df_agg = df_agg.sort_values('date').reset_index(drop=True)
-            individual_data[product] = df_agg
-            individual_counts[product] = {'airregi': airregi_count, 'mail': mail_order_count}
+            individual_data[unit_name] = df_agg
+            individual_counts[unit_name] = {'airregi': airregi_count, 'mail': mail_order_count}
     
     st.session_state.individual_sales_data = individual_data
     
-    for product, df_agg in individual_data.items():
-        with st.expander(f"📦 **{product}**", expanded=True):
-            counts = individual_counts.get(product, {'airregi': 0, 'mail': 0})
-            total_qty = counts['airregi'] + counts['mail']
+    # 各分析単位の結果を表示
+    for unit_name, df_agg in individual_data.items():
+        counts = individual_counts.get(unit_name, {'airregi': 0, 'mail': 0})
+        total_qty = counts['airregi'] + counts['mail']
+        
+        with st.expander(f"📦 **{unit_name}**（合計: {total_qty:,}体）", expanded=True):
             total_sales = df_agg['販売総売上'].sum()
             period_days = (end_date - start_date).days + 1
             avg_daily = total_qty / period_days if period_days > 0 else 0
@@ -2645,24 +2758,96 @@ def render_individual_analysis(start_date: date, end_date: date):
             avg_weekday = df_weekday['販売商品数'].mean() if not df_weekday.empty else 0
             avg_weekend = df_weekend['販売商品数'].mean() if not df_weekend.empty else 0
             
+            # 基本メトリクス
             col1, col2, col3, col4 = st.columns(4)
             col1.metric("🛒 販売数量合計", f"{total_qty:,}体")
             col2.metric("💰 売上合計", f"¥{total_sales:,.0f}")
             col3.metric("📈 平均日販", f"{avg_daily:.1f}体/日")
             col4.metric("📅 期間", f"{period_days}日間")
             
-            # エアレジと郵送の内訳を常に表示
+            # エアレジと郵送の内訳
             col5, col6, col7, col8 = st.columns(4)
             col5.metric("🏪 Airレジ", f"{counts['airregi']:,}体")
             col6.metric("📬 郵送", f"{counts['mail']:,}体")
             if avg_weekday > 0:
                 ratio = avg_weekend / avg_weekday
                 col7.metric("📊 休日/平日比", f"{ratio:.2f}倍")
+            
+            # ========== 年次比較（個別モード用） ==========
+            render_individual_year_comparison(df_agg, unit_name, start_date, end_date, total_qty)
     
     render_individual_forecast_section()
-    
-    # 個別モードでも納品計画を表示
     render_delivery_section()
+
+
+def render_individual_year_comparison(df_agg: pd.DataFrame, unit_name: str, start_date: date, end_date: date, current_total: int):
+    """個別分析モード用の年次比較"""
+    
+    with st.expander("📊 年次比較", expanded=False):
+        if df_agg.empty:
+            st.warning("データがありません")
+            return
+        
+        df_all = df_agg.copy()
+        df_all['date'] = pd.to_datetime(df_all['date'])
+        df_all['年'] = df_all['date'].dt.year
+        
+        yearly = df_all.groupby('年').agg({
+            '販売商品数': 'sum',
+            '販売総売上': 'sum'
+        }).reset_index()
+        
+        if len(yearly) < 1:
+            st.info("年次比較には複数年のデータが必要です")
+            return
+        
+        # 前年比を計算
+        yearly['前年比'] = yearly['販売商品数'].pct_change() * 100
+        yearly['増減数'] = yearly['販売商品数'].diff()
+        
+        # 表形式で表示
+        st.write("**📋 年別比較表**")
+        
+        table_data = []
+        for idx, row in yearly.iterrows():
+            year = int(row['年'])
+            qty = int(row['販売商品数'])
+            diff = row['増減数']
+            pct = row['前年比']
+            
+            if pd.notna(diff):
+                diff_str = f"{int(diff):+,}体"
+                pct_str = f"{pct:+.1f}%"
+                eval_str = "📈 増加" if diff > 0 else ("📉 減少" if diff < 0 else "➡️ 同じ")
+            else:
+                diff_str = "-"
+                pct_str = "-"
+                eval_str = "-"
+            
+            table_data.append({
+                '年': f"{year}年",
+                '販売数': f"{qty:,}体",
+                '前年比（数）': diff_str,
+                '前年比（%）': pct_str,
+                '評価': eval_str
+            })
+        
+        display_df = pd.DataFrame(table_data)
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+        
+        # 直近の年次比較
+        if len(yearly) >= 2:
+            latest = yearly.iloc[-1]
+            prev = yearly.iloc[-2]
+            diff = int(latest['販売商品数'] - prev['販売商品数'])
+            diff_pct = latest['前年比']
+            
+            if diff > 0:
+                st.success(f"✅ {int(latest['年'])}年は{int(prev['年'])}年より **{diff:,}体** 増加（{diff_pct:+.1f}%）")
+            elif diff < 0:
+                st.warning(f"⚠️ {int(latest['年'])}年は{int(prev['年'])}年より **{abs(diff):,}体** 減少（{diff_pct:.1f}%）")
+            else:
+                st.info(f"➡️ {int(latest['年'])}年は{int(prev['年'])}年と同じ販売数")
 
 
 def render_individual_forecast_section():
@@ -2781,63 +2966,74 @@ def render_individual_forecast_section():
         with st.spinner("予測中..."):
             # 「すべての方法で比較」が選ばれた場合
             if method == "🔄 すべての方法で比較":
-                all_method_results = {}  # 予測方法ごとの結果を保存
+                # マトリックス形式で結果を保存: {商品名: {予測方法: 予測数}}
+                matrix_results = {}
+                method_names = []
                 
                 for product, sales_data in st.session_state.individual_sales_data.items():
                     try:
                         # すべての方法で予測
                         method_results = forecast_all_methods_with_vertex_ai(sales_data, forecast_days, product)
                         
+                        matrix_results[product] = {}
                         for method_name, (forecast_df, message) in method_results.items():
-                            if method_name not in all_method_results:
-                                all_method_results[method_name] = {'total': 0, 'products': []}
+                            if method_name not in method_names:
+                                method_names.append(method_name)
                             
                             raw_total = int(forecast_df['predicted'].sum())
                             rounded_total = round_up_to_50(raw_total)
-                            
-                            all_method_results[method_name]['total'] += rounded_total
-                            all_method_results[method_name]['products'].append({
-                                'product': product,
-                                'total': rounded_total
-                            })
+                            matrix_results[product][method_name] = rounded_total
                     except Exception as e:
                         st.warning(f"{product}の予測に失敗: {e}")
                 
-                if all_method_results:
+                if matrix_results:
                     st.success("✅ すべての予測方法で比較完了！")
                     
-                    # 各予測方法の結果を表示
-                    st.write("### 📊 各予測方法の予測総数（全商品合計）")
-                    st.markdown("---")
+                    # ========== マトリックス形式の表を作成 ==========
+                    st.write("### 📊 商品×予測方法 マトリックス表")
                     
-                    for method_name, data in all_method_results.items():
-                        icon = "🚀" if "Vertex" in method_name else "📈" if "季節" in method_name else "📊" if "移動" in method_name else "📉"
-                        st.markdown(f"**{icon} {method_name}**: **{data['total']:,}体**")
+                    # 表データを構築
+                    table_data = []
+                    method_totals = {m: 0 for m in method_names}
                     
-                    st.markdown("---")
+                    for product, methods in matrix_results.items():
+                        row = {'商品名': product}
+                        for method_name in method_names:
+                            value = methods.get(method_name, 0)
+                            row[method_name] = f"{value:,}体"
+                            method_totals[method_name] += value
+                        table_data.append(row)
                     
-                    # メトリクスでも表示
-                    num_methods = len(all_method_results)
-                    cols = st.columns(num_methods)
-                    for i, (method_name, data) in enumerate(all_method_results.items()):
+                    # 合計行を追加
+                    total_row = {'商品名': '**合計**'}
+                    for method_name in method_names:
+                        total_row[method_name] = f"**{method_totals[method_name]:,}体**"
+                    table_data.append(total_row)
+                    
+                    # DataFrameで表示
+                    df_matrix = pd.DataFrame(table_data)
+                    st.dataframe(df_matrix, use_container_width=True, hide_index=True)
+                    
+                    # ========== 予測方法ごとの合計をメトリクスで表示 ==========
+                    st.write("### 📈 予測方法別 合計")
+                    
+                    num_methods = len(method_names)
+                    cols = st.columns(min(num_methods, 4))
+                    for i, method_name in enumerate(method_names):
                         icon = "🚀" if "Vertex" in method_name else "📈" if "季節" in method_name else "📊" if "移動" in method_name else "📉"
                         short_name = method_name.replace("（統計）", "").replace("（推奨）", "")
-                        with cols[i]:
-                            st.metric(f"{icon} {short_name}", f"{data['total']:,}体")
+                        with cols[i % 4]:
+                            st.metric(f"{icon} {short_name}", f"{method_totals[method_name]:,}体")
                     
-                    # 商品別の詳細
-                    with st.expander("📋 商品別の詳細を表示", expanded=False):
-                        for method_name, data in all_method_results.items():
-                            st.write(f"**{method_name}**")
-                            for p in data['products']:
-                                st.write(f"  - {p['product']}: {p['total']:,}体")
+                    # session_stateに保存
+                    st.session_state.individual_all_methods_results = matrix_results
                     
                     # 季節性考慮の結果を保存（納品計画用）
-                    if '季節性考慮' in all_method_results:
-                        st.session_state.forecast_total = all_method_results['季節性考慮']['total']
-                    elif all_method_results:
-                        first_method = list(all_method_results.keys())[0]
-                        st.session_state.forecast_total = all_method_results[first_method]['total']
+                    if '季節性考慮' in method_totals:
+                        st.session_state.forecast_total = method_totals['季節性考慮']
+                    elif method_totals:
+                        first_method = method_names[0]
+                        st.session_state.forecast_total = method_totals[first_method]
             else:
                 # 通常の単一予測方法の場合
                 results = []
