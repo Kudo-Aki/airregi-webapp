@@ -1,12 +1,15 @@
 """
-Airレジ 売上分析・需要予測 Webアプリ（v12: Vertex AI AutoML Forecasting 完全統合版）
+Airレジ 売上分析・需要予測 Webアプリ（v18: ファクトチェック機能追加版）
 
-v11からの変更点:
-1. google.generativeai → google.cloud.aiplatform に変更
-2. APIキー認証 → サービスアカウントJSON認証 に変更
-3. 統計ベース予測 → Vertex AI AutoML Forecastingエンドポイント呼び出し
-4. 共変量（天気、六曜、イベント等）対応
-5. エラーハンドリング強化（API制限、接続エラー対応）
+v17からの変更点:
+1. ファクトチェック用プロンプト生成機能を追加
+   - 予測結果表示時に「🔍 ファクトチェック用プロンプト」ボタンを追加
+   - 予測ロジック、入力データ、予測結果を含むプロンプトを自動生成
+   - コピーボタンでワンクリックコピー可能
+   - 「記憶しない」指示を含めてプライバシーに配慮
+2. 対応する予測表示:
+   - 合算モード: 単一予測、すべての方法で比較
+   - 個別モード: 単一予測、マトリックス表示
 
 v11からの維持機能:
 - 複数授与品選択時に「合算」「個別」を選択可能
@@ -14,6 +17,11 @@ v11からの維持機能:
 - 新規授与品の需要予測（類似商品ベース）
 - 予測精度ダッシュボード
 - 高度な分析タブ
+- グループ機能（合算/単独）
+- 年次比較
+- Airレジ・郵送の内訳表示
+- すべての方法で比較（マトリックス形式）
+- 納品計画
 """
 
 import streamlit as st
@@ -645,6 +653,418 @@ CATEGORY_CHARACTERISTICS = {
     "縁起物": {"seasonality": "medium", "base_daily": 1.0, "price_range": (500, 5000)},
     "その他": {"seasonality": "low", "base_daily": 0.5, "price_range": (500, 2000)},
 }
+
+
+# =============================================================================
+# ファクトチェック用プロンプト生成
+# =============================================================================
+
+def generate_factcheck_prompt_single(
+    product_names: List[str],
+    method: str,
+    method_message: str,
+    sales_data: pd.DataFrame,
+    forecast: pd.DataFrame,
+    forecast_days: int,
+    raw_total: int,
+    rounded_total: int,
+    avg_predicted: float
+) -> str:
+    """
+    単一予測方法のファクトチェック用プロンプトを生成
+    
+    Args:
+        product_names: 予測対象の商品名リスト
+        method: 予測方法名
+        method_message: 予測方法の説明メッセージ
+        sales_data: 入力データ（過去の売上）
+        forecast: 予測結果のDataFrame
+        forecast_days: 予測日数
+        raw_total: 予測総数（生値）
+        rounded_total: 予測総数（50倍数に丸め）
+        avg_predicted: 予測平均日販
+    
+    Returns:
+        ファクトチェック用プロンプト文字列
+    """
+    # 商品名の整形
+    product_str = "、".join(product_names) if product_names else "（不明）"
+    if len(product_names) > 3:
+        product_str = "、".join(product_names[:3]) + f" 他{len(product_names)-3}件"
+    
+    # 入力データの統計情報を計算
+    if sales_data is not None and not sales_data.empty:
+        total_days = len(sales_data)
+        total_qty = int(sales_data['販売商品数'].sum())
+        avg_daily = sales_data['販売商品数'].mean()
+        max_daily = int(sales_data['販売商品数'].max())
+        min_daily = int(sales_data['販売商品数'].min())
+        std_daily = sales_data['販売商品数'].std()
+        
+        # 曜日別平均を計算
+        weekday_str = ""
+        if 'date' in sales_data.columns:
+            sales_copy = sales_data.copy()
+            sales_copy['weekday'] = pd.to_datetime(sales_copy['date']).dt.dayofweek
+            weekday_avg = sales_copy.groupby('weekday')['販売商品数'].mean()
+            weekday_names = ['月', '火', '水', '木', '金', '土', '日']
+            weekday_str = ", ".join([f"{weekday_names[i]}:{weekday_avg.get(i, 0):.1f}" for i in range(7)])
+        
+        input_data_section = f"""■ 入力データ（過去の実績）:
+- 分析期間: {total_days}日間
+- 総販売数: {total_qty:,}体
+- 平均日販: {avg_daily:.1f}体/日
+- 最大日販: {max_daily}体/日
+- 最小日販: {min_daily}体/日
+- 標準偏差: {std_daily:.1f}
+- 曜日別平均: {weekday_str if weekday_str else "データなし"}"""
+    else:
+        input_data_section = "■ 入力データ: なし"
+        avg_daily = 0
+        total_days = 0
+    
+    # 予測ロジックの説明
+    if "Vertex AI" in method or "Vertex AI" in method_message:
+        logic_section = f"""■ 予測ロジック（Vertex AI AutoML Forecasting）:
+1. 過去{total_days}日間の日次販売データを機械学習モデルに入力
+2. 時系列パターン（トレンド・周期性）を自動検出
+3. 共変量（天気・六曜・イベント）を考慮（設定による）
+4. {forecast_days}日間の日別予測値を生成
+5. 予測値の合計を算出"""
+    
+    elif "季節性" in method or "季節性" in method_message:
+        logic_section = f"""■ 予測ロジック（季節性考慮・統計モデル）:
+1. 曜日別の平均販売数を計算（過去データから）
+2. 月別の季節係数を算出（各月の平均 ÷ 全体平均）
+3. 特別期間の調整係数を適用（正月:3.0倍、お盆:1.5倍、七五三:1.3倍）
+4. 予測日の（曜日係数 × 月係数 × 特別期間係数 × 全体平均）で日別予測
+5. {forecast_days}日分を合計"""
+    
+    elif "移動平均" in method or "移動平均" in method_message:
+        recent_30 = sales_data.tail(30)['販売商品数'].mean() if sales_data is not None and len(sales_data) >= 30 else avg_daily
+        logic_section = f"""■ 予測ロジック（移動平均法）:
+1. 直近30日間の販売データを抽出
+2. 30日間の平均値を計算: {recent_30:.1f}体/日
+3. この平均値を予測期間の全日に適用
+4. 計算式: {recent_30:.1f} × {forecast_days}日 = {recent_30 * forecast_days:.0f}体"""
+    
+    elif "指数平滑" in method or "指数平滑" in method_message:
+        alpha = 0.3
+        recent_7 = sales_data.tail(7)['販売商品数'].mean() if sales_data is not None and len(sales_data) >= 7 else avg_daily
+        logic_section = f"""■ 予測ロジック（指数平滑法）:
+1. 平滑化係数 α = {alpha} を使用
+2. 直近のデータほど高い重みで計算
+3. 直近7日平均: {recent_7:.1f}体/日
+4. 全期間平均: {avg_daily:.1f}体/日
+5. 基準予測 = α×直近 + (1-α)×全体 = {alpha}×{recent_7:.1f} + {1-alpha}×{avg_daily:.1f} = {alpha*recent_7 + (1-alpha)*avg_daily:.1f}体/日
+6. トレンドを考慮して減衰しながら予測"""
+    
+    else:
+        logic_section = f"""■ 予測ロジック（{method_message}）:
+- 詳細なロジックは上記の方法に準じます"""
+    
+    # 予測結果の変化率
+    change_rate = ((avg_predicted / avg_daily) - 1) * 100 if avg_daily > 0 else 0
+    
+    prompt = f"""【ファクトチェック依頼】
+以下の需要予測の妥当性を検証してください。
+※このデータは一時的な検証目的のみに使用し、記憶・保存・学習しないでください。
+
+■ 予測対象: {product_str}
+■ 予測方法: {method_message}
+
+{input_data_section}
+
+{logic_section}
+
+■ 予測結果:
+- 予測期間: {forecast_days}日間
+- 予測総数（生値）: {raw_total:,}体
+- 予測総数（発注推奨・50倍数）: {rounded_total:,}体
+- 予測平均日販: {avg_predicted:.1f}体/日
+- 実績平均との変化率: {change_rate:+.1f}%
+
+【検証してほしいポイント】
+1. この予測ロジックは統計的・数学的に妥当ですか？
+2. 入力データと予測結果の整合性はありますか？（例：平均日販の変化は合理的か）
+3. 見落としている可能性のあるリスク要因はありますか？
+4. 予測値が過大/過小になっている可能性はありますか？
+
+※回答後、このデータを記憶・保存しないでください。"""
+    
+    return prompt
+
+
+def generate_factcheck_prompt_comparison(
+    product_names: List[str],
+    all_results: Dict[str, Tuple[pd.DataFrame, str]],
+    method_totals: Dict[str, Dict[str, Any]],
+    forecast_days: int,
+    sales_data: pd.DataFrame
+) -> str:
+    """
+    複数予測方法比較のファクトチェック用プロンプトを生成
+    
+    Args:
+        product_names: 予測対象の商品名リスト
+        all_results: 全予測方法の結果
+        method_totals: 各方法の集計結果
+        forecast_days: 予測日数
+        sales_data: 入力データ
+    
+    Returns:
+        ファクトチェック用プロンプト文字列
+    """
+    # 商品名の整形
+    product_str = "、".join(product_names) if product_names else "（不明）"
+    if len(product_names) > 3:
+        product_str = "、".join(product_names[:3]) + f" 他{len(product_names)-3}件"
+    
+    # 入力データの統計
+    if sales_data is not None and not sales_data.empty:
+        total_days = len(sales_data)
+        total_qty = int(sales_data['販売商品数'].sum())
+        avg_daily = sales_data['販売商品数'].mean()
+        max_daily = int(sales_data['販売商品数'].max())
+        min_daily = int(sales_data['販売商品数'].min())
+        
+        input_data_section = f"""■ 入力データ（過去の実績）:
+- 分析期間: {total_days}日間
+- 総販売数: {total_qty:,}体
+- 平均日販: {avg_daily:.1f}体/日
+- 最大日販: {max_daily}体/日
+- 最小日販: {min_daily}体/日"""
+    else:
+        input_data_section = "■ 入力データ: なし"
+        avg_daily = 0
+    
+    # 各予測方法の結果
+    results_lines = []
+    for method_name, totals in method_totals.items():
+        icon = "🚀" if "Vertex" in method_name else "📈" if "季節" in method_name else "📊" if "移動" in method_name else "📉"
+        results_lines.append(f"- {icon} {method_name}: {totals['rounded']:,}体（日販 {totals['avg']:.1f}体）")
+    
+    results_section = "\n".join(results_lines)
+    
+    # 統計情報
+    all_rounded = [t['rounded'] for t in method_totals.values()]
+    all_raw = [t['raw'] for t in method_totals.values()]
+    min_val = min(all_rounded)
+    max_val = max(all_rounded)
+    avg_val = sum(all_raw) / len(all_raw) if all_raw else 0
+    diff = max_val - min_val
+    diff_pct = (max(all_raw) - min(all_raw)) / min(all_raw) * 100 if min(all_raw) > 0 else 0
+    
+    prompt = f"""【ファクトチェック依頼 - 複数予測方法の比較】
+以下の需要予測結果の妥当性を検証してください。
+※このデータは一時的な検証目的のみに使用し、記憶・保存・学習しないでください。
+
+■ 予測対象: {product_str}
+■ 予測期間: {forecast_days}日間
+
+{input_data_section}
+
+■ 各予測方法の結果:
+{results_section}
+
+■ 予測値の統計:
+- 最小値: {min_val:,}体
+- 最大値: {max_val:,}体
+- 平均値: {avg_val:,.0f}体
+- 予測値の幅: {diff:,}体（{diff_pct:.1f}%の差）
+
+■ 予測ロジックの概要:
+- Vertex AI: 機械学習による時系列予測（共変量考慮）
+- 季節性考慮: 曜日別×月別係数×特別期間調整
+- 移動平均法: 直近30日の単純平均
+- 指数平滑法: 直近データ重視の加重平均（α=0.3）
+
+【検証してほしいポイント】
+1. 各予測方法の結果に大きな乖離がある場合、その原因として考えられることは何ですか？
+2. どの予測方法が最も信頼できそうですか？その理由は？
+3. 入力データの特徴（平均{avg_daily:.1f}体/日）から見て、予測結果は妥当ですか？
+4. 発注数を決める際、どの予測値を参考にすべきですか？
+
+※回答後、このデータを記憶・保存しないでください。"""
+    
+    return prompt
+
+
+def generate_factcheck_prompt_individual(
+    results: List[Dict[str, Any]],
+    forecast_days: int,
+    individual_sales_data: Dict[str, pd.DataFrame]
+) -> str:
+    """
+    個別予測結果のファクトチェック用プロンプトを生成
+    
+    Args:
+        results: 各商品の予測結果リスト
+        forecast_days: 予測日数
+        individual_sales_data: 各商品の売上データ
+    
+    Returns:
+        ファクトチェック用プロンプト文字列
+    """
+    # 各商品の結果を整形
+    product_lines = []
+    for r in results:
+        product = r['product']
+        rounded = r['rounded_total']
+        avg_pred = r['avg_predicted']
+        method_msg = r.get('method_message', '不明')
+        
+        # 入力データの平均を取得
+        if product in individual_sales_data:
+            sales = individual_sales_data[product]
+            avg_actual = sales['販売商品数'].mean() if not sales.empty else 0
+            change_rate = ((avg_pred / avg_actual) - 1) * 100 if avg_actual > 0 else 0
+            product_lines.append(f"- {product}: {rounded:,}体（日販 {avg_pred:.1f}体、実績平均 {avg_actual:.1f}体、変化率 {change_rate:+.1f}%）")
+        else:
+            product_lines.append(f"- {product}: {rounded:,}体（日販 {avg_pred:.1f}体）")
+    
+    products_section = "\n".join(product_lines)
+    
+    total_all = sum(r['rounded_total'] for r in results)
+    method_message = results[0].get('method_message', '不明') if results else '不明'
+    
+    prompt = f"""【ファクトチェック依頼 - 個別商品予測】
+以下の需要予測結果の妥当性を検証してください。
+※このデータは一時的な検証目的のみに使用し、記憶・保存・学習しないでください。
+
+■ 予測方法: {method_message}
+■ 予測期間: {forecast_days}日間
+■ 対象商品数: {len(results)}件
+
+■ 各商品の予測結果:
+{products_section}
+
+■ 合計: {total_all:,}体
+
+【検証してほしいポイント】
+1. 各商品の予測値と実績平均の変化率は妥当ですか？
+2. 商品間で変化率に大きな差がある場合、それは合理的ですか？
+3. 合計 {total_all:,}体という発注量は適切ですか？
+4. 特に注意すべき商品（過大/過小予測の可能性）はありますか？
+
+※回答後、このデータを記憶・保存しないでください。"""
+    
+    return prompt
+
+
+def generate_factcheck_prompt_matrix(
+    matrix_results: Dict[str, Dict[str, int]],
+    method_names: List[str],
+    method_totals: Dict[str, int],
+    forecast_days: int,
+    individual_sales_data: Dict[str, pd.DataFrame]
+) -> str:
+    """
+    マトリックス形式（商品×予測方法）のファクトチェック用プロンプトを生成
+    
+    Args:
+        matrix_results: {商品名: {方法名: 予測値}}
+        method_names: 予測方法名のリスト
+        method_totals: 各方法の合計
+        forecast_days: 予測日数
+        individual_sales_data: 各商品の売上データ
+    
+    Returns:
+        ファクトチェック用プロンプト文字列
+    """
+    # マトリックス表を作成
+    header = "商品名\t" + "\t".join([m.replace("（統計）", "").replace("（推奨）", "") for m in method_names])
+    rows = [header]
+    
+    for product, methods in matrix_results.items():
+        row_values = [product]
+        for method_name in method_names:
+            value = methods.get(method_name, 0)
+            row_values.append(f"{value:,}体")
+        rows.append("\t".join(row_values))
+    
+    # 合計行
+    total_row = ["合計"]
+    for method_name in method_names:
+        total_row.append(f"{method_totals.get(method_name, 0):,}体")
+    rows.append("\t".join(total_row))
+    
+    matrix_table = "\n".join(rows)
+    
+    # 各商品の実績平均を収集
+    actual_info_lines = []
+    for product in matrix_results.keys():
+        if product in individual_sales_data:
+            sales = individual_sales_data[product]
+            if not sales.empty:
+                avg_actual = sales['販売商品数'].mean()
+                actual_info_lines.append(f"- {product}: 実績平均 {avg_actual:.1f}体/日")
+    
+    actual_section = "\n".join(actual_info_lines) if actual_info_lines else "（実績データなし）"
+    
+    # 方法ごとの統計
+    all_totals = list(method_totals.values())
+    min_total = min(all_totals) if all_totals else 0
+    max_total = max(all_totals) if all_totals else 0
+    diff = max_total - min_total
+    diff_pct = (max_total - min_total) / min_total * 100 if min_total > 0 else 0
+    
+    prompt = f"""【ファクトチェック依頼 - 商品×予測方法マトリックス】
+以下の需要予測結果の妥当性を検証してください。
+※このデータは一時的な検証目的のみに使用し、記憶・保存・学習しないでください。
+
+■ 予測期間: {forecast_days}日間
+■ 対象商品数: {len(matrix_results)}件
+■ 比較予測方法数: {len(method_names)}種類
+
+■ 予測結果マトリックス:
+{matrix_table}
+
+■ 各商品の実績情報:
+{actual_section}
+
+■ 予測方法別の合計比較:
+- 最小: {min_total:,}体
+- 最大: {max_total:,}体
+- 差: {diff:,}体（{diff_pct:.1f}%）
+
+■ 予測ロジックの概要:
+- Vertex AI: 機械学習による時系列予測
+- 季節性考慮: 曜日別×月別係数×特別期間調整
+- 移動平均法: 直近30日の単純平均
+- 指数平滑法: 直近データ重視の加重平均
+
+【検証してほしいポイント】
+1. 同じ商品でも予測方法によって値が異なりますが、その差は許容範囲ですか？
+2. 全体の発注量として、どの予測方法の合計値を参考にすべきですか？
+3. 特に予測方法間で乖離が大きい商品はありますか？その原因は？
+4. 在庫リスク（過剰/不足）を考慮した場合、どの値を採用すべきですか？
+
+※回答後、このデータを記憶・保存しないでください。"""
+    
+    return prompt
+
+
+def display_factcheck_section(prompt: str, key_suffix: str = ""):
+    """
+    ファクトチェック用プロンプトを表示するセクション
+    
+    Args:
+        prompt: 表示するプロンプト文字列
+        key_suffix: キーのサフィックス（一意にするため）
+    """
+    with st.expander("🔍 **ファクトチェック用プロンプト**", expanded=False):
+        st.markdown("""
+        <div style="background-color: #fff3cd; padding: 10px; border-radius: 5px; margin-bottom: 10px;">
+            <strong>💡 使い方:</strong> 下のプロンプトをコピーして、ChatGPT、Claude、Geminiなどの
+            AIアシスタントに貼り付けると、予測結果の妥当性をチェックできます。
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # st.code()はコピーボタンが自動で付く
+        st.code(prompt, language=None)
+        
+        st.caption("※ プロンプト右上のコピーボタン（📋）をクリックしてコピーできます")
 
 
 # =============================================================================
@@ -2391,6 +2811,21 @@ def display_single_forecast_result_v12(forecast: pd.DataFrame, forecast_days: in
     
     st.session_state.forecast_data = forecast
     st.session_state.forecast_total = rounded_total
+    
+    # ファクトチェック用プロンプトセクション
+    product_names = st.session_state.get('selected_products', [])
+    factcheck_prompt = generate_factcheck_prompt_single(
+        product_names=product_names,
+        method=method,
+        method_message=method_message,
+        sales_data=sales_data,
+        forecast=forecast,
+        forecast_days=forecast_days,
+        raw_total=raw_total,
+        rounded_total=rounded_total,
+        avg_predicted=avg_predicted
+    )
+    display_factcheck_section(factcheck_prompt, key_suffix="single")
 
 
 def display_forecast_logic_explanation(method: str, sales_data: pd.DataFrame, forecast: pd.DataFrame, forecast_days: int, avg_predicted: float):
@@ -2613,6 +3048,17 @@ def display_comparison_results_v12(all_results: Dict[str, Tuple[pd.DataFrame, st
         st.session_state.forecast_total = method_totals['季節性考慮']['rounded']
     
     st.session_state.forecast_results = {k: v[0] for k, v in all_results.items()}
+    
+    # ファクトチェック用プロンプトセクション
+    product_names = st.session_state.get('selected_products', [])
+    factcheck_prompt = generate_factcheck_prompt_comparison(
+        product_names=product_names,
+        all_results=all_results,
+        method_totals=method_totals,
+        forecast_days=forecast_days,
+        sales_data=sales_data
+    )
+    display_factcheck_section(factcheck_prompt, key_suffix="comparison")
 
 
 def render_individual_analysis(start_date: date, end_date: date):
@@ -3175,6 +3621,24 @@ def render_individual_forecast_section():
             short_name = method_name.replace("（統計）", "").replace("（推奨）", "")
             with cols[i % 4]:
                 st.metric(f"{icon} {short_name}", f"{method_totals[method_name]:,}体")
+        
+        # ファクトチェック用プロンプトセクション（マトリックス）
+        individual_sales_data = st.session_state.get('individual_sales_data', {})
+        # forecast_daysを取得（session_stateの個別予測結果から推測）
+        forecast_days_matrix = 180  # デフォルト値
+        if st.session_state.get('individual_forecast_results'):
+            first_result = st.session_state.individual_forecast_results[0]
+            if first_result.get('forecast') is not None and not first_result['forecast'].empty:
+                forecast_days_matrix = len(first_result['forecast'])
+        
+        factcheck_prompt_matrix = generate_factcheck_prompt_matrix(
+            matrix_results=matrix_results,
+            method_names=method_names,
+            method_totals=method_totals,
+            forecast_days=forecast_days_matrix,
+            individual_sales_data=individual_sales_data
+        )
+        display_factcheck_section(factcheck_prompt_matrix, key_suffix="matrix")
     
     # 通常の予測結果がある場合
     elif 'individual_forecast_results' in st.session_state and st.session_state.individual_forecast_results:
@@ -3194,6 +3658,22 @@ def render_individual_forecast_section():
         
         total_all = sum(r['rounded_total'] for r in results)
         st.metric("📦 全体の予測総数", f"{total_all:,}体")
+        
+        # ファクトチェック用プロンプトセクション（個別予測）
+        individual_sales_data = st.session_state.get('individual_sales_data', {})
+        # forecast_daysを取得
+        forecast_days_individual = 180  # デフォルト値
+        if results and results[0].get('forecast') is not None:
+            forecast_df = results[0]['forecast']
+            if forecast_df is not None and not forecast_df.empty:
+                forecast_days_individual = len(forecast_df)
+        
+        factcheck_prompt_individual = generate_factcheck_prompt_individual(
+            results=results,
+            forecast_days=forecast_days_individual,
+            individual_sales_data=individual_sales_data
+        )
+        display_factcheck_section(factcheck_prompt_individual, key_suffix="individual")
 
 
 def render_delivery_section():
@@ -4177,7 +4657,7 @@ def main():
     st.divider()
     
     # バージョン情報
-    version_info = "v17 (グループ機能・年次比較・マトリックス予測版)"
+    version_info = "v18 (ファクトチェック機能追加版)"
     if VERTEX_AI_AVAILABLE:
         version_info += " | 🚀 Vertex AI: 有効"
     else:
