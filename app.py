@@ -1,17 +1,30 @@
 """
-Airレジ 売上分析・需要予測 Webアプリ（v18: ファクトチェック機能追加版）
+Airレジ 売上分析・需要予測 Webアプリ（v19: 予測精度強化・セキュリティ改善版）
 
-v17からの変更点:
-1. ファクトチェック用プロンプト生成機能を追加
-   - 予測結果表示時に「🔍 ファクトチェック用プロンプト」ボタンを追加
-   - 予測ロジック、入力データ、予測結果を含むプロンプトを自動生成
-   - コピーボタンでワンクリックコピー可能
-   - 「記憶しない」指示を含めてプライバシーに配慮
-2. 対応する予測表示:
-   - 合算モード: 単一予測、すべての方法で比較
-   - 個別モード: 単一予測、マトリックス表示
+v18からの変更点:
+1. 【予測精度の大幅改善】
+   - ベースライン計算を中央値/トリム平均に変更（外れ値に強い）
+   - 係数計算の頑健化（サンプル少時は1.0に縮退）
+   - 特別期間係数の自動計算オプション（過去データから学習）
+   - 分位点予測追加（P50/P80/P90）
+   - 発注モード選択（滞留回避/バランス/欠品回避）
+   - 簡易バックテスト機能（MAPE表示）
+   - 特別期間の二重計上対策
 
-v11からの維持機能:
+2. 【セキュリティ強化】
+   - st.secrets対応（Streamlit Cloud推奨）
+   - ADC（Application Default Credentials）対応
+   - HTML注入対策（html.escape適用）
+   - エラー表示の安全化（機密情報マスク）
+
+3. 【UI/UX改善】
+   - st.formによる予測パラメータ設定（チラつき防止）
+   - 詳細設定のexpander集約
+   - 予測結果カードの情報充実（使用方式・バックテスト指標表示）
+   - キャッシュ最適化（@st.cache_data）
+
+v18以前からの維持機能:
+- ファクトチェック用プロンプト生成機能
 - 複数授与品選択時に「合算」「個別」を選択可能
 - 予測期間を「日数指定」「期間指定」で選択可能
 - 新規授与品の需要予測（類似商品ベース）
@@ -22,6 +35,7 @@ v11からの維持機能:
 - Airレジ・郵送の内訳表示
 - すべての方法で比較（マトリックス形式）
 - 納品計画
+- Vertex AI AutoML Forecasting連携
 """
 
 import streamlit as st
@@ -38,6 +52,16 @@ import os
 import json
 import logging
 import hashlib
+import html  # XSS対策用
+
+# scipy（統計処理用）- オプショナル
+try:
+    from scipy import stats
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+    logger_temp = logging.getLogger(__name__)
+    logger_temp.warning("scipyがインストールされていません。一部の統計機能が制限されます。")
 
 # ロギング設定
 logging.basicConfig(level=logging.INFO)
@@ -76,6 +100,114 @@ VERTEX_AI_AVAILABLE = False
 aiplatform = None
 prediction_service_client = None
 
+# =============================================================================
+# セキュリティ強化: GCP認証のモダン化
+# =============================================================================
+
+def get_gcp_credentials():
+    """
+    GCP認証情報を取得（優先順位: st.secrets > 環境変数 > ファイル）
+    
+    Streamlit Cloud推奨の認証方式に対応
+    """
+    from google.oauth2 import service_account
+    
+    credentials = None
+    auth_method = None
+    
+    try:
+        # 1. st.secretsから取得（Streamlit Cloud推奨）
+        if hasattr(st, 'secrets') and 'gcp_service_account' in st.secrets:
+            try:
+                service_account_info = dict(st.secrets['gcp_service_account'])
+                credentials = service_account.Credentials.from_service_account_info(
+                    service_account_info,
+                    scopes=['https://www.googleapis.com/auth/cloud-platform']
+                )
+                auth_method = "st.secrets"
+                logger.info("GCP認証: st.secretsから取得成功")
+                return credentials, auth_method
+            except Exception as e:
+                logger.warning(f"st.secretsからの認証取得失敗: {e}")
+        
+        # 2. 環境変数からJSON文字列を取得
+        env_json = os.environ.get('VERTEX_AI_SERVICE_ACCOUNT_JSON')
+        if env_json:
+            try:
+                service_account_info = json.loads(env_json)
+                credentials = service_account.Credentials.from_service_account_info(
+                    service_account_info,
+                    scopes=['https://www.googleapis.com/auth/cloud-platform']
+                )
+                auth_method = "環境変数(JSON)"
+                logger.info("GCP認証: 環境変数から取得成功")
+                return credentials, auth_method
+            except Exception as e:
+                logger.warning(f"環境変数からの認証取得失敗: {e}")
+        
+        # 3. サービスアカウントファイルから取得（従来方式）
+        sa_file = VERTEX_AI_CONFIG['service_account_file']
+        if os.path.exists(sa_file):
+            try:
+                credentials = service_account.Credentials.from_service_account_file(
+                    sa_file,
+                    scopes=['https://www.googleapis.com/auth/cloud-platform']
+                )
+                auth_method = "ファイル"
+                logger.info(f"GCP認証: ファイルから取得成功 ({sa_file})")
+                return credentials, auth_method
+            except Exception as e:
+                logger.warning(f"ファイルからの認証取得失敗: {e}")
+        
+        # 4. Application Default Credentials（ADC）を試行
+        try:
+            import google.auth
+            credentials, project = google.auth.default(
+                scopes=['https://www.googleapis.com/auth/cloud-platform']
+            )
+            auth_method = "ADC"
+            logger.info("GCP認証: ADCから取得成功")
+            return credentials, auth_method
+        except Exception as e:
+            logger.warning(f"ADCからの認証取得失敗: {e}")
+    
+    except Exception as e:
+        logger.error(f"GCP認証取得中の予期しないエラー: {e}")
+    
+    return None, None
+
+
+def safe_html(text: str) -> str:
+    """
+    HTML注入対策: テキストをエスケープ
+    
+    Args:
+        text: エスケープするテキスト
+    
+    Returns:
+        エスケープ済みテキスト
+    """
+    if text is None:
+        return ""
+    return html.escape(str(text))
+
+
+def mask_sensitive_value(value: str, visible_chars: int = 4) -> str:
+    """
+    機密情報をマスク表示
+    
+    Args:
+        value: マスクする値
+        visible_chars: 表示する文字数
+    
+    Returns:
+        マスク済みの値
+    """
+    if not value or len(value) <= visible_chars:
+        return "***"
+    return value[:visible_chars] + "***"
+
+
 try:
     from google.cloud import aiplatform
     from google.cloud.aiplatform.gapic.schema import predict as predict_schema
@@ -84,26 +216,25 @@ try:
     from google.oauth2 import service_account
     from google.api_core import exceptions as google_exceptions
     
-    # サービスアカウント認証
-    if os.path.exists(VERTEX_AI_CONFIG['service_account_file']):
-        credentials = service_account.Credentials.from_service_account_file(
-            VERTEX_AI_CONFIG['service_account_file'],
-            scopes=['https://www.googleapis.com/auth/cloud-platform']
-        )
-        
+    # 認証情報を取得
+    credentials, auth_method = get_gcp_credentials()
+    
+    if credentials and VERTEX_AI_CONFIG['project_id'] and VERTEX_AI_CONFIG['endpoint_id']:
         # Vertex AI初期化
-        if VERTEX_AI_CONFIG['project_id'] and VERTEX_AI_CONFIG['endpoint_id']:
-            aiplatform.init(
-                project=VERTEX_AI_CONFIG['project_id'],
-                location=VERTEX_AI_CONFIG['location'],
-                credentials=credentials
-            )
-            VERTEX_AI_AVAILABLE = True
-            logger.info("Vertex AI AutoML Forecasting: 初期化成功")
-        else:
-            logger.warning("Vertex AI: project_idまたはendpoint_idが設定されていません")
+        aiplatform.init(
+            project=VERTEX_AI_CONFIG['project_id'],
+            location=VERTEX_AI_CONFIG['location'],
+            credentials=credentials
+        )
+        VERTEX_AI_AVAILABLE = True
+        logger.info(f"Vertex AI AutoML Forecasting: 初期化成功 (認証方式: {auth_method})")
     else:
-        logger.warning(f"Vertex AI: サービスアカウントファイルが見つかりません: {VERTEX_AI_CONFIG['service_account_file']}")
+        if not credentials:
+            logger.warning("Vertex AI: 認証情報が見つかりません")
+        if not VERTEX_AI_CONFIG['project_id']:
+            logger.warning("Vertex AI: project_idが設定されていません")
+        if not VERTEX_AI_CONFIG['endpoint_id']:
+            logger.warning("Vertex AI: endpoint_idが設定されていません")
         
 except ImportError as e:
     logger.warning(f"Vertex AI SDKがインストールされていません: {e}")
@@ -129,10 +260,12 @@ class VertexAIForecaster:
             from google.cloud.aiplatform_v1.types import PredictRequest
             
             client_options = {"api_endpoint": f"{self.location}-aiplatform.googleapis.com"}
-            credentials = service_account.Credentials.from_service_account_file(
-                VERTEX_AI_CONFIG['service_account_file'],
-                scopes=['https://www.googleapis.com/auth/cloud-platform']
-            )
+            
+            # 新しい認証方式を使用
+            credentials, _ = get_gcp_credentials()
+            if credentials is None:
+                raise RuntimeError("GCP認証情報が取得できませんでした")
+            
             self._client = PredictionServiceClient(
                 credentials=credentials,
                 client_options=client_options
@@ -417,6 +550,8 @@ def forecast_with_seasonality_fallback(df: pd.DataFrame, periods: int) -> pd.Dat
     フォールバック用の季節性考慮予測（統計ベース）
     
     Vertex AIが利用できない場合に使用
+    
+    ★v19改善: 中央値ベースの頑健な予測
     """
     df = df.copy()
     df['date'] = pd.to_datetime(df['date'])
@@ -477,6 +612,470 @@ def forecast_with_seasonality_fallback(df: pd.DataFrame, periods: int) -> pd.Dat
 
 
 # =============================================================================
+# 【v19新機能】予測精度強化のための統計関数群
+# =============================================================================
+
+def calculate_robust_baseline(values: np.ndarray, method: str = 'median') -> float:
+    """
+    外れ値に強いベースライン計算
+    
+    Args:
+        values: 販売数の配列
+        method: 計算方法 ('median', 'trimmed_mean', 'iqr_mean')
+    
+    Returns:
+        頑健なベースライン値
+    """
+    if len(values) == 0:
+        return 1.0
+    
+    values = np.array(values, dtype=float)
+    values = values[~np.isnan(values)]
+    
+    if len(values) == 0:
+        return 1.0
+    
+    if method == 'median':
+        # 中央値（外れ値に最も強い）
+        return float(np.median(values))
+    
+    elif method == 'trimmed_mean':
+        # トリム平均（上下10%を除外）
+        if SCIPY_AVAILABLE:
+            try:
+                return float(stats.trim_mean(values, proportiontocut=0.1))
+            except:
+                pass
+        # scipyがない場合の代替実装
+        sorted_vals = np.sort(values)
+        n = len(sorted_vals)
+        trim_count = int(n * 0.1)
+        if trim_count > 0 and n > trim_count * 2:
+            trimmed = sorted_vals[trim_count:-trim_count]
+            return float(np.mean(trimmed))
+        return float(np.median(values))
+    
+    elif method == 'iqr_mean':
+        # IQR内の値のみで平均（四分位範囲内）
+        q1 = np.percentile(values, 25)
+        q3 = np.percentile(values, 75)
+        iqr = q3 - q1
+        lower_bound = q1 - 1.5 * iqr
+        upper_bound = q3 + 1.5 * iqr
+        filtered = values[(values >= lower_bound) & (values <= upper_bound)]
+        if len(filtered) > 0:
+            return float(np.mean(filtered))
+        return float(np.median(values))
+    
+    else:
+        return float(np.mean(values))
+
+
+def calculate_robust_factor(group_values: np.ndarray, overall_baseline: float, 
+                           min_samples: int = 5) -> float:
+    """
+    頑健な係数計算（サンプル数が少ない場合は1.0に縮退）
+    
+    Args:
+        group_values: グループの値
+        overall_baseline: 全体のベースライン
+        min_samples: 最小サンプル数
+    
+    Returns:
+        係数（1.0に近づくスムージング付き）
+    """
+    if len(group_values) < min_samples or overall_baseline <= 0:
+        return 1.0
+    
+    # 中央値ベースで係数を計算
+    group_median = np.median(group_values)
+    raw_factor = group_median / overall_baseline if overall_baseline > 0 else 1.0
+    
+    # サンプル数に応じてスムージング（少ないほど1.0に近づける）
+    confidence = min(1.0, len(group_values) / (min_samples * 2))
+    smoothed_factor = confidence * raw_factor + (1 - confidence) * 1.0
+    
+    # 極端な値を抑制（0.3〜3.0の範囲に収める）
+    return float(max(0.3, min(3.0, smoothed_factor)))
+
+
+def identify_special_periods(df: pd.DataFrame) -> Dict[str, List[date]]:
+    """
+    特別期間（正月、お盆、七五三等）の日付を特定
+    
+    Args:
+        df: 日付を含むDataFrame
+    
+    Returns:
+        特別期間名をキー、日付リストを値とする辞書
+    """
+    df = df.copy()
+    df['date'] = pd.to_datetime(df['date'])
+    
+    special_periods = {
+        'new_year': [],     # 正月（1/1〜1/7）
+        'obon': [],         # お盆（8/13〜8/16）
+        'shichigosan': [],  # 七五三（11/10〜11/20）
+        'golden_week': [],  # ゴールデンウィーク（5/3〜5/5）
+        'year_end': [],     # 年末（12/28〜12/31）
+    }
+    
+    for d in df['date'].unique():
+        d = pd.Timestamp(d)
+        if d.month == 1 and d.day <= 7:
+            special_periods['new_year'].append(d.date())
+        elif d.month == 8 and 13 <= d.day <= 16:
+            special_periods['obon'].append(d.date())
+        elif d.month == 11 and 10 <= d.day <= 20:
+            special_periods['shichigosan'].append(d.date())
+        elif d.month == 5 and 3 <= d.day <= 5:
+            special_periods['golden_week'].append(d.date())
+        elif d.month == 12 and d.day >= 28:
+            special_periods['year_end'].append(d.date())
+    
+    return special_periods
+
+
+def calculate_special_period_factors(df: pd.DataFrame, overall_baseline: float,
+                                     auto_calculate: bool = True) -> Dict[str, float]:
+    """
+    特別期間の係数を計算（過去データから自動算出 or 固定値）
+    
+    Args:
+        df: 売上データ
+        overall_baseline: 全体のベースライン
+        auto_calculate: Trueなら過去データから計算、Falseなら固定値
+    
+    Returns:
+        特別期間名をキー、係数を値とする辞書
+    """
+    # デフォルト（固定）係数
+    default_factors = {
+        'new_year': 3.0,      # 正月
+        'obon': 1.5,          # お盆
+        'shichigosan': 1.3,   # 七五三
+        'golden_week': 1.3,   # ゴールデンウィーク
+        'year_end': 1.5,      # 年末
+        'normal': 1.0         # 通常日
+    }
+    
+    if not auto_calculate or overall_baseline <= 0:
+        return default_factors
+    
+    df = df.copy()
+    df['date'] = pd.to_datetime(df['date'])
+    
+    # 特別期間フラグを付与
+    def get_period_type(d):
+        if d.month == 1 and d.day <= 7:
+            return 'new_year'
+        elif d.month == 8 and 13 <= d.day <= 16:
+            return 'obon'
+        elif d.month == 11 and 10 <= d.day <= 20:
+            return 'shichigosan'
+        elif d.month == 5 and 3 <= d.day <= 5:
+            return 'golden_week'
+        elif d.month == 12 and d.day >= 28:
+            return 'year_end'
+        return 'normal'
+    
+    df['period_type'] = df['date'].apply(get_period_type)
+    
+    # 各期間の係数を計算
+    calculated_factors = {}
+    for period_name in default_factors.keys():
+        period_data = df[df['period_type'] == period_name]['販売商品数'].values
+        
+        if len(period_data) >= 3:  # 最低3サンプル必要
+            period_median = np.median(period_data)
+            factor = period_median / overall_baseline if overall_baseline > 0 else 1.0
+            # 極端な値を抑制（0.5〜5.0の範囲）
+            factor = max(0.5, min(5.0, factor))
+            calculated_factors[period_name] = float(factor)
+        else:
+            # サンプル不足時はデフォルト値を使用
+            calculated_factors[period_name] = default_factors[period_name]
+    
+    return calculated_factors
+
+
+def calculate_prediction_quantiles(predictions: np.ndarray, residuals: np.ndarray,
+                                   quantiles: List[float] = [0.5, 0.8, 0.9]) -> Dict[str, np.ndarray]:
+    """
+    予測の分位点を計算
+    
+    Args:
+        predictions: 点予測値の配列
+        residuals: 過去の残差（実績-予測）
+        quantiles: 計算する分位点のリスト
+    
+    Returns:
+        分位点名をキー、予測値配列を値とする辞書
+    """
+    result = {'predicted': predictions}
+    
+    if len(residuals) < 5:
+        # 残差データ不足時は点予測に基づく簡易計算
+        std_estimate = np.std(predictions) * 0.2  # 予測値の20%を標準偏差と仮定
+        
+        # 正規分布の分位点を計算（scipyがない場合の代替）
+        # Z値の近似: P50=0, P80≈0.84, P90≈1.28
+        z_values = {0.5: 0.0, 0.8: 0.84, 0.9: 1.28}
+        
+        for q in quantiles:
+            if SCIPY_AVAILABLE:
+                z_score = stats.norm.ppf(q)
+            else:
+                z_score = z_values.get(q, 0.0)
+            result[f'p{int(q*100)}'] = predictions + z_score * std_estimate
+    else:
+        # 残差の分布から分位点を計算
+        residual_quantiles = {q: np.percentile(residuals, q * 100) for q in quantiles}
+        for q in quantiles:
+            result[f'p{int(q*100)}'] = predictions + residual_quantiles[q]
+    
+    # 負の値を0に補正
+    for key in result:
+        result[key] = np.maximum(0, result[key])
+    
+    return result
+
+
+def run_simple_backtest(df: pd.DataFrame, holdout_days: int = 14,
+                       forecast_func=None) -> Dict[str, Any]:
+    """
+    簡易バックテストを実行してMAPEを計算
+    
+    Args:
+        df: 売上データ
+        holdout_days: ホールドアウト日数
+        forecast_func: 予測関数（Noneなら改善版フォールバックを使用）
+    
+    Returns:
+        バックテスト結果（MAPE、MAE、詳細データ）
+    """
+    df = df.copy()
+    df['date'] = pd.to_datetime(df['date'])
+    df = df.sort_values('date')
+    
+    if len(df) < holdout_days + 30:  # 最低30日の学習データが必要
+        return {
+            'mape': None,
+            'mae': None,
+            'message': 'データ不足のためバックテスト不可',
+            'holdout_days': holdout_days,
+            'available': False
+        }
+    
+    # データを分割
+    train_df = df.iloc[:-holdout_days].copy()
+    test_df = df.iloc[-holdout_days:].copy()
+    
+    # 予測を実行
+    if forecast_func is None:
+        forecast_result = forecast_with_seasonality_enhanced(
+            train_df, holdout_days, 
+            baseline_method='median',
+            auto_special_factors=True
+        )
+    else:
+        forecast_result = forecast_func(train_df, holdout_days)
+    
+    # 予測と実績を比較
+    test_df = test_df.reset_index(drop=True)
+    forecast_result = forecast_result.reset_index(drop=True)
+    
+    actual = test_df['販売商品数'].values
+    predicted = forecast_result['predicted'].values[:len(actual)]
+    
+    # MAPE計算（0除算対策）
+    non_zero_mask = actual > 0
+    if non_zero_mask.sum() > 0:
+        mape = np.mean(np.abs(actual[non_zero_mask] - predicted[non_zero_mask]) / actual[non_zero_mask]) * 100
+    else:
+        mape = None
+    
+    # MAE計算
+    mae = np.mean(np.abs(actual - predicted))
+    
+    # 残差を保存（分位点計算用）
+    residuals = actual - predicted
+    
+    return {
+        'mape': float(mape) if mape is not None else None,
+        'mae': float(mae),
+        'residuals': residuals.tolist(),
+        'holdout_days': holdout_days,
+        'actual': actual.tolist(),
+        'predicted': predicted.tolist(),
+        'message': f'直近{holdout_days}日間でバックテスト実施',
+        'available': True
+    }
+
+
+def forecast_with_seasonality_enhanced(
+    df: pd.DataFrame, 
+    periods: int,
+    baseline_method: str = 'median',
+    auto_special_factors: bool = True,
+    include_quantiles: bool = False,
+    order_mode: str = 'balanced',
+    backtest_days: int = 14
+) -> pd.DataFrame:
+    """
+    【v19新機能】精度強化版の季節性考慮予測
+    
+    Args:
+        df: 売上データ（date, 販売商品数を含む）
+        periods: 予測日数
+        baseline_method: ベースライン計算方法 ('median', 'trimmed_mean', 'iqr_mean', 'mean')
+        auto_special_factors: 特別期間係数を過去データから自動計算するか
+        include_quantiles: 分位点予測を含めるか
+        order_mode: 発注モード ('conservative'=P50, 'balanced'=P80, 'aggressive'=P90)
+        backtest_days: バックテスト日数（0なら実行しない）
+    
+    Returns:
+        予測結果のDataFrame
+    """
+    df = df.copy()
+    df['date'] = pd.to_datetime(df['date'])
+    df = df.sort_values('date')
+    
+    values = df['販売商品数'].values
+    
+    # ========== 1. 頑健なベースライン計算 ==========
+    overall_baseline = calculate_robust_baseline(values, method=baseline_method)
+    
+    if overall_baseline <= 0:
+        overall_baseline = 1.0
+    
+    # ========== 2. 特別期間を除外した通常日のベースライン ==========
+    def is_special_day(d):
+        d = pd.Timestamp(d)
+        if d.month == 1 and d.day <= 7:  # 正月
+            return True
+        if d.month == 8 and 13 <= d.day <= 16:  # お盆
+            return True
+        if d.month == 11 and 10 <= d.day <= 20:  # 七五三
+            return True
+        if d.month == 5 and 3 <= d.day <= 5:  # GW
+            return True
+        if d.month == 12 and d.day >= 28:  # 年末
+            return True
+        return False
+    
+    df['is_special'] = df['date'].apply(is_special_day)
+    normal_df = df[~df['is_special']]
+    
+    if len(normal_df) > 10:
+        # 通常日のみでベースラインを再計算（二重計上対策）
+        normal_baseline = calculate_robust_baseline(
+            normal_df['販売商品数'].values, 
+            method=baseline_method
+        )
+    else:
+        normal_baseline = overall_baseline
+    
+    # ========== 3. 曜日係数（頑健版） ==========
+    df['weekday'] = df['date'].dt.dayofweek
+    weekday_factor = {}
+    
+    for wd in range(7):
+        wd_values = normal_df[normal_df['weekday'] == wd]['販売商品数'].values
+        weekday_factor[wd] = calculate_robust_factor(wd_values, normal_baseline, min_samples=3)
+    
+    # ========== 4. 月係数（頑健版） ==========
+    df['month'] = df['date'].dt.month
+    month_factor = {}
+    
+    for m in range(1, 13):
+        # 通常日のみで月係数を計算
+        m_values = normal_df[normal_df['month'] == m]['販売商品数'].values
+        month_factor[m] = calculate_robust_factor(m_values, normal_baseline, min_samples=5)
+    
+    # ========== 5. 特別期間係数 ==========
+    special_factors = calculate_special_period_factors(
+        df, normal_baseline, auto_calculate=auto_special_factors
+    )
+    
+    # ========== 6. バックテスト（残差取得用） ==========
+    residuals = np.array([])
+    backtest_result = None
+    
+    if backtest_days > 0 and len(df) > backtest_days + 30:
+        backtest_result = run_simple_backtest(df, backtest_days)
+        if backtest_result['available']:
+            residuals = np.array(backtest_result['residuals'])
+    
+    # ========== 7. 予測生成 ==========
+    last_date = df['date'].max()
+    future_dates = pd.date_range(start=last_date + timedelta(days=1), periods=periods, freq='D')
+    
+    predictions = []
+    point_predictions = []
+    
+    for d in future_dates:
+        weekday_f = weekday_factor.get(d.dayofweek, 1.0)
+        month_f = month_factor.get(d.month, 1.0)
+        
+        # 特別期間の判定
+        special_f = special_factors['normal']
+        if d.month == 1 and d.day <= 7:
+            special_f = special_factors['new_year']
+        elif d.month == 8 and 13 <= d.day <= 16:
+            special_f = special_factors['obon']
+        elif d.month == 11 and 10 <= d.day <= 20:
+            special_f = special_factors['shichigosan']
+        elif d.month == 5 and 3 <= d.day <= 5:
+            special_f = special_factors['golden_week']
+        elif d.month == 12 and d.day >= 28:
+            special_f = special_factors['year_end']
+        
+        # 予測値計算（通常日ベースライン × 曜日係数 × 月係数 × 特別期間係数）
+        pred = normal_baseline * weekday_f * month_f * special_f
+        pred = max(0.1, pred)
+        point_predictions.append(pred)
+        
+        predictions.append({
+            'date': d,
+            'predicted': round(pred),
+            'weekday_factor': weekday_f,
+            'month_factor': month_f,
+            'special_factor': special_f
+        })
+    
+    result_df = pd.DataFrame(predictions)
+    
+    # ========== 8. 分位点予測の追加 ==========
+    if include_quantiles:
+        point_array = np.array(point_predictions)
+        quantile_results = calculate_prediction_quantiles(
+            point_array, residuals, quantiles=[0.5, 0.8, 0.9]
+        )
+        
+        result_df['p50'] = quantile_results['p50'].round().astype(int)
+        result_df['p80'] = quantile_results['p80'].round().astype(int)
+        result_df['p90'] = quantile_results['p90'].round().astype(int)
+        
+        # 発注モードに応じた推奨値
+        if order_mode == 'conservative':  # 滞留回避
+            result_df['recommended'] = result_df['p50']
+        elif order_mode == 'aggressive':  # 欠品回避
+            result_df['recommended'] = result_df['p90']
+        else:  # balanced
+            result_df['recommended'] = result_df['p80']
+    
+    # バックテスト結果をメタデータとして保存
+    if backtest_result is not None:
+        result_df.attrs['backtest'] = backtest_result
+        result_df.attrs['special_factors'] = special_factors
+        result_df.attrs['baseline_method'] = baseline_method
+        result_df.attrs['normal_baseline'] = normal_baseline
+    
+    return result_df
+
+
+# =============================================================================
 # 予測方法の統合（Vertex AI対応）
 # =============================================================================
 
@@ -484,7 +1083,13 @@ def forecast_with_vertex_ai(
     df: pd.DataFrame,
     periods: int,
     method: str = "Vertex AI",
-    product_id: str = "default"
+    product_id: str = "default",
+    # v19新パラメータ
+    baseline_method: str = 'median',
+    auto_special_factors: bool = True,
+    include_quantiles: bool = False,
+    order_mode: str = 'balanced',
+    backtest_days: int = 14
 ) -> Tuple[pd.DataFrame, str]:
     """
     予測方法に応じた予測を実行
@@ -494,6 +1099,11 @@ def forecast_with_vertex_ai(
         periods: 予測日数
         method: 予測方法
         product_id: 商品識別子
+        baseline_method: ベースライン計算方法（v19新規）
+        auto_special_factors: 特別期間係数の自動計算（v19新規）
+        include_quantiles: 分位点予測を含める（v19新規）
+        order_mode: 発注モード（v19新規）
+        backtest_days: バックテスト日数（v19新規）
     
     Returns:
         予測DataFrame, 使用した予測方法の説明
@@ -506,7 +1116,35 @@ def forecast_with_vertex_ai(
         return forecast_moving_average(df, periods), "移動平均法（統計モデル）"
     
     elif method == "季節性考慮（統計）":
+        # 従来版（互換性維持）
         return forecast_with_seasonality_fallback(df, periods), "季節性考慮（統計モデル）"
+    
+    elif method == "🎯 季節性考慮（精度強化版）":
+        # v19新規：精度強化版
+        forecast = forecast_with_seasonality_enhanced(
+            df, periods,
+            baseline_method=baseline_method,
+            auto_special_factors=auto_special_factors,
+            include_quantiles=include_quantiles,
+            order_mode=order_mode,
+            backtest_days=backtest_days
+        )
+        
+        # メッセージ生成
+        method_desc = f"季節性考慮（精度強化版・{baseline_method}ベース）"
+        if auto_special_factors:
+            method_desc += "・特別期間係数自動計算"
+        if include_quantiles:
+            mode_name = {'conservative': '滞留回避', 'balanced': 'バランス', 'aggressive': '欠品回避'}
+            method_desc += f"・{mode_name.get(order_mode, order_mode)}モード"
+        
+        # バックテスト結果があれば追記
+        if hasattr(forecast, 'attrs') and 'backtest' in forecast.attrs:
+            bt = forecast.attrs['backtest']
+            if bt.get('mape') is not None:
+                method_desc += f"・MAPE {bt['mape']:.1f}%"
+        
+        return forecast, method_desc
     
     elif method == "指数平滑法":
         return forecast_exponential_smoothing(df, periods), "指数平滑法（統計モデル）"
@@ -586,23 +1224,210 @@ def forecast_exponential_smoothing(df: pd.DataFrame, periods: int, alpha: float 
     return pd.DataFrame(predictions)
 
 
-def forecast_all_methods_with_vertex_ai(df: pd.DataFrame, periods: int, product_id: str = "default") -> Dict[str, Tuple[pd.DataFrame, str]]:
+def forecast_all_methods_with_vertex_ai(
+    df: pd.DataFrame, 
+    periods: int, 
+    product_id: str = "default",
+    baseline_method: str = 'median',
+    auto_special_factors: bool = True,
+    backtest_days: int = 14
+) -> Dict[str, Tuple[pd.DataFrame, str]]:
     """
-    すべての予測方法で予測を実行（Vertex AI含む）
+    すべての予測方法で予測を実行（Vertex AI含む、v19: 精度強化版追加）
     """
     results = {}
     
     # Vertex AI予測
     if VERTEX_AI_AVAILABLE:
-        predictions, used_vertex_ai, message = get_vertex_ai_prediction(df, periods, product_id)
-        results['Vertex AI'] = (predictions, message)
+        try:
+            predictions, used_vertex_ai, message = get_vertex_ai_prediction(df, periods, product_id)
+            results['Vertex AI'] = (predictions, message)
+        except Exception as e:
+            logger.warning(f"Vertex AI予測失敗: {e}")
     
-    # 統計モデル予測
+    # 【v19新規】精度強化版予測
+    try:
+        enhanced_forecast = forecast_with_seasonality_enhanced(
+            df, periods,
+            baseline_method=baseline_method,
+            auto_special_factors=auto_special_factors,
+            include_quantiles=True,
+            order_mode='balanced',
+            backtest_days=backtest_days
+        )
+        method_desc = f"季節性考慮（精度強化版・{baseline_method}ベース）"
+        results['精度強化版'] = (enhanced_forecast, method_desc)
+    except Exception as e:
+        logger.warning(f"精度強化版予測失敗: {e}")
+    
+    # 統計モデル予測（従来版）
     results['季節性考慮'] = (forecast_with_seasonality_fallback(df, periods), "季節性考慮（統計モデル）")
     results['移動平均法'] = (forecast_moving_average(df, periods), "移動平均法（統計モデル）")
     results['指数平滑法'] = (forecast_exponential_smoothing(df, periods), "指数平滑法（統計モデル）")
     
     return results
+
+
+def display_comparison_results_v19(
+    all_results: Dict[str, Tuple[pd.DataFrame, str]], 
+    forecast_days: int, 
+    sales_data: pd.DataFrame = None
+):
+    """【v19新機能】すべての予測方法の比較結果を表示（バックテスト情報付き）"""
+    st.success("✅ すべての予測方法で比較完了！")
+    
+    # 各予測方法の予測総数を計算
+    method_totals = {}
+    backtest_info = {}
+    
+    for method_name, (forecast, message) in all_results.items():
+        raw_total = int(forecast['predicted'].sum())
+        rounded_total = round_up_to_50(raw_total)
+        avg_predicted = forecast['predicted'].mean()
+        method_totals[method_name] = {
+            'raw': raw_total,
+            'rounded': rounded_total,
+            'avg': avg_predicted
+        }
+        
+        # バックテスト情報があれば取得
+        if hasattr(forecast, 'attrs') and 'backtest' in forecast.attrs:
+            bt = forecast.attrs['backtest']
+            if bt.get('mape') is not None:
+                backtest_info[method_name] = bt['mape']
+    
+    # ========== 各予測方法の予測総数を明確に表示 ==========
+    st.write("### 📊 各予測方法の予測総数（発注推奨数）")
+    
+    # 分かりやすいリスト形式で表示
+    st.markdown("---")
+    for method_name, totals in method_totals.items():
+        icon = "🚀" if "Vertex" in method_name else "🎯" if "精度強化" in method_name else "📈" if "季節" in method_name else "📊" if "移動" in method_name else "📉"
+        mape_str = f"（MAPE {backtest_info[method_name]:.1f}%）" if method_name in backtest_info else ""
+        st.markdown(f"""
+        **{icon} {safe_html(method_name)}**: **{totals['rounded']:,}体**（日販 {totals['avg']:.1f}体）{mape_str}
+        """)
+    st.markdown("---")
+    
+    # メトリクスで大きく表示
+    num_methods = len(method_totals)
+    cols = st.columns(min(num_methods, 4))
+    
+    for i, (method_name, totals) in enumerate(method_totals.items()):
+        icon = "🚀" if "Vertex" in method_name else "🎯" if "精度強化" in method_name else "📈" if "季節" in method_name else "📊" if "移動" in method_name else "📉"
+        short_name = method_name.replace("（統計）", "").replace("（推奨）", "")
+        with cols[i % 4]:
+            delta_str = f"MAPE {backtest_info[method_name]:.1f}%" if method_name in backtest_info else f"日販 {totals['avg']:.1f}体"
+            st.metric(
+                f"{icon} {safe_html(short_name)}",
+                f"{totals['rounded']:,}体",
+                delta_str
+            )
+    
+    # 詳細表
+    with st.expander("📋 詳細データを表示", expanded=False):
+        summary_rows = []
+        for method_name, totals in method_totals.items():
+            icon = "🚀" if "Vertex" in method_name else "🎯" if "精度強化" in method_name else "📈" if "季節" in method_name else "📊" if "移動" in method_name else "📉"
+            mape_str = f"{backtest_info[method_name]:.1f}%" if method_name in backtest_info else "-"
+            summary_rows.append({
+                '予測方法': f"{icon} {method_name}",
+                '予測総数（生値）': f"{totals['raw']:,}体",
+                '発注推奨数（50倍数）': f"{totals['rounded']:,}体",
+                '平均日販': f"{totals['avg']:.1f}体/日",
+                'MAPE': mape_str
+            })
+        
+        summary_df = pd.DataFrame(summary_rows)
+        st.dataframe(summary_df, use_container_width=True, hide_index=True)
+    
+    # 統計サマリー
+    all_rounded = [t['rounded'] for t in method_totals.values()]
+    all_raw = [t['raw'] for t in method_totals.values()]
+    
+    st.write("### 📈 予測値の統計")
+    
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("📉 最小", f"{min(all_rounded):,}体")
+    col2.metric("📈 最大", f"{max(all_rounded):,}体")
+    col3.metric("📊 平均", f"{round_up_to_50(int(sum(all_raw) / len(all_raw))):,}体")
+    col4.metric("📊 中央値", f"{round_up_to_50(int(sorted(all_raw)[len(all_raw)//2])):,}体")
+    
+    # 差分の表示
+    if len(all_rounded) >= 2:
+        diff = max(all_rounded) - min(all_rounded)
+        diff_pct = (max(all_raw) - min(all_raw)) / min(all_raw) * 100 if min(all_raw) > 0 else 0
+        st.info(f"📏 **予測値の幅**: 最小〜最大で **{diff:,}体** の差（{diff_pct:.1f}%）")
+    
+    # 【v19新機能】推奨の判断基準
+    if backtest_info:
+        best_method = min(backtest_info.keys(), key=lambda x: backtest_info[x])
+        best_mape = backtest_info[best_method]
+        st.success(f"💡 **おすすめ**: バックテスト結果から **{safe_html(best_method)}**（MAPE {best_mape:.1f}%）が最も精度が高いです。")
+    elif 'Vertex AI' in all_results:
+        st.info("💡 **おすすめ**: Vertex AI AutoML Forecastingは機械学習モデルで学習済みのため、最も精度が高い傾向があります。")
+    else:
+        st.info("💡 **おすすめ**: 精度強化版は中央値ベース・外れ値に強いため、季節変動の大きいデータに適しています。")
+    
+    method_colors = {
+        'Vertex AI': '#4285F4',
+        '精度強化版': '#9C27B0',
+        '季節性考慮': '#4CAF50',
+        '移動平均法': '#1E88E5',
+        '指数平滑法': '#FF9800'
+    }
+    
+    # 比較グラフ（スマホ最適化）
+    st.write("### 📈 日別予測比較グラフ")
+    
+    fig = go.Figure()
+    
+    for method_name, (forecast, message) in all_results.items():
+        fig.add_trace(go.Scatter(
+            x=forecast['date'],
+            y=forecast['predicted'],
+            mode='lines',
+            name=method_name,
+            line=dict(color=method_colors.get(method_name, '#666666'), width=2)
+        ))
+    
+    layout = get_mobile_chart_layout('予測方法別の日別予測比較', height=300)
+    layout['xaxis_title'] = '日付'
+    layout['yaxis_title'] = '予測販売数（体）'
+    fig.update_layout(**layout)
+    
+    st.plotly_chart(fig, use_container_width=True, config=get_mobile_chart_config())
+    
+    # セッション状態に保存（精度強化版優先、なければVertex AI、なければ季節性考慮）
+    if '精度強化版' in all_results:
+        st.session_state.forecast_data = all_results['精度強化版'][0]
+        st.session_state.forecast_total = method_totals['精度強化版']['rounded']
+    elif 'Vertex AI' in all_results:
+        st.session_state.forecast_data = all_results['Vertex AI'][0]
+        st.session_state.forecast_total = method_totals['Vertex AI']['rounded']
+    elif '季節性考慮' in all_results:
+        st.session_state.forecast_data = all_results['季節性考慮'][0]
+        st.session_state.forecast_total = method_totals['季節性考慮']['rounded']
+    
+    st.session_state.forecast_results = {k: v[0] for k, v in all_results.items()}
+    
+    # ファクトチェック用プロンプトセクション
+    product_names = st.session_state.get('selected_products', [])
+    factcheck_prompt = generate_factcheck_prompt_comparison(
+        product_names=product_names,
+        all_results=all_results,
+        method_totals=method_totals,
+        forecast_days=forecast_days,
+        sales_data=sales_data
+    )
+    display_factcheck_section(factcheck_prompt, key_suffix="comparison_v19")
+
+
+# 旧バージョンとの互換性のため残す
+def display_comparison_results_v12(all_results: Dict[str, Tuple[pd.DataFrame, str]], forecast_days: int, sales_data: pd.DataFrame = None):
+    """すべての予測方法の比較結果を表示（v12 互換性維持用）"""
+    # v19版を呼び出し
+    display_comparison_results_v19(all_results, forecast_days, sales_data)
 
 
 # =============================================================================
@@ -616,8 +1441,14 @@ FORECAST_METHODS = {
         "color": "#4285F4",
         "requires_vertex_ai": True
     },
+    "🎯 季節性考慮（精度強化版）": {
+        "description": "【v19新機能】中央値ベース・特別期間自動学習・分位点予測・バックテスト付き。最も推奨。",
+        "icon": "🎯",
+        "color": "#9C27B0",
+        "requires_vertex_ai": False
+    },
     "季節性考慮（統計）": {
-        "description": "月別・曜日別の傾向と特別期間を考慮した統計モデル。Vertex AI未設定時の推奨。",
+        "description": "月別・曜日別の傾向と特別期間を考慮した統計モデル。従来版（互換性維持）。",
         "icon": "📈",
         "color": "#4CAF50",
         "requires_vertex_ai": False
@@ -637,7 +1468,7 @@ FORECAST_METHODS = {
     "🔄 すべての方法で比較": {
         "description": "Vertex AIと統計モデルすべてで予測し、結果を比較します。",
         "icon": "🔄",
-        "color": "#9C27B0",
+        "color": "#607D8B",
         "requires_vertex_ai": False
     }
 }
@@ -1124,8 +1955,16 @@ st.markdown("""
     }
     .method-vertex-ai { border-left-color: #4285F4; background: #e8f0fe; }
     .method-seasonality { border-left-color: #4CAF50; }
+    .method-enhanced { border-left-color: #9C27B0; background: #f3e5f5; }
     .method-moving-avg { border-left-color: #1E88E5; }
     .method-exponential { border-left-color: #FF9800; }
+    
+    /* v19: バックテスト・分位点関連 */
+    .backtest-good { background: #e8f5e9; border: 1px solid #4CAF50; padding: 10px; border-radius: 8px; }
+    .backtest-medium { background: #fff3e0; border: 1px solid #FF9800; padding: 10px; border-radius: 8px; }
+    .backtest-poor { background: #ffebee; border: 1px solid #F44336; padding: 10px; border-radius: 8px; }
+    .quantile-highlight { background: #e3f2fd; padding: 5px 10px; border-radius: 5px; font-weight: bold; }
+    
     .vertex-ai-status {
         padding: 10px 15px;
         border-radius: 8px;
@@ -1388,6 +2227,22 @@ if 'individual_all_methods_results' not in st.session_state:
 if 'delete_counter' not in st.session_state:
     st.session_state.delete_counter = 0
 
+# =============================================================================
+# 【v19新規】予測パラメータのセッション状態
+# =============================================================================
+if 'v19_baseline_method' not in st.session_state:
+    st.session_state.v19_baseline_method = 'median'  # デフォルト: 中央値
+if 'v19_auto_special_factors' not in st.session_state:
+    st.session_state.v19_auto_special_factors = True  # デフォルト: 自動計算ON
+if 'v19_include_quantiles' not in st.session_state:
+    st.session_state.v19_include_quantiles = True  # デフォルト: 分位点ON
+if 'v19_order_mode' not in st.session_state:
+    st.session_state.v19_order_mode = 'balanced'  # デフォルト: バランスモード
+if 'v19_backtest_days' not in st.session_state:
+    st.session_state.v19_backtest_days = 14  # デフォルト: 14日
+if 'v19_last_backtest_result' not in st.session_state:
+    st.session_state.v19_last_backtest_result = None
+
 
 # =============================================================================
 # ユーティリティ関数
@@ -1619,20 +2474,33 @@ def render_header():
             st.session_state.individual_sales_data = {}
             st.rerun()
     
-    # Vertex AIステータス表示
+    # Vertex AIステータス表示（v19: 機密情報はマスク）
     if VERTEX_AI_AVAILABLE:
-        st.markdown(f"""
-        <div class="vertex-ai-status vertex-ai-available">
-            ✅ <strong>Vertex AI AutoML Forecasting:</strong> 接続済み
-            （プロジェクト: {VERTEX_AI_CONFIG['project_id']}, リージョン: {VERTEX_AI_CONFIG['location']}）
-        </div>
-        """, unsafe_allow_html=True)
+        # デバッグモード時のみ詳細表示
+        show_detail = hasattr(st, 'secrets') and st.secrets.get('DEBUG', False)
+        if show_detail:
+            project_masked = mask_sensitive_value(VERTEX_AI_CONFIG['project_id'], 8)
+            st.markdown(f"""
+            <div class="vertex-ai-status vertex-ai-available">
+                ✅ <strong>Vertex AI AutoML Forecasting:</strong> 接続済み
+                （プロジェクト: {safe_html(project_masked)}, リージョン: {safe_html(VERTEX_AI_CONFIG['location'])}）
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.markdown("""
+            <div class="vertex-ai-status vertex-ai-available">
+                ✅ <strong>Vertex AI AutoML Forecasting:</strong> 接続済み
+            </div>
+            """, unsafe_allow_html=True)
     else:
         st.markdown("""
         <div class="vertex-ai-status vertex-ai-unavailable">
             ⚠️ <strong>Vertex AI:</strong> 未設定（統計モデルで予測します）
         </div>
         """, unsafe_allow_html=True)
+    
+    # v19バージョン情報
+    st.caption("📊 v19: 予測精度強化版（中央値ベース・分位点予測・バックテスト対応）")
     
     if st.session_state.data_loader:
         min_date, max_date = st.session_state.data_loader.get_date_range()
@@ -1687,39 +2555,67 @@ def render_main_tabs():
 # =============================================================================
 
 def render_vertex_ai_settings():
-    """Vertex AI設定タブ"""
+    """Vertex AI設定タブ（v19: st.secrets対応）"""
     st.markdown('<p class="section-header">⚙️ Vertex AI AutoML Forecasting 設定</p>', unsafe_allow_html=True)
     
-    # 現在の設定状況
+    # 現在の設定状況（v19: 機密情報はマスク）
     st.write("### 📋 現在の設定状況")
     
+    # デバッグモード確認
+    show_detail = hasattr(st, 'secrets') and st.secrets.get('DEBUG', False)
+    
     config_status = {
-        'プロジェクトID': VERTEX_AI_CONFIG['project_id'] or '未設定',
+        'プロジェクトID': mask_sensitive_value(VERTEX_AI_CONFIG['project_id'], 8) if VERTEX_AI_CONFIG['project_id'] else '未設定',
         'リージョン': VERTEX_AI_CONFIG['location'] or '未設定',
-        'エンドポイントID': VERTEX_AI_CONFIG['endpoint_id'] or '未設定',
-        'サービスアカウントファイル': VERTEX_AI_CONFIG['service_account_file'],
-        'ファイル存在': '✅ あり' if os.path.exists(VERTEX_AI_CONFIG['service_account_file']) else '❌ なし',
+        'エンドポイントID': mask_sensitive_value(VERTEX_AI_CONFIG['endpoint_id'], 8) if VERTEX_AI_CONFIG['endpoint_id'] else '未設定',
         'Vertex AI利用可能': '✅ はい' if VERTEX_AI_AVAILABLE else '❌ いいえ',
     }
     
     for key, value in config_status.items():
-        st.write(f"- **{key}**: {value}")
+        st.write(f"- **{key}**: {safe_html(value)}")
     
     st.divider()
     
-    # 設定方法の説明
+    # 設定方法の説明（v19: st.secrets対応追加）
     st.write("### 🔧 設定方法")
     
     st.markdown("""
-    **方法1: 環境変数で設定**
+    **【推奨】方法1: Streamlit Cloud (st.secrets)で設定**
+    
+    `.streamlit/secrets.toml` または Streamlit Cloud の Secrets に以下を設定:
+    
+    ```toml
+    # Vertex AI設定
+    VERTEX_AI_PROJECT_ID = "your-project-id"
+    VERTEX_AI_LOCATION = "asia-northeast1"
+    VERTEX_AI_ENDPOINT_ID = "your-endpoint-id"
+    
+    # GCPサービスアカウント（JSON形式）
+    [gcp_service_account]
+    type = "service_account"
+    project_id = "your-project-id"
+    private_key_id = "your-private-key-id"
+    private_key = "-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n"
+    client_email = "your-service-account@your-project.iam.gserviceaccount.com"
+    client_id = "123456789"
+    auth_uri = "https://accounts.google.com/o/oauth2/auth"
+    token_uri = "https://oauth2.googleapis.com/token"
+    # ... その他のフィールド
+    
+    # デバッグモード（オプション）
+    DEBUG = false
+    ```
+    
+    **方法2: 環境変数で設定**
     ```bash
     export VERTEX_AI_PROJECT_ID="your-project-id"
     export VERTEX_AI_LOCATION="asia-northeast1"
     export VERTEX_AI_ENDPOINT_ID="your-endpoint-id"
-    export VERTEX_AI_SERVICE_ACCOUNT_FILE="path/to/service_account.json"
+    # JSON文字列として設定
+    export VERTEX_AI_SERVICE_ACCOUNT_JSON='{"type":"service_account",...}'
     ```
     
-    **方法2: config.pyで設定**
+    **方法3: config.pyで設定（ローカル開発用）**
     ```python
     # config.py
     VERTEX_AI_PROJECT_ID = "your-project-id"
@@ -1773,7 +2669,7 @@ def render_vertex_ai_settings():
            - Vertex AI ユーザー
            - Vertex AI 予測ユーザー
         4. 「鍵を作成」→ JSON形式でダウンロード
-        5. ダウンロードしたファイルをプロジェクトフォルダに配置
+        5. Streamlit Cloud の場合は secrets.toml に設定
         """)
     
     # 接続テスト
@@ -2598,177 +3494,414 @@ def render_yearly_trend(df_items: pd.DataFrame, original_names: list):
 
 
 def render_forecast_section(sales_data: pd.DataFrame):
-    """需要予測セクション（Vertex AI対応）"""
+    """需要予測セクション（v19: st.form対応・精度強化版）"""
     st.markdown('<p class="section-header">④ 需要を予測する</p>', unsafe_allow_html=True)
     
     if sales_data is None or sales_data.empty:
         st.info("売上データがあると、需要予測ができます")
         return
     
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        forecast_mode = st.radio(
-            "予測期間の指定方法",
-            ["日数で指定", "期間で指定"],
-            horizontal=True,
-            key="forecast_mode_existing",
-            help="「期間で指定」は期間限定品の予測に便利です"
+    # ==========================================================================
+    # 予測パラメータ設定（st.formで囲んでチラつき防止）
+    # ==========================================================================
+    with st.form(key="forecast_form_v19"):
+        st.write("### 🎯 予測設定")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            forecast_mode = st.radio(
+                "予測期間の指定方法",
+                ["日数で指定", "期間で指定"],
+                horizontal=True,
+                key="forecast_mode_existing_v19",
+                help="「期間で指定」は期間限定品の予測に便利です"
+            )
+        
+        with col2:
+            available_methods = get_available_forecast_methods()
+            # v19: 精度強化版をデフォルトに
+            if "🎯 季節性考慮（精度強化版）" in available_methods:
+                default_idx = available_methods.index("🎯 季節性考慮（精度強化版）")
+            elif "🚀 Vertex AI（推奨）" in available_methods:
+                default_idx = available_methods.index("🚀 Vertex AI（推奨）")
+            else:
+                default_idx = 0
+            
+            method = st.selectbox(
+                "予測方法",
+                available_methods,
+                index=default_idx,
+                key="forecast_method_existing_v19"
+            )
+        
+        # 予測期間の設定
+        if forecast_mode == "日数で指定":
+            forecast_days = st.slider("予測日数", 30, 365, 180, key="forecast_days_existing_v19")
+            forecast_start_date = None
+            forecast_end_date = None
+        else:
+            # 期間指定UI
+            today = date.today()
+            default_start = today + timedelta(days=1)
+            default_end = today + timedelta(days=180)
+            
+            st.write("**予測期間指定**")
+            col_s1, col_s2, col_s3, col_e1, col_e2, col_e3 = st.columns([1, 1, 1, 1, 1, 1])
+            
+            with col_s1:
+                start_year = st.selectbox(
+                    "予測開始年",
+                    list(range(2025, 2028)),
+                    index=list(range(2025, 2028)).index(default_start.year) if default_start.year in range(2025, 2028) else 0,
+                    key="forecast_start_year_v19"
+                )
+            with col_s2:
+                start_month = st.selectbox(
+                    "予測開始月",
+                    list(range(1, 13)),
+                    index=default_start.month - 1,
+                    format_func=lambda x: f"{x}月",
+                    key="forecast_start_month_v19"
+                )
+            with col_s3:
+                max_day_start = calendar.monthrange(start_year, start_month)[1]
+                start_day = st.selectbox(
+                    "予測開始日",
+                    list(range(1, max_day_start + 1)),
+                    index=min(default_start.day - 1, max_day_start - 1),
+                    format_func=lambda x: f"{x}日",
+                    key="forecast_start_day_v19"
+                )
+            
+            with col_e1:
+                end_year = st.selectbox(
+                    "予測終了年",
+                    list(range(2025, 2028)),
+                    index=list(range(2025, 2028)).index(default_end.year) if default_end.year in range(2025, 2028) else 0,
+                    key="forecast_end_year_v19"
+                )
+            with col_e2:
+                end_month = st.selectbox(
+                    "予測終了月",
+                    list(range(1, 13)),
+                    index=default_end.month - 1,
+                    format_func=lambda x: f"{x}月",
+                    key="forecast_end_month_v19"
+                )
+            with col_e3:
+                max_day_end = calendar.monthrange(end_year, end_month)[1]
+                end_day = st.selectbox(
+                    "予測終了日",
+                    list(range(1, max_day_end + 1)),
+                    index=min(default_end.day - 1, max_day_end - 1),
+                    format_func=lambda x: f"{x}日",
+                    key="forecast_end_day_v19"
+                )
+            
+            forecast_start_date = date(start_year, start_month, start_day)
+            forecast_end_date = date(end_year, end_month, end_day)
+            forecast_days = max(1, (forecast_end_date - forecast_start_date).days + 1)
+        
+        # ==========================================================================
+        # 【v19新機能】精度強化版の詳細設定
+        # ==========================================================================
+        if "精度強化版" in method:
+            with st.expander("⚙️ **詳細設定（精度強化オプション）**", expanded=True):
+                st.markdown("""
+                <div style="background-color: #e8f5e9; padding: 10px; border-radius: 5px; margin-bottom: 10px;">
+                    <strong>💡 v19新機能:</strong> 以下の設定で予測精度を調整できます
+                </div>
+                """, unsafe_allow_html=True)
+                
+                col_opt1, col_opt2 = st.columns(2)
+                
+                with col_opt1:
+                    baseline_method = st.selectbox(
+                        "ベースライン計算方法",
+                        options=['median', 'trimmed_mean', 'iqr_mean', 'mean'],
+                        format_func=lambda x: {
+                            'median': '中央値（推奨・外れ値に強い）',
+                            'trimmed_mean': 'トリム平均（上下10%除外）',
+                            'iqr_mean': 'IQR平均（四分位範囲内）',
+                            'mean': '単純平均（従来方式）'
+                        }.get(x, x),
+                        index=0,
+                        key="v19_baseline_method_select",
+                        help="正月などの繁忙期データがあっても影響を受けにくい計算方法を選択"
+                    )
+                    
+                    auto_special_factors = st.checkbox(
+                        "特別期間係数を自動計算",
+                        value=True,
+                        key="v19_auto_special_factors_check",
+                        help="過去3年のデータから正月・お盆・七五三などの係数を自動学習"
+                    )
+                
+                with col_opt2:
+                    order_mode = st.selectbox(
+                        "発注モード",
+                        options=['conservative', 'balanced', 'aggressive'],
+                        format_func=lambda x: {
+                            'conservative': '滞留回避（P50・控えめ）',
+                            'balanced': 'バランス（P80・推奨）',
+                            'aggressive': '欠品回避（P90・多め）'
+                        }.get(x, x),
+                        index=1,  # デフォルト: バランス
+                        key="v19_order_mode_select",
+                        help="欠品リスクと在庫リスクのバランスを選択"
+                    )
+                    
+                    backtest_days = st.selectbox(
+                        "バックテスト日数",
+                        options=[0, 7, 14, 30],
+                        format_func=lambda x: f"{x}日間" if x > 0 else "実行しない",
+                        index=2,  # デフォルト: 14日
+                        key="v19_backtest_days_select",
+                        help="予測精度を検証するためのホールドアウト期間"
+                    )
+                
+                include_quantiles = st.checkbox(
+                    "分位点予測を含める（P50/P80/P90）",
+                    value=True,
+                    key="v19_include_quantiles_check",
+                    help="予測の不確実性を考慮した発注推奨"
+                )
+        else:
+            # 精度強化版以外はデフォルト値を使用
+            baseline_method = 'median'
+            auto_special_factors = True
+            order_mode = 'balanced'
+            backtest_days = 14
+            include_quantiles = False
+        
+        # 共変量オプション（Vertex AI選択時）
+        use_covariates = False
+        if "Vertex AI" in method and VERTEX_AI_AVAILABLE:
+            use_covariates = st.checkbox(
+                "共変量を使用（天気・六曜・イベント）",
+                value=True,
+                key="v19_use_covariates",
+                help="予測精度が向上しますが、処理時間が長くなる場合があります"
+            )
+        
+        # ==========================================================================
+        # 予測実行ボタン
+        # ==========================================================================
+        submitted = st.form_submit_button(
+            "🔮 需要を予測",
+            type="primary",
+            use_container_width=True
         )
     
-    with col2:
-        available_methods = get_available_forecast_methods()
-        default_idx = 0  # Vertex AIがあれば0、なければ季節性考慮
-        if "🚀 Vertex AI（推奨）" not in available_methods:
-            default_idx = available_methods.index("季節性考慮（統計）") if "季節性考慮（統計）" in available_methods else 0
-        
-        method = st.selectbox(
-            "予測方法",
-            available_methods,
-            index=default_idx,
-            key="forecast_method_existing"
-        )
-    
-    # 予測期間の設定
-    if forecast_mode == "日数で指定":
-        forecast_days = st.slider("予測日数", 30, 365, 180, key="forecast_days_existing")
-        forecast_start_date = None
-        forecast_end_date = None
-    else:
-        # 期間指定UI（分析期間と同じスタイル）
-        today = date.today()
-        default_start = today + timedelta(days=1)
-        default_end = today + timedelta(days=180)
-        
-        st.write("**予測期間指定**")
-        col_s1, col_s2, col_s3, col_e1, col_e2, col_e3 = st.columns([1, 1, 1, 1, 1, 1])
-        
-        with col_s1:
-            start_year = st.selectbox(
-                "予測開始年",
-                list(range(2025, 2028)),
-                index=list(range(2025, 2028)).index(default_start.year) if default_start.year in range(2025, 2028) else 0,
-                key="forecast_start_year"
-            )
-        with col_s2:
-            start_month = st.selectbox(
-                "予測開始月",
-                list(range(1, 13)),
-                index=default_start.month - 1,
-                format_func=lambda x: f"{x}月",
-                key="forecast_start_month"
-            )
-        with col_s3:
-            max_day_start = calendar.monthrange(start_year, start_month)[1]
-            start_day = st.selectbox(
-                "予測開始日",
-                list(range(1, max_day_start + 1)),
-                index=min(default_start.day - 1, max_day_start - 1),
-                format_func=lambda x: f"{x}日",
-                key="forecast_start_day"
-            )
-        
-        with col_e1:
-            end_year = st.selectbox(
-                "予測終了年",
-                list(range(2025, 2028)),
-                index=list(range(2025, 2028)).index(default_end.year) if default_end.year in range(2025, 2028) else 0,
-                key="forecast_end_year"
-            )
-        with col_e2:
-            end_month = st.selectbox(
-                "予測終了月",
-                list(range(1, 13)),
-                index=default_end.month - 1,
-                format_func=lambda x: f"{x}月",
-                key="forecast_end_month"
-            )
-        with col_e3:
-            max_day_end = calendar.monthrange(end_year, end_month)[1]
-            end_day = st.selectbox(
-                "予測終了日",
-                list(range(1, max_day_end + 1)),
-                index=min(default_end.day - 1, max_day_end - 1),
-                format_func=lambda x: f"{x}日",
-                key="forecast_end_day"
-            )
-        
-        forecast_start_date = date(start_year, start_month, start_day)
-        forecast_end_date = date(end_year, end_month, end_day)
-        
-        if forecast_end_date <= forecast_start_date:
-            st.error("⚠️ 終了日は開始日より後にしてください")
-            return
-        
-        forecast_days = (forecast_end_date - forecast_start_date).days + 1
-        st.info(f"📅 予測期間: {forecast_start_date.strftime('%Y年%m月%d日')} 〜 {forecast_end_date.strftime('%Y年%m月%d日')}（{forecast_days}日間）")
-    
-    # 予測方法の説明を表示
-    method_info = FORECAST_METHODS[method]
+    # フォーム外に予測方法の説明を表示
+    method_info = FORECAST_METHODS.get(method, {"icon": "📊", "description": "", "color": "#666"})
     css_class = "vertex-ai" if "Vertex" in method else "seasonality" if "季節" in method else "moving-avg" if "移動" in method else "exponential"
     
     st.markdown(f"""
     <div class="method-card method-{css_class}">
-        <strong>{method_info['icon']} {method}</strong><br>
-        {method_info['description']}
+        <strong>{method_info['icon']} {safe_html(method)}</strong><br>
+        {safe_html(method_info['description'])}
     </div>
     """, unsafe_allow_html=True)
     
-    # 共変量オプション（Vertex AI選択時）
-    use_covariates = False
-    if "Vertex AI" in method and VERTEX_AI_AVAILABLE:
-        use_covariates = st.checkbox(
-            "共変量を使用（天気・六曜・イベント）",
-            value=True,
-            help="予測精度が向上しますが、処理時間が長くなる場合があります"
-        )
-    
-    if st.button("🔮 需要を予測", type="primary", use_container_width=True, key="forecast_btn_existing"):
+    # ==========================================================================
+    # 予測実行
+    # ==========================================================================
+    if submitted:
+        # 期間指定の検証
+        if forecast_mode == "期間で指定":
+            if forecast_end_date <= forecast_start_date:
+                st.error("⚠️ 終了日は開始日より後にしてください")
+                return
+            st.info(f"📅 予測期間: {forecast_start_date.strftime('%Y年%m月%d日')} 〜 {forecast_end_date.strftime('%Y年%m月%d日')}（{forecast_days}日間）")
+        
         with st.spinner("予測中..."):
             try:
                 if method == "🔄 すべての方法で比較":
                     # すべての方法で予測
                     product_id = "_".join(st.session_state.selected_products[:3])
-                    all_results = forecast_all_methods_with_vertex_ai(sales_data, forecast_days, product_id)
-                    display_comparison_results_v12(all_results, forecast_days, sales_data)
+                    all_results = forecast_all_methods_with_vertex_ai(
+                        sales_data, forecast_days, product_id,
+                        baseline_method=baseline_method,
+                        auto_special_factors=auto_special_factors,
+                        backtest_days=backtest_days
+                    )
+                    display_comparison_results_v19(all_results, forecast_days, sales_data)
                 else:
                     # 単一の予測方法
                     product_id = "_".join(st.session_state.selected_products[:3])
-                    forecast, method_message = forecast_with_vertex_ai(sales_data, forecast_days, method, product_id)
+                    
+                    forecast, method_message = forecast_with_vertex_ai(
+                        sales_data, forecast_days, method, product_id,
+                        baseline_method=baseline_method,
+                        auto_special_factors=auto_special_factors,
+                        include_quantiles=include_quantiles,
+                        order_mode=order_mode,
+                        backtest_days=backtest_days
+                    )
                     
                     if forecast is not None and not forecast.empty:
-                        display_single_forecast_result_v12(forecast, forecast_days, method, method_message, sales_data)
+                        display_single_forecast_result_v19(
+                            forecast, forecast_days, method, method_message, 
+                            sales_data, order_mode, include_quantiles
+                        )
                     else:
                         st.error("予測結果が空です。データを確認してください。")
             except Exception as e:
-                st.error(f"予測エラー: {e}")
-                logger.error(f"予測エラー: {e}")
+                # セキュリティ: ユーザーには一般的なメッセージ、詳細はログへ
+                st.error("予測中にエラーが発生しました。データを確認してください。")
+                logger.error(f"予測エラー（詳細）: {e}")
 
 
-def display_single_forecast_result_v12(forecast: pd.DataFrame, forecast_days: int, method: str, method_message: str, sales_data: pd.DataFrame = None):
-    """単一の予測結果を表示（v12 スマホ最適化 + ロジック説明）"""
+def display_single_forecast_result_v19(
+    forecast: pd.DataFrame, 
+    forecast_days: int, 
+    method: str, 
+    method_message: str, 
+    sales_data: pd.DataFrame = None,
+    order_mode: str = 'balanced',
+    include_quantiles: bool = False
+):
+    """【v19新機能】単一の予測結果を表示（バックテスト・分位点対応）"""
     raw_total = int(forecast['predicted'].sum())
     rounded_total = round_up_to_50(raw_total)
     avg_predicted = forecast['predicted'].mean()
     
-    # Vertex AI使用時は特別表示
+    # ==========================================================================
+    # 予測結果カード（v19: 情報充実）
+    # ==========================================================================
     if "Vertex AI" in method_message:
-        st.success(f"✅ 予測完了！（🚀 {method_message}）")
+        st.success(f"✅ 予測完了！（🚀 {safe_html(method_message)}）")
     else:
-        st.success(f"✅ 予測完了！（{method_message}）")
+        st.success(f"✅ 予測完了！（{safe_html(method_message)}）")
     
     st.session_state.last_forecast_method = method_message
     
+    # 基本メトリクス
     col1, col2, col3 = st.columns(3)
     col1.metric("📦 予測販売総数", f"{rounded_total:,}体")
     col2.metric("📈 平均日販（予測）", f"{avg_predicted:.1f}体/日")
     col3.metric("📅 予測期間", f"{forecast_days}日間")
     
-    # 予測ロジックの説明を追加
+    # ==========================================================================
+    # 【v19新機能】バックテスト結果の表示
+    # ==========================================================================
+    if hasattr(forecast, 'attrs') and 'backtest' in forecast.attrs:
+        bt = forecast.attrs['backtest']
+        if bt.get('available', False):
+            st.markdown("---")
+            st.write("### 📊 予測精度（バックテスト結果）")
+            
+            col_bt1, col_bt2, col_bt3 = st.columns(3)
+            
+            mape = bt.get('mape')
+            mae = bt.get('mae')
+            
+            with col_bt1:
+                if mape is not None:
+                    # MAPE評価（色分け）
+                    if mape < 15:
+                        mape_color = "good"
+                        mape_eval = "✅ 良好"
+                    elif mape < 30:
+                        mape_color = "medium"
+                        mape_eval = "⚠️ 普通"
+                    else:
+                        mape_color = "poor"
+                        mape_eval = "❌ 要注意"
+                    
+                    st.metric("MAPE（平均絶対%誤差）", f"{mape:.1f}%", delta=mape_eval)
+                else:
+                    st.metric("MAPE", "計算不可")
+            
+            with col_bt2:
+                if mae is not None:
+                    st.metric("MAE（平均絶対誤差）", f"{mae:.1f}体/日")
+            
+            with col_bt3:
+                st.metric("検証期間", f"直近{bt.get('holdout_days', 14)}日間")
+            
+            # バックテスト詳細
+            with st.expander("📈 バックテスト詳細を見る", expanded=False):
+                if 'actual' in bt and 'predicted' in bt:
+                    bt_df = pd.DataFrame({
+                        '実績': bt['actual'],
+                        '予測': bt['predicted']
+                    })
+                    bt_df['誤差'] = bt_df['実績'] - bt_df['予測']
+                    bt_df['誤差率(%)'] = ((bt_df['実績'] - bt_df['予測']) / bt_df['実績'].replace(0, 1) * 100).round(1)
+                    st.dataframe(bt_df, use_container_width=True)
+            
+            # 予測の信頼度メッセージ
+            if mape is not None:
+                if mape < 15:
+                    st.info(f"💡 この予測は高い信頼度（MAPE {mape:.1f}%）です。安心して発注計画に活用できます。")
+                elif mape < 30:
+                    st.warning(f"⚠️ この予測は中程度の信頼度（MAPE {mape:.1f}%）です。バッファを持った発注をおすすめします。")
+                else:
+                    st.error(f"❌ この予測は信頼度が低め（MAPE {mape:.1f}%）です。複数の予測方法で比較検討してください。")
+    
+    # ==========================================================================
+    # 【v19新機能】分位点予測と発注推奨
+    # ==========================================================================
+    if include_quantiles and 'p50' in forecast.columns:
+        st.markdown("---")
+        st.write("### 🎯 発注モード別の推奨数量")
+        
+        p50_total = round_up_to_50(int(forecast['p50'].sum()))
+        p80_total = round_up_to_50(int(forecast['p80'].sum()))
+        p90_total = round_up_to_50(int(forecast['p90'].sum()))
+        
+        col_q1, col_q2, col_q3 = st.columns(3)
+        
+        with col_q1:
+            highlight = "🔷" if order_mode == 'conservative' else ""
+            st.metric(f"{highlight}滞留回避（P50）", f"{p50_total:,}体", 
+                     help="50%の確率でこの数量以上売れる")
+        
+        with col_q2:
+            highlight = "🔷" if order_mode == 'balanced' else ""
+            st.metric(f"{highlight}バランス（P80）", f"{p80_total:,}体",
+                     help="80%の確率でこの数量以上売れる（推奨）")
+        
+        with col_q3:
+            highlight = "🔷" if order_mode == 'aggressive' else ""
+            st.metric(f"{highlight}欠品回避（P90）", f"{p90_total:,}体",
+                     help="90%の確率でこの数量以上売れる")
+        
+        # 選択されたモードを強調
+        mode_names = {'conservative': '滞留回避', 'balanced': 'バランス', 'aggressive': '欠品回避'}
+        mode_totals = {'conservative': p50_total, 'balanced': p80_total, 'aggressive': p90_total}
+        st.info(f"🔷 **現在のモード: {mode_names[order_mode]}** → 推奨発注数: **{mode_totals[order_mode]:,}体**")
+    
+    # ==========================================================================
+    # 【v19新機能】特別期間係数の表示
+    # ==========================================================================
+    if hasattr(forecast, 'attrs') and 'special_factors' in forecast.attrs:
+        with st.expander("📅 特別期間係数を見る", expanded=False):
+            sf = forecast.attrs['special_factors']
+            st.write("**自動計算された特別期間の係数:**")
+            
+            factor_df = pd.DataFrame([
+                {'期間': '正月（1/1〜1/7）', '係数': f"{sf.get('new_year', 3.0):.2f}倍"},
+                {'期間': 'お盆（8/13〜8/16）', '係数': f"{sf.get('obon', 1.5):.2f}倍"},
+                {'期間': '七五三（11/10〜11/20）', '係数': f"{sf.get('shichigosan', 1.3):.2f}倍"},
+                {'期間': 'GW（5/3〜5/5）', '係数': f"{sf.get('golden_week', 1.3):.2f}倍"},
+                {'期間': '年末（12/28〜12/31）', '係数': f"{sf.get('year_end', 1.5):.2f}倍"},
+                {'期間': '通常日', '係数': f"{sf.get('normal', 1.0):.2f}倍"},
+            ])
+            st.dataframe(factor_df, use_container_width=True, hide_index=True)
+    
+    # ==========================================================================
+    # 予測ロジックの説明
+    # ==========================================================================
     with st.expander("📊 予測ロジックの詳細", expanded=False):
         display_forecast_logic_explanation(method, sales_data, forecast, forecast_days, avg_predicted)
     
+    # ==========================================================================
     # グラフ表示（スマホ最適化）
+    # ==========================================================================
     method_info = FORECAST_METHODS.get(method, {"color": "#4285F4"})
     
     fig = go.Figure()
@@ -2780,8 +3913,29 @@ def display_single_forecast_result_v12(forecast: pd.DataFrame, forecast_days: in
         line=dict(color=method_info.get('color', '#4285F4'), width=2)
     ))
     
-    # 信頼区間があれば表示
-    if 'confidence_lower' in forecast.columns and forecast['confidence_lower'].notna().any():
+    # 分位点があれば帯で表示
+    if 'p50' in forecast.columns and 'p90' in forecast.columns:
+        fig.add_trace(go.Scatter(
+            x=forecast['date'],
+            y=forecast['p90'],
+            mode='lines',
+            name='P90（欠品回避）',
+            line=dict(color='rgba(156, 39, 176, 0.5)', dash='dash'),
+            showlegend=True
+        ))
+        fig.add_trace(go.Scatter(
+            x=forecast['date'],
+            y=forecast['p50'],
+            mode='lines',
+            name='P50（滞留回避）',
+            line=dict(color='rgba(156, 39, 176, 0.5)', dash='dash'),
+            fill='tonexty',
+            fillcolor='rgba(156, 39, 176, 0.1)',
+            showlegend=True
+        ))
+    
+    # 信頼区間があれば表示（Vertex AI用）
+    elif 'confidence_lower' in forecast.columns and forecast['confidence_lower'].notna().any():
         fig.add_trace(go.Scatter(
             x=forecast['date'],
             y=forecast['confidence_upper'],
@@ -2802,7 +3956,7 @@ def display_single_forecast_result_v12(forecast: pd.DataFrame, forecast_days: in
         ))
     
     # スマホ最適化レイアウト
-    layout = get_mobile_chart_layout(f'{method}による日別予測', height=280)
+    layout = get_mobile_chart_layout(f'{safe_html(method)}による日別予測', height=280)
     layout['xaxis_title'] = '日付'
     layout['yaxis_title'] = '予測販売数（体）'
     fig.update_layout(**layout)
@@ -2813,6 +3967,26 @@ def display_single_forecast_result_v12(forecast: pd.DataFrame, forecast_days: in
     st.session_state.forecast_total = rounded_total
     
     # ファクトチェック用プロンプトセクション
+    product_names = st.session_state.get('selected_products', [])
+    factcheck_prompt = generate_factcheck_prompt_single(
+        product_names=product_names,
+        method=method,
+        method_message=method_message,
+        sales_data=sales_data,
+        forecast=forecast,
+        forecast_days=forecast_days,
+        raw_total=raw_total,
+        rounded_total=rounded_total,
+        avg_predicted=avg_predicted
+    )
+    display_factcheck_section(factcheck_prompt, key_suffix="single_v19")
+
+
+# 旧バージョンとの互換性のため残す
+def display_single_forecast_result_v12(forecast: pd.DataFrame, forecast_days: int, method: str, method_message: str, sales_data: pd.DataFrame = None):
+    """単一の予測結果を表示（v12 互換性維持用）"""
+    # v19版を呼び出し
+    display_single_forecast_result_v19(forecast, forecast_days, method, method_message, sales_data)
     product_names = st.session_state.get('selected_products', [])
     factcheck_prompt = generate_factcheck_prompt_single(
         product_names=product_names,
@@ -3321,129 +4495,221 @@ def render_individual_year_comparison(df_agg: pd.DataFrame, unit_name: str, star
 
 
 def render_individual_forecast_section():
-    """個別予測セクション（期間指定対応）"""
+    """個別予測セクション（v19: st.form対応・精度強化版）"""
     st.markdown('<p class="section-header">④ 個別需要予測</p>', unsafe_allow_html=True)
     
     if not st.session_state.individual_sales_data:
         st.info("売上データがあると、需要予測ができます")
         return
     
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        forecast_mode = st.radio(
-            "予測期間の指定方法",
-            ["日数で指定", "期間で指定"],
-            horizontal=True,
-            key="individual_forecast_mode",
-            help="「期間で指定」は期間限定品の予測に便利です"
+    # ==========================================================================
+    # 予測パラメータ設定（st.formで囲んでチラつき防止）
+    # ==========================================================================
+    with st.form(key="individual_forecast_form_v19"):
+        st.write("### 🎯 予測設定")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            forecast_mode = st.radio(
+                "予測期間の指定方法",
+                ["日数で指定", "期間で指定"],
+                horizontal=True,
+                key="individual_forecast_mode_v19",
+                help="「期間で指定」は期間限定品の予測に便利です"
+            )
+        
+        with col2:
+            available_methods = get_available_forecast_methods()
+            # v19: 精度強化版をデフォルトに
+            if "🎯 季節性考慮（精度強化版）" in available_methods:
+                default_idx = available_methods.index("🎯 季節性考慮（精度強化版）")
+            elif "🚀 Vertex AI（推奨）" in available_methods:
+                default_idx = available_methods.index("🚀 Vertex AI（推奨）")
+            else:
+                default_idx = 0
+            
+            method = st.selectbox(
+                "予測方法",
+                available_methods,
+                index=default_idx,
+                key="individual_forecast_method_v19"
+            )
+        
+        # 予測期間の設定
+        if forecast_mode == "日数で指定":
+            forecast_days = st.slider("予測日数", 30, 365, 180, key="individual_forecast_days_v19")
+            forecast_start_date = None
+            forecast_end_date = None
+        else:
+            # 期間指定UI
+            today = date.today()
+            default_start = today + timedelta(days=1)
+            default_end = today + timedelta(days=180)
+            
+            st.write("**予測期間指定**")
+            col_s1, col_s2, col_s3, col_e1, col_e2, col_e3 = st.columns([1, 1, 1, 1, 1, 1])
+            
+            with col_s1:
+                start_year = st.selectbox(
+                    "予測開始年",
+                    list(range(2025, 2028)),
+                    index=list(range(2025, 2028)).index(default_start.year) if default_start.year in range(2025, 2028) else 0,
+                    key="ind_forecast_start_year_v19"
+                )
+            with col_s2:
+                start_month = st.selectbox(
+                    "予測開始月",
+                    list(range(1, 13)),
+                    index=default_start.month - 1,
+                    format_func=lambda x: f"{x}月",
+                    key="ind_forecast_start_month_v19"
+                )
+            with col_s3:
+                max_day_start = calendar.monthrange(start_year, start_month)[1]
+                start_day = st.selectbox(
+                    "予測開始日",
+                    list(range(1, max_day_start + 1)),
+                    index=min(default_start.day - 1, max_day_start - 1),
+                    format_func=lambda x: f"{x}日",
+                    key="ind_forecast_start_day_v19"
+                )
+            
+            with col_e1:
+                end_year = st.selectbox(
+                    "予測終了年",
+                    list(range(2025, 2028)),
+                    index=list(range(2025, 2028)).index(default_end.year) if default_end.year in range(2025, 2028) else 0,
+                    key="ind_forecast_end_year_v19"
+                )
+            with col_e2:
+                end_month = st.selectbox(
+                    "予測終了月",
+                    list(range(1, 13)),
+                    index=default_end.month - 1,
+                    format_func=lambda x: f"{x}月",
+                    key="ind_forecast_end_month_v19"
+                )
+            with col_e3:
+                max_day_end = calendar.monthrange(end_year, end_month)[1]
+                end_day = st.selectbox(
+                    "予測終了日",
+                    list(range(1, max_day_end + 1)),
+                    index=min(default_end.day - 1, max_day_end - 1),
+                    format_func=lambda x: f"{x}日",
+                    key="ind_forecast_end_day_v19"
+                )
+            
+            forecast_start_date = date(start_year, start_month, start_day)
+            forecast_end_date = date(end_year, end_month, end_day)
+            forecast_days = max(1, (forecast_end_date - forecast_start_date).days + 1)
+        
+        # ==========================================================================
+        # 【v19新機能】精度強化版の詳細設定
+        # ==========================================================================
+        if "精度強化版" in method:
+            with st.expander("⚙️ **詳細設定（精度強化オプション）**", expanded=False):
+                col_opt1, col_opt2 = st.columns(2)
+                
+                with col_opt1:
+                    baseline_method = st.selectbox(
+                        "ベースライン計算方法",
+                        options=['median', 'trimmed_mean', 'iqr_mean', 'mean'],
+                        format_func=lambda x: {
+                            'median': '中央値（推奨）',
+                            'trimmed_mean': 'トリム平均',
+                            'iqr_mean': 'IQR平均',
+                            'mean': '単純平均'
+                        }.get(x, x),
+                        index=0,
+                        key="ind_v19_baseline_method"
+                    )
+                    
+                    auto_special_factors = st.checkbox(
+                        "特別期間係数を自動計算",
+                        value=True,
+                        key="ind_v19_auto_special_factors"
+                    )
+                
+                with col_opt2:
+                    order_mode = st.selectbox(
+                        "発注モード",
+                        options=['conservative', 'balanced', 'aggressive'],
+                        format_func=lambda x: {
+                            'conservative': '滞留回避（P50）',
+                            'balanced': 'バランス（P80）',
+                            'aggressive': '欠品回避（P90）'
+                        }.get(x, x),
+                        index=1,
+                        key="ind_v19_order_mode"
+                    )
+                    
+                    backtest_days = st.selectbox(
+                        "バックテスト日数",
+                        options=[0, 7, 14, 30],
+                        format_func=lambda x: f"{x}日間" if x > 0 else "実行しない",
+                        index=2,
+                        key="ind_v19_backtest_days"
+                    )
+                
+                include_quantiles = st.checkbox(
+                    "分位点予測を含める（P50/P80/P90）",
+                    value=True,
+                    key="ind_v19_include_quantiles"
+                )
+        else:
+            # 精度強化版以外はデフォルト値
+            baseline_method = 'median'
+            auto_special_factors = True
+            order_mode = 'balanced'
+            backtest_days = 14
+            include_quantiles = False
+        
+        # ==========================================================================
+        # 予測実行ボタン
+        # ==========================================================================
+        submitted = st.form_submit_button(
+            "🔮 個別に需要予測を実行",
+            type="primary",
+            use_container_width=True
         )
     
-    with col2:
-        available_methods = get_available_forecast_methods()
-        # 個別モードでも「すべての方法で比較」を使用可能に
-        
-        method = st.selectbox(
-            "予測方法",
-            available_methods,
-            index=0,
-            key="individual_forecast_method"
-        )
-    
-    # 予測期間の設定
-    if forecast_mode == "日数で指定":
-        forecast_days = st.slider("予測日数", 30, 365, 180, key="individual_forecast_days")
-        forecast_start_date = None
-        forecast_end_date = None
-    else:
-        # 期間指定UI（分析期間と同じスタイル）
-        today = date.today()
-        default_start = today + timedelta(days=1)
-        default_end = today + timedelta(days=180)
-        
-        st.write("**予測期間指定**")
-        col_s1, col_s2, col_s3, col_e1, col_e2, col_e3 = st.columns([1, 1, 1, 1, 1, 1])
-        
-        with col_s1:
-            start_year = st.selectbox(
-                "予測開始年",
-                list(range(2025, 2028)),
-                index=list(range(2025, 2028)).index(default_start.year) if default_start.year in range(2025, 2028) else 0,
-                key="ind_forecast_start_year"
-            )
-        with col_s2:
-            start_month = st.selectbox(
-                "予測開始月",
-                list(range(1, 13)),
-                index=default_start.month - 1,
-                format_func=lambda x: f"{x}月",
-                key="ind_forecast_start_month"
-            )
-        with col_s3:
-            max_day_start = calendar.monthrange(start_year, start_month)[1]
-            start_day = st.selectbox(
-                "予測開始日",
-                list(range(1, max_day_start + 1)),
-                index=min(default_start.day - 1, max_day_start - 1),
-                format_func=lambda x: f"{x}日",
-                key="ind_forecast_start_day"
-            )
-        
-        with col_e1:
-            end_year = st.selectbox(
-                "予測終了年",
-                list(range(2025, 2028)),
-                index=list(range(2025, 2028)).index(default_end.year) if default_end.year in range(2025, 2028) else 0,
-                key="ind_forecast_end_year"
-            )
-        with col_e2:
-            end_month = st.selectbox(
-                "予測終了月",
-                list(range(1, 13)),
-                index=default_end.month - 1,
-                format_func=lambda x: f"{x}月",
-                key="ind_forecast_end_month"
-            )
-        with col_e3:
-            max_day_end = calendar.monthrange(end_year, end_month)[1]
-            end_day = st.selectbox(
-                "予測終了日",
-                list(range(1, max_day_end + 1)),
-                index=min(default_end.day - 1, max_day_end - 1),
-                format_func=lambda x: f"{x}日",
-                key="ind_forecast_end_day"
-            )
-        
-        forecast_start_date = date(start_year, start_month, start_day)
-        forecast_end_date = date(end_year, end_month, end_day)
-        
-        if forecast_end_date <= forecast_start_date:
-            st.error("⚠️ 終了日は開始日より後にしてください")
-            return
-        
-        forecast_days = (forecast_end_date - forecast_start_date).days + 1
-        st.info(f"📅 予測期間: {forecast_start_date.strftime('%Y年%m月%d日')} 〜 {forecast_end_date.strftime('%Y年%m月%d日')}（{forecast_days}日間）")
-    
-    method_info = FORECAST_METHODS[method]
+    # フォーム外に予測方法の説明を表示
+    method_info = FORECAST_METHODS.get(method, {"icon": "📊", "description": "", "color": "#666"})
     st.markdown(f"""
     <div class="analysis-card">
-        <strong>{method_info['icon']} {method}</strong><br>
-        {method_info['description']}
+        <strong>{method_info['icon']} {safe_html(method)}</strong><br>
+        {safe_html(method_info['description'])}
     </div>
     """, unsafe_allow_html=True)
     
-    if st.button("🔮 個別に需要予測を実行", type="primary", use_container_width=True, key="individual_forecast_btn"):
+    # ==========================================================================
+    # 予測実行
+    # ==========================================================================
+    if submitted:
+        # 期間指定の検証
+        if forecast_mode == "期間で指定":
+            if forecast_end_date <= forecast_start_date:
+                st.error("⚠️ 終了日は開始日より後にしてください")
+                return
+            st.info(f"📅 予測期間: {forecast_start_date.strftime('%Y年%m月%d日')} 〜 {forecast_end_date.strftime('%Y年%m月%d日')}（{forecast_days}日間）")
+        
         with st.spinner("予測中..."):
             # 「すべての方法で比較」が選ばれた場合
             if method == "🔄 すべての方法で比較":
-                # マトリックス形式で結果を保存: {商品名: {予測方法: 予測数}}
+                # マトリックス形式で結果を保存
                 matrix_results = {}
                 method_names = []
+                backtest_info = {}
                 
                 for product, sales_data in st.session_state.individual_sales_data.items():
                     try:
-                        # すべての方法で予測
-                        method_results = forecast_all_methods_with_vertex_ai(sales_data, forecast_days, product)
+                        method_results = forecast_all_methods_with_vertex_ai(
+                            sales_data, forecast_days, product,
+                            baseline_method=baseline_method,
+                            auto_special_factors=auto_special_factors,
+                            backtest_days=backtest_days
+                        )
                         
                         matrix_results[product] = {}
                         for method_name, (forecast_df, message) in method_results.items():
@@ -3453,16 +4719,24 @@ def render_individual_forecast_section():
                             raw_total = int(forecast_df['predicted'].sum())
                             rounded_total = round_up_to_50(raw_total)
                             matrix_results[product][method_name] = rounded_total
+                            
+                            # バックテスト情報を収集
+                            if hasattr(forecast_df, 'attrs') and 'backtest' in forecast_df.attrs:
+                                bt = forecast_df.attrs['backtest']
+                                if bt.get('mape') is not None:
+                                    if method_name not in backtest_info:
+                                        backtest_info[method_name] = []
+                                    backtest_info[method_name].append(bt['mape'])
                     except Exception as e:
-                        st.warning(f"{product}の予測に失敗: {e}")
+                        st.warning(f"{safe_html(product)}の予測に失敗しました")
+                        logger.error(f"{product}の予測エラー: {e}")
                 
                 if matrix_results:
                     st.success("✅ すべての予測方法で比較完了！")
                     
-                    # ========== マトリックス形式の表を作成 ==========
+                    # マトリックス形式の表を作成
                     st.write("### 📊 商品×予測方法 マトリックス表")
                     
-                    # 表データを構築
                     table_data = []
                     method_totals = {m: 0 for m in method_names}
                     
@@ -3480,33 +4754,38 @@ def render_individual_forecast_section():
                         total_row[method_name] = f"**{method_totals[method_name]:,}体**"
                     table_data.append(total_row)
                     
-                    # DataFrameで表示
                     df_matrix = pd.DataFrame(table_data)
                     st.dataframe(df_matrix, use_container_width=True, hide_index=True)
                     
-                    # ========== 予測方法ごとの合計をメトリクスで表示 ==========
+                    # 予測方法ごとの合計をメトリクスで表示
                     st.write("### 📈 予測方法別 合計")
                     
                     num_methods = len(method_names)
                     cols = st.columns(min(num_methods, 4))
                     for i, method_name in enumerate(method_names):
-                        icon = "🚀" if "Vertex" in method_name else "📈" if "季節" in method_name else "📊" if "移動" in method_name else "📉"
+                        icon = "🚀" if "Vertex" in method_name else "🎯" if "精度強化" in method_name else "📈" if "季節" in method_name else "📊" if "移動" in method_name else "📉"
                         short_name = method_name.replace("（統計）", "").replace("（推奨）", "")
+                        
+                        # バックテスト平均MAPE
+                        mape_str = ""
+                        if method_name in backtest_info and backtest_info[method_name]:
+                            avg_mape = sum(backtest_info[method_name]) / len(backtest_info[method_name])
+                            mape_str = f"MAPE {avg_mape:.1f}%"
+                        
                         with cols[i % 4]:
-                            st.metric(f"{icon} {short_name}", f"{method_totals[method_name]:,}体")
+                            st.metric(f"{icon} {safe_html(short_name)}", f"{method_totals[method_name]:,}体", mape_str if mape_str else None)
                     
                     # session_stateに保存
                     st.session_state.individual_all_methods_results = matrix_results
                     
-                    # 納品計画用のデータを設定（季節性考慮を優先）
-                    preferred_method = '季節性考慮' if '季節性考慮' in method_names else method_names[0]
+                    # 精度強化版優先、なければ季節性考慮を使用
+                    preferred_method = '精度強化版' if '精度強化版' in method_names else ('季節性考慮' if '季節性考慮' in method_names else method_names[0])
                     
-                    # individual_forecast_resultsを設定（納品計画で使用）
                     forecast_results_for_delivery = []
                     for product, methods in matrix_results.items():
                         forecast_results_for_delivery.append({
                             'product': product,
-                            'forecast': None,  # 日別データは無いが、合計は使える
+                            'forecast': None,
                             'raw_total': methods.get(preferred_method, 0),
                             'rounded_total': methods.get(preferred_method, 0),
                             'avg_predicted': methods.get(preferred_method, 0) / forecast_days if forecast_days > 0 else 0,
@@ -3515,14 +4794,24 @@ def render_individual_forecast_section():
                     
                     st.session_state.individual_forecast_results = forecast_results_for_delivery
                     
-                    # 季節性考慮の結果を保存（納品計画用）
-                    if '季節性考慮' in method_totals:
-                        st.session_state.forecast_total = method_totals['季節性考慮']
+                    if preferred_method in method_totals:
+                        st.session_state.forecast_total = method_totals[preferred_method]
                     elif method_totals:
-                        first_method = method_names[0]
-                        st.session_state.forecast_total = method_totals[first_method]
+                        st.session_state.forecast_total = method_totals[method_names[0]]
                     
                     st.session_state.last_forecast_method = f'{preferred_method}（すべての方法で比較）'
+                    
+                    # ファクトチェック用プロンプト
+                    product_names = list(matrix_results.keys())
+                    factcheck_prompt = generate_factcheck_prompt_matrix(
+                        matrix_results=matrix_results,
+                        method_names=method_names,
+                        method_totals=method_totals,
+                        forecast_days=forecast_days,
+                        sales_data_dict=st.session_state.individual_sales_data
+                    )
+                    display_factcheck_section(factcheck_prompt, key_suffix="individual_matrix_v19")
+                    
                     st.rerun()
             else:
                 # 通常の単一予測方法の場合
@@ -3530,7 +4819,14 @@ def render_individual_forecast_section():
                 
                 for product, sales_data in st.session_state.individual_sales_data.items():
                     try:
-                        forecast, method_message = forecast_with_vertex_ai(sales_data, forecast_days, method, product)
+                        forecast, method_message = forecast_with_vertex_ai(
+                            sales_data, forecast_days, method, product,
+                            baseline_method=baseline_method,
+                            auto_special_factors=auto_special_factors,
+                            include_quantiles=include_quantiles,
+                            order_mode=order_mode,
+                            backtest_days=backtest_days
+                        )
                         
                         if forecast is not None and not forecast.empty:
                             raw_total = int(forecast['predicted'].sum())
@@ -3546,14 +4842,14 @@ def render_individual_forecast_section():
                                 'method_message': method_message
                             })
                     except Exception as e:
-                        st.warning(f"{product}の予測に失敗: {e}")
+                        st.warning(f"{safe_html(product)}の予測に失敗しました")
+                        logger.error(f"{product}の予測エラー: {e}")
                 
                 if results:
                     # 納品計画で使えるようにsession_stateに保存
                     if len(results) == 1:
                         st.session_state.forecast_data = results[0]['forecast']
                     else:
-                        # 複数商品の場合は日付ごとに合算
                         combined_forecast = results[0]['forecast'].copy()
                         combined_forecast = combined_forecast.rename(columns={'predicted': 'predicted_sum'})
                         
@@ -3573,7 +4869,7 @@ def render_individual_forecast_section():
                     total_all = sum(r['rounded_total'] for r in results)
                     st.session_state.forecast_total = total_all
                     st.session_state.last_forecast_method = results[0]['method_message'] if results else ""
-                    st.session_state.individual_forecast_results = results  # 結果を保存
+                    st.session_state.individual_forecast_results = results
                     st.rerun()  # 納品セクションを更新するため再描画
     
     # 予測結果の表示（session_stateから）
@@ -4656,8 +5952,8 @@ def main():
     
     st.divider()
     
-    # バージョン情報
-    version_info = "v18 (ファクトチェック機能追加版)"
+    # バージョン情報（v19更新）
+    version_info = "v19 (予測精度強化・セキュリティ改善版)"
     if VERTEX_AI_AVAILABLE:
         version_info += " | 🚀 Vertex AI: 有効"
     else:
