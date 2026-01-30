@@ -864,19 +864,22 @@ def run_simple_backtest(df: pd.DataFrame, holdout_days: int = 14,
             'mae': None,
             'message': 'データ不足のためバックテスト不可',
             'holdout_days': holdout_days,
-            'available': False
+            'available': False,
+            'residuals': []
         }
     
     # データを分割
     train_df = df.iloc[:-holdout_days].copy()
     test_df = df.iloc[-holdout_days:].copy()
     
-    # 予測を実行
+    # 予測を実行（backtest_days=0で再帰を防止）
     if forecast_func is None:
         forecast_result = forecast_with_seasonality_enhanced(
             train_df, holdout_days, 
             baseline_method='median',
-            auto_special_factors=True
+            auto_special_factors=True,
+            include_quantiles=False,  # バックテスト内では分位点不要
+            backtest_days=0  # ★重要: 再帰を防止
         )
     else:
         forecast_result = forecast_func(train_df, holdout_days)
@@ -938,8 +941,34 @@ def forecast_with_seasonality_enhanced(
         予測結果のDataFrame
     """
     df = df.copy()
+    
+    # データフレームの検証
+    if df is None or df.empty:
+        raise ValueError("売上データが空です")
+    
+    if 'date' not in df.columns:
+        raise ValueError("'date'列が見つかりません")
+    
+    if '販売商品数' not in df.columns:
+        raise ValueError("'販売商品数'列が見つかりません")
+    
     df['date'] = pd.to_datetime(df['date'])
     df = df.sort_values('date')
+    
+    # データが少なすぎる場合のフォールバック
+    if len(df) < 7:
+        logger.warning(f"データが少なすぎます（{len(df)}件）。シンプルな予測にフォールバックします。")
+        # 単純平均で予測
+        avg_value = df['販売商品数'].mean() if len(df) > 0 else 1.0
+        avg_value = max(1.0, avg_value)
+        
+        last_date = df['date'].max()
+        future_dates = pd.date_range(start=last_date + timedelta(days=1), periods=periods, freq='D')
+        
+        predictions = [{'date': d, 'predicted': round(avg_value)} for d in future_dates]
+        result_df = pd.DataFrame(predictions)
+        result_df.attrs['backtest'] = {'mape': None, 'available': False, 'message': 'データ不足'}
+        return result_df
     
     values = df['販売商品数'].values
     
@@ -4842,8 +4871,10 @@ def render_individual_forecast_section():
                                 'method_message': method_message
                             })
                     except Exception as e:
-                        st.warning(f"{safe_html(product)}の予測に失敗しました")
-                        logger.error(f"{product}の予測エラー: {e}")
+                        import traceback
+                        error_detail = traceback.format_exc()
+                        st.warning(f"{safe_html(product)}の予測に失敗しました: {str(e)[:100]}")
+                        logger.error(f"{product}の予測エラー: {e}\n{error_detail}")
                 
                 if results:
                     # 納品計画で使えるようにsession_stateに保存
