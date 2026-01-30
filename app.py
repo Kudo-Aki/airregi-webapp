@@ -978,7 +978,11 @@ def forecast_with_seasonality_enhanced(
     if overall_baseline <= 0:
         overall_baseline = 1.0
     
-    # ========== 2. 特別期間を除外した通常日のベースライン ==========
+    # ========== 2. 曜日・月列を先に追加 ==========
+    df['weekday'] = df['date'].dt.dayofweek
+    df['month'] = df['date'].dt.month
+    
+    # ========== 3. 特別期間を除外した通常日のベースライン ==========
     def is_special_day(d):
         d = pd.Timestamp(d)
         if d.month == 1 and d.day <= 7:  # 正月
@@ -994,7 +998,7 @@ def forecast_with_seasonality_enhanced(
         return False
     
     df['is_special'] = df['date'].apply(is_special_day)
-    normal_df = df[~df['is_special']]
+    normal_df = df[~df['is_special']].copy()  # .copy()を追加して明示的にコピー
     
     if len(normal_df) > 10:
         # 通常日のみでベースラインを再計算（二重計上対策）
@@ -1005,16 +1009,14 @@ def forecast_with_seasonality_enhanced(
     else:
         normal_baseline = overall_baseline
     
-    # ========== 3. 曜日係数（頑健版） ==========
-    df['weekday'] = df['date'].dt.dayofweek
+    # ========== 4. 曜日係数（頑健版） ==========
     weekday_factor = {}
     
     for wd in range(7):
         wd_values = normal_df[normal_df['weekday'] == wd]['販売商品数'].values
         weekday_factor[wd] = calculate_robust_factor(wd_values, normal_baseline, min_samples=3)
     
-    # ========== 4. 月係数（頑健版） ==========
-    df['month'] = df['date'].dt.month
+    # ========== 5. 月係数（頑健版） ==========
     month_factor = {}
     
     for m in range(1, 13):
@@ -1022,12 +1024,12 @@ def forecast_with_seasonality_enhanced(
         m_values = normal_df[normal_df['month'] == m]['販売商品数'].values
         month_factor[m] = calculate_robust_factor(m_values, normal_baseline, min_samples=5)
     
-    # ========== 5. 特別期間係数 ==========
+    # ========== 6. 特別期間係数 ==========
     special_factors = calculate_special_period_factors(
         df, normal_baseline, auto_calculate=auto_special_factors
     )
     
-    # ========== 6. バックテスト（残差取得用） ==========
+    # ========== 7. バックテスト（残差取得用） ==========
     residuals = np.array([])
     backtest_result = None
     
@@ -1036,7 +1038,7 @@ def forecast_with_seasonality_enhanced(
         if backtest_result['available']:
             residuals = np.array(backtest_result['residuals'])
     
-    # ========== 7. 予測生成 ==========
+    # ========== 8. 予測生成 ==========
     last_date = df['date'].max()
     future_dates = pd.date_range(start=last_date + timedelta(days=1), periods=periods, freq='D')
     
@@ -1075,7 +1077,7 @@ def forecast_with_seasonality_enhanced(
     
     result_df = pd.DataFrame(predictions)
     
-    # ========== 8. 分位点予測の追加 ==========
+    # ========== 9. 分位点予測の追加 ==========
     if include_quantiles:
         point_array = np.array(point_predictions)
         quantile_results = calculate_prediction_quantiles(
