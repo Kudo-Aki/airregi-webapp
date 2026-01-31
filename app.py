@@ -5236,54 +5236,12 @@ def render_individual_forecast_section():
                         key="ind_v20_trend_window"
                     )
                 
-                # 欠品期間の入力
+                # 欠品期間の表示（登録はフォーム外で行う）
                 st.markdown("**🚫 欠品期間の除外**")
-                st.caption("在庫切れ期間を指定すると、その期間は学習から除外されます")
-                
-                col_stock1, col_stock2, col_stock3 = st.columns([2, 2, 1])
-                
-                with col_stock1:
-                    stockout_start = st.date_input(
-                        "欠品開始日",
-                        value=None,
-                        key="ind_v20_stockout_start"
-                    )
-                
-                with col_stock2:
-                    stockout_end = st.date_input(
-                        "欠品終了日",
-                        value=None,
-                        key="ind_v20_stockout_end"
-                    )
-                
-                with col_stock3:
-                    add_stockout = st.button("追加", key="ind_v20_add_stockout")
-                
-                # 欠品期間の追加処理
-                if add_stockout and stockout_start and stockout_end:
-                    if stockout_start <= stockout_end:
-                        new_period = (stockout_start, stockout_end)
-                        if new_period not in st.session_state.v20_stockout_periods:
-                            st.session_state.v20_stockout_periods.append(new_period)
-                            st.success(f"欠品期間を追加しました: {stockout_start} 〜 {stockout_end}")
-                    else:
-                        st.warning("終了日は開始日以降にしてください")
-                
-                # 登録済み欠品期間の表示
                 if st.session_state.v20_stockout_periods:
-                    st.markdown("**登録済み欠品期間:**")
-                    for i, (s, e) in enumerate(st.session_state.v20_stockout_periods):
-                        col_p1, col_p2 = st.columns([4, 1])
-                        with col_p1:
-                            st.text(f"  {i+1}. {s} 〜 {e}")
-                        with col_p2:
-                            if st.button("削除", key=f"del_stockout_{i}"):
-                                st.session_state.v20_stockout_periods.pop(i)
-                                st.rerun()
-                    
-                    if st.button("すべてクリア", key="clear_all_stockout"):
-                        st.session_state.v20_stockout_periods = []
-                        st.rerun()
+                    st.info(f"登録済み欠品期間: {len(st.session_state.v20_stockout_periods)}件（フォーム下部で管理）")
+                else:
+                    st.caption("欠品期間は予測実行ボタンの下で登録できます")
                 
                 # v20オプションの取得
                 stockout_periods = st.session_state.v20_stockout_periods if st.session_state.v20_stockout_periods else None
@@ -5309,6 +5267,63 @@ def render_individual_forecast_section():
             type="primary",
             use_container_width=True
         )
+    
+    # ==========================================================================
+    # 【v20】欠品期間の管理（フォーム外）
+    # ==========================================================================
+    if "精度強化版" in method:
+        with st.expander("🚫 欠品期間の登録・管理", expanded=False):
+            st.caption("在庫切れ期間を指定すると、その期間は学習から除外されます")
+            
+            col_stock1, col_stock2, col_stock3 = st.columns([2, 2, 1])
+            
+            with col_stock1:
+                stockout_start = st.date_input(
+                    "欠品開始日",
+                    value=None,
+                    key="ind_v20_stockout_start"
+                )
+            
+            with col_stock2:
+                stockout_end = st.date_input(
+                    "欠品終了日",
+                    value=None,
+                    key="ind_v20_stockout_end"
+                )
+            
+            with col_stock3:
+                st.write("")  # スペーサー
+                st.write("")  # スペーサー
+                add_stockout = st.button("➕ 追加", key="ind_v20_add_stockout")
+            
+            # 欠品期間の追加処理
+            if add_stockout and stockout_start and stockout_end:
+                if stockout_start <= stockout_end:
+                    new_period = (stockout_start, stockout_end)
+                    if new_period not in st.session_state.v20_stockout_periods:
+                        st.session_state.v20_stockout_periods.append(new_period)
+                        st.success(f"欠品期間を追加しました: {stockout_start} 〜 {stockout_end}")
+                        st.rerun()
+                else:
+                    st.warning("終了日は開始日以降にしてください")
+            
+            # 登録済み欠品期間の表示
+            if st.session_state.v20_stockout_periods:
+                st.markdown("**登録済み欠品期間:**")
+                for i, (s, e) in enumerate(st.session_state.v20_stockout_periods):
+                    col_p1, col_p2 = st.columns([4, 1])
+                    with col_p1:
+                        st.text(f"  {i+1}. {s} 〜 {e}")
+                    with col_p2:
+                        if st.button("🗑️", key=f"del_stockout_{i}", help="この期間を削除"):
+                            st.session_state.v20_stockout_periods.pop(i)
+                            st.rerun()
+                
+                if st.button("すべてクリア", key="clear_all_stockout"):
+                    st.session_state.v20_stockout_periods = []
+                    st.rerun()
+            else:
+                st.info("欠品期間は登録されていません")
     
     # フォーム外に予測方法の説明を表示
     method_info = FORECAST_METHODS.get(method, {"icon": "📊", "description": "", "color": "#666"})
