@@ -1,27 +1,32 @@
 """
-Airレジ 売上分析・需要予測 Webアプリ（v19: 予測精度強化・セキュリティ改善版）
+Airレジ 売上分析・需要予測 Webアプリ（v20: 精度向上版 - 0埋め・トレンド・正月日別対応）
 
-v18からの変更点:
-1. 【予測精度の大幅改善】
-   - ベースライン計算を中央値/トリム平均に変更（外れ値に強い）
-   - 係数計算の頑健化（サンプル少時は1.0に縮退）
-   - 特別期間係数の自動計算オプション（過去データから学習）
-   - 分位点予測追加（P50/P80/P90）
-   - 発注モード選択（滞留回避/バランス/欠品回避）
-   - 簡易バックテスト機能（MAPE表示）
-   - 特別期間の二重計上対策
+v19からの変更点（v20新機能）:
+1. 【予測精度の大幅向上】
+   - 0埋め処理: 売上がない日を0で補完し、正確な曜日・季節係数を計算
+   - 欠品期間除外: 在庫切れ期間を学習から除外（需要と供給制約を分離）
+   - トレンド係数: 前年同期比の成長率を予測に反映
+   - 正月日別係数: 1/1〜1/7を日別に係数設定（元日ピーク対応）
+   
+2. 【発注支援機能】
+   - 発注点（リオーダーポイント）の自動計算
+   - 安全在庫の算出（サービスレベル別）
+   - 推奨発注量の表示
 
-2. 【セキュリティ強化】
-   - st.secrets対応（Streamlit Cloud推奨）
-   - ADC（Application Default Credentials）対応
-   - HTML注入対策（html.escape適用）
-   - エラー表示の安全化（機密情報マスク）
+3. 【UI改善】
+   - v20精度向上オプションのexpander追加
+   - 欠品期間の入力UI
+   - トレンド・正月日別のON/OFF切り替え
 
-3. 【UI/UX改善】
-   - st.formによる予測パラメータ設定（チラつき防止）
-   - 詳細設定のexpander集約
-   - 予測結果カードの情報充実（使用方式・バックテスト指標表示）
-   - キャッシュ最適化（@st.cache_data）
+v19からの維持機能:
+- ベースライン計算（中央値/トリム平均）
+- 特別期間係数の自動計算
+- 分位点予測（P50/P80/P90）
+- 発注モード選択（滞留回避/バランス/欠品回避）
+- 簡易バックテスト機能（MAPE表示）
+- st.secrets対応（Streamlit Cloud推奨）
+- HTML注入対策
+- st.formによる予測パラメータ設定
 
 v18以前からの維持機能:
 - ファクトチェック用プロンプト生成機能
@@ -916,6 +921,375 @@ def run_simple_backtest(df: pd.DataFrame, holdout_days: int = 14,
     }
 
 
+# =============================================================================
+# 【v20新機能】精度向上のための追加機能群
+# =============================================================================
+
+def fill_missing_dates(df: pd.DataFrame, fill_value: int = 0) -> Tuple[pd.DataFrame, List[date]]:
+    """
+    【v20新機能】日付の欠損を0で埋める（0埋め処理）
+    
+    Airレジでは売上がない日は日付が抜けるため、
+    全日付を埋めて正確な曜日・季節係数を計算する。
+    
+    Args:
+        df: 売上データ（date, 販売商品数を含む）
+        fill_value: 欠損日に埋める値（デフォルト0）
+    
+    Returns:
+        (0埋め後のDataFrame, 埋めた日付のリスト)
+    """
+    if df is None or df.empty:
+        return df, []
+    
+    df = df.copy()
+    df['date'] = pd.to_datetime(df['date'])
+    
+    # 日付の範囲を取得
+    min_date = df['date'].min()
+    max_date = df['date'].max()
+    
+    # 全日付の連続シーケンスを作成
+    all_dates = pd.date_range(start=min_date, end=max_date, freq='D')
+    
+    # 元データに存在する日付
+    existing_dates = set(df['date'].dt.date)
+    
+    # 欠損日を特定
+    missing_dates = [d.date() for d in all_dates if d.date() not in existing_dates]
+    
+    if not missing_dates:
+        return df, []
+    
+    # 欠損日のデータを作成
+    missing_data = []
+    for d in missing_dates:
+        missing_data.append({
+            'date': pd.Timestamp(d),
+            '販売商品数': fill_value
+        })
+    
+    missing_df = pd.DataFrame(missing_data)
+    
+    # 元データと結合
+    filled_df = pd.concat([df, missing_df], ignore_index=True)
+    filled_df = filled_df.sort_values('date').reset_index(drop=True)
+    
+    logger.info(f"0埋め処理: {len(missing_dates)}日分の欠損を補完しました")
+    
+    return filled_df, missing_dates
+
+
+def exclude_stockout_periods(df: pd.DataFrame, stockout_periods: List[Tuple[date, date]]) -> pd.DataFrame:
+    """
+    【v20新機能】欠品期間を学習データから除外
+    
+    欠品（在庫切れ）期間は「需要がなかった」のではなく「供給できなかった」ため、
+    学習データから除外して正確な需要を推定する。
+    
+    Args:
+        df: 売上データ
+        stockout_periods: 欠品期間のリスト [(開始日, 終了日), ...]
+    
+    Returns:
+        欠品期間を除外したDataFrame（除外行はNaN扱い）
+    """
+    if not stockout_periods:
+        return df
+    
+    df = df.copy()
+    df['date'] = pd.to_datetime(df['date'])
+    
+    # 欠品フラグを初期化
+    df['is_stockout'] = False
+    
+    for start_date, end_date in stockout_periods:
+        start_ts = pd.Timestamp(start_date)
+        end_ts = pd.Timestamp(end_date)
+        
+        mask = (df['date'] >= start_ts) & (df['date'] <= end_ts)
+        df.loc[mask, 'is_stockout'] = True
+    
+    # 欠品日の販売数をNaNに（学習から除外）
+    excluded_count = df['is_stockout'].sum()
+    df.loc[df['is_stockout'], '販売商品数'] = np.nan
+    
+    if excluded_count > 0:
+        logger.info(f"欠品期間除外: {excluded_count}日分を学習対象外にしました")
+    
+    return df
+
+
+def calculate_trend_factor(df: pd.DataFrame, comparison_window_days: int = 60) -> Tuple[float, Dict[str, Any]]:
+    """
+    【v20新機能】トレンド係数の計算（前年同期比）
+    
+    直近の売上傾向と前年同期を比較し、成長率を算出する。
+    これにより、年々の増減トレンドを予測に反映できる。
+    
+    Args:
+        df: 売上データ
+        comparison_window_days: 比較期間（日数）
+    
+    Returns:
+        (トレンド係数, 詳細情報の辞書)
+    """
+    df = df.copy()
+    df['date'] = pd.to_datetime(df['date'])
+    df = df.sort_values('date')
+    
+    # NaN（欠品日）を除外して計算
+    df_valid = df.dropna(subset=['販売商品数'])
+    
+    # データが1年+比較期間未満の場合はトレンドなし
+    if len(df_valid) < 365 + comparison_window_days:
+        return 1.0, {
+            'available': False,
+            'message': 'データ不足（1年以上必要）',
+            'trend_factor': 1.0,
+            'current_mean': None,
+            'last_year_mean': None
+        }
+    
+    last_date = df_valid['date'].max()
+    
+    # 直近N日間
+    current_period_start = last_date - pd.Timedelta(days=comparison_window_days)
+    current_vals = df_valid[df_valid['date'] > current_period_start]['販売商品数']
+    
+    # 前年同期間
+    last_year_end = last_date - pd.Timedelta(days=365)
+    last_year_start = last_year_end - pd.Timedelta(days=comparison_window_days)
+    last_year_vals = df_valid[
+        (df_valid['date'] > last_year_start) & 
+        (df_valid['date'] <= last_year_end)
+    ]['販売商品数']
+    
+    if len(current_vals) < 10 or len(last_year_vals) < 10:
+        return 1.0, {
+            'available': False,
+            'message': '比較期間のデータ不足',
+            'trend_factor': 1.0,
+            'current_mean': None,
+            'last_year_mean': None
+        }
+    
+    current_mean = float(current_vals.mean())
+    last_year_mean = float(last_year_vals.mean())
+    
+    if last_year_mean <= 0:
+        return 1.0, {
+            'available': False,
+            'message': '前年同期の売上が0',
+            'trend_factor': 1.0,
+            'current_mean': current_mean,
+            'last_year_mean': 0
+        }
+    
+    # トレンド係数（0.7〜1.5にクリップして極端な変動を抑制）
+    raw_trend = current_mean / last_year_mean
+    trend_factor = max(0.7, min(1.5, raw_trend))
+    
+    # 変化率（%）
+    change_rate = (trend_factor - 1.0) * 100
+    
+    return trend_factor, {
+        'available': True,
+        'message': f'前年比 {trend_factor:.1%}（{change_rate:+.1f}%）',
+        'trend_factor': trend_factor,
+        'raw_trend': raw_trend,
+        'current_mean': current_mean,
+        'last_year_mean': last_year_mean,
+        'comparison_window_days': comparison_window_days
+    }
+
+
+def get_period_type_v2(d: pd.Timestamp) -> str:
+    """
+    【v20新機能】特別期間の判定（正月は日別）
+    
+    正月（1/1〜1/7）は日によって需要が大きく異なるため、
+    日別に係数を持つ。
+    
+    Args:
+        d: 日付
+    
+    Returns:
+        特別期間タイプ（'new_year_d1'〜'new_year_d7'、'obon'、'normal'など）
+    """
+    d = pd.Timestamp(d)
+    
+    # 正月は日別（1/1〜1/7）
+    if d.month == 1 and 1 <= d.day <= 7:
+        return f'new_year_d{d.day}'
+    
+    # お盆（8/13〜8/16）
+    elif d.month == 8 and 13 <= d.day <= 16:
+        return 'obon'
+    
+    # 七五三（11/10〜11/20）
+    elif d.month == 11 and 10 <= d.day <= 20:
+        return 'shichigosan'
+    
+    # ゴールデンウィーク（5/3〜5/5）
+    elif d.month == 5 and 3 <= d.day <= 5:
+        return 'golden_week'
+    
+    # 年末（12/28〜12/31）
+    elif d.month == 12 and d.day >= 28:
+        return 'year_end'
+    
+    return 'normal'
+
+
+def calculate_special_period_factors_v2(
+    df: pd.DataFrame, 
+    overall_baseline: float,
+    auto_calculate: bool = True
+) -> Dict[str, float]:
+    """
+    【v20新機能】特別期間係数の計算（正月日別対応版）
+    
+    正月（1/1〜1/7）を日別に分けて係数を計算することで、
+    元日のピークから徐々に下がる需要パターンを捉える。
+    
+    Args:
+        df: 売上データ
+        overall_baseline: 全体のベースライン
+        auto_calculate: 自動計算するか
+    
+    Returns:
+        特別期間係数の辞書（正月は日別）
+    """
+    # デフォルト係数（正月は日別プロファイル）
+    default_factors = {
+        'new_year_d1': 5.0,   # 元日（ピーク）
+        'new_year_d2': 4.5,   # 1/2
+        'new_year_d3': 4.0,   # 1/3（三が日最終日）
+        'new_year_d4': 2.5,   # 1/4
+        'new_year_d5': 2.0,   # 1/5
+        'new_year_d6': 1.8,   # 1/6
+        'new_year_d7': 1.5,   # 1/7
+        'obon': 1.5,          # お盆
+        'shichigosan': 1.3,   # 七五三
+        'golden_week': 1.3,   # ゴールデンウィーク
+        'year_end': 1.5,      # 年末
+        'normal': 1.0         # 通常日
+    }
+    
+    if not auto_calculate or overall_baseline <= 0:
+        return default_factors
+    
+    df = df.copy()
+    df['date'] = pd.to_datetime(df['date'])
+    
+    # NaN（欠品日）を除外
+    df = df.dropna(subset=['販売商品数'])
+    
+    # 特別期間フラグを付与（v2版：正月日別）
+    df['period_type'] = df['date'].apply(get_period_type_v2)
+    
+    # 各期間の係数を計算
+    calculated_factors = {}
+    
+    for period_name in default_factors.keys():
+        period_data = df[df['period_type'] == period_name]['販売商品数'].values
+        
+        # 正月の日別は1サンプル以上あれば計算（年数分しかない）
+        min_samples = 1 if period_name.startswith('new_year_d') else 3
+        
+        if len(period_data) >= min_samples:
+            period_median = np.median(period_data)
+            factor = period_median / overall_baseline if overall_baseline > 0 else 1.0
+            
+            # 極端な値を抑制（0.5〜8.0の範囲、正月は上限を高く）
+            max_factor = 8.0 if period_name.startswith('new_year') else 5.0
+            factor = max(0.5, min(max_factor, factor))
+            calculated_factors[period_name] = float(factor)
+        else:
+            # サンプル不足時はデフォルト値を使用
+            calculated_factors[period_name] = default_factors[period_name]
+    
+    return calculated_factors
+
+
+def calculate_reorder_point(
+    prediction_df: pd.DataFrame,
+    residuals: List[float],
+    lead_time_days: int = 14,
+    service_level: float = 0.95
+) -> Dict[str, Any]:
+    """
+    【v20新機能】発注点（リオーダーポイント）と安全在庫の計算
+    
+    発注点 = リードタイム中の予測需要 + 安全在庫
+    安全在庫 = 安全係数(Z) × RMSE × √リードタイム
+    
+    Args:
+        prediction_df: 予測結果のDataFrame
+        residuals: バックテストの残差リスト
+        lead_time_days: リードタイム（発注から納品までの日数）
+        service_level: サービスレベル（0.90, 0.95, 0.99）
+    
+    Returns:
+        発注点計算結果の辞書
+    """
+    # サービスレベルに応じた安全係数（Z値）
+    z_scores = {
+        0.90: 1.28,   # 90%サービスレベル
+        0.95: 1.65,   # 95%サービスレベル（推奨）
+        0.99: 2.33    # 99%サービスレベル
+    }
+    z = z_scores.get(service_level, 1.65)
+    
+    # リードタイム期間の予測需要合計
+    if len(prediction_df) < lead_time_days:
+        lead_time_demand = prediction_df['predicted'].sum()
+        actual_days = len(prediction_df)
+    else:
+        lead_time_demand = prediction_df.iloc[:lead_time_days]['predicted'].sum()
+        actual_days = lead_time_days
+    
+    # 予測誤差（RMSE）の計算
+    if not residuals or len(residuals) < 7:
+        # データがない場合は予測の20%を誤差と仮定
+        daily_demand = lead_time_demand / actual_days if actual_days > 0 else 1
+        rmse = daily_demand * 0.2
+        rmse_source = 'estimated'
+    else:
+        residuals_array = np.array(residuals)
+        rmse = float(np.sqrt(np.mean(residuals_array ** 2)))
+        rmse_source = 'calculated'
+    
+    # 安全在庫
+    safety_stock = z * rmse * np.sqrt(actual_days)
+    
+    # 発注点
+    reorder_point = lead_time_demand + safety_stock
+    
+    # 日別予測平均
+    daily_avg = lead_time_demand / actual_days if actual_days > 0 else 0
+    
+    return {
+        'lead_time_days': actual_days,
+        'lead_time_demand': int(round(lead_time_demand)),
+        'safety_stock': int(round(safety_stock)),
+        'reorder_point': int(round(reorder_point)),
+        'service_level': service_level,
+        'service_level_pct': f'{service_level*100:.0f}%',
+        'z_score': z,
+        'rmse': float(rmse),
+        'rmse_source': rmse_source,
+        'daily_avg': float(daily_avg),
+        'message': (
+            f"📦 発注推奨\n"
+            f"├─ 予測需要（{actual_days}日間）: {int(lead_time_demand):,}個\n"
+            f"├─ 安全在庫（{service_level*100:.0f}%SL）: +{int(safety_stock):,}個\n"
+            f"└─ 推奨発注点: {int(reorder_point):,}個"
+        )
+    }
+
+
 def forecast_with_seasonality_enhanced(
     df: pd.DataFrame, 
     periods: int,
@@ -923,10 +1297,22 @@ def forecast_with_seasonality_enhanced(
     auto_special_factors: bool = True,
     include_quantiles: bool = False,
     order_mode: str = 'balanced',
-    backtest_days: int = 14
+    backtest_days: int = 14,
+    # v20新規オプション（既存互換のためデフォルトはFalse/None）
+    enable_zero_fill: bool = True,
+    stockout_periods: Optional[List[Tuple[date, date]]] = None,
+    enable_trend: bool = True,
+    use_daily_new_year: bool = True,
+    trend_window_days: int = 60
 ) -> pd.DataFrame:
     """
-    【v19新機能】精度強化版の季節性考慮予測
+    【v20精度強化版】季節性考慮予測（0埋め・欠品除外・トレンド・正月日別対応）
+    
+    v19からの追加機能:
+    - 0埋め処理: 売上0の日を自動補完して正確な係数計算
+    - 欠品期間除外: 在庫切れ期間を学習から除外
+    - トレンド係数: 前年同期比の成長率を反映
+    - 正月日別係数: 1/1〜1/7を日別に係数設定（元日ピーク対応）
     
     Args:
         df: 売上データ（date, 販売商品数を含む）
@@ -936,6 +1322,11 @@ def forecast_with_seasonality_enhanced(
         include_quantiles: 分位点予測を含めるか
         order_mode: 発注モード ('conservative'=P50, 'balanced'=P80, 'aggressive'=P90)
         backtest_days: バックテスト日数（0なら実行しない）
+        enable_zero_fill: 【v20】日付欠損を0で埋めるか（推奨: True）
+        stockout_periods: 【v20】欠品期間のリスト [(開始日, 終了日), ...]
+        enable_trend: 【v20】トレンド係数を適用するか（推奨: True）
+        use_daily_new_year: 【v20】正月を日別係数にするか（推奨: True）
+        trend_window_days: 【v20】トレンド計算の比較期間（日数）
     
     Returns:
         予測結果のDataFrame
@@ -955,11 +1346,22 @@ def forecast_with_seasonality_enhanced(
     df['date'] = pd.to_datetime(df['date'])
     df = df.sort_values('date')
     
+    # ========== v20新機能1: 0埋め処理 ==========
+    missing_dates = []
+    if enable_zero_fill:
+        df, missing_dates = fill_missing_dates(df, fill_value=0)
+    
+    # ========== v20新機能2: 欠品期間の除外 ==========
+    if stockout_periods:
+        df = exclude_stockout_periods(df, stockout_periods)
+    
     # データが少なすぎる場合のフォールバック
-    if len(df) < 7:
-        logger.warning(f"データが少なすぎます（{len(df)}件）。シンプルな予測にフォールバックします。")
-        # 単純平均で予測
-        avg_value = df['販売商品数'].mean() if len(df) > 0 else 1.0
+    # NaNを除外してカウント
+    valid_count = df['販売商品数'].notna().sum()
+    if valid_count < 7:
+        logger.warning(f"有効データが少なすぎます（{valid_count}件）。シンプルな予測にフォールバックします。")
+        # 単純平均で予測（NaN除外）
+        avg_value = df['販売商品数'].dropna().mean() if valid_count > 0 else 1.0
         avg_value = max(1.0, avg_value)
         
         last_date = df['date'].max()
@@ -968,15 +1370,29 @@ def forecast_with_seasonality_enhanced(
         predictions = [{'date': d, 'predicted': round(avg_value)} for d in future_dates]
         result_df = pd.DataFrame(predictions)
         result_df.attrs['backtest'] = {'mape': None, 'available': False, 'message': 'データ不足'}
+        result_df.attrs['v20_features'] = {
+            'zero_fill': enable_zero_fill,
+            'missing_dates_count': len(missing_dates),
+            'stockout_excluded': stockout_periods is not None,
+            'trend_applied': False,
+            'daily_new_year': use_daily_new_year
+        }
         return result_df
     
-    values = df['販売商品数'].values
+    # NaNを除外した値で計算
+    valid_values = df['販売商品数'].dropna().values
     
     # ========== 1. 頑健なベースライン計算 ==========
-    overall_baseline = calculate_robust_baseline(values, method=baseline_method)
+    overall_baseline = calculate_robust_baseline(valid_values, method=baseline_method)
     
     if overall_baseline <= 0:
         overall_baseline = 1.0
+    
+    # ========== v20新機能3: トレンド係数の計算 ==========
+    trend_factor = 1.0
+    trend_info = {'available': False, 'trend_factor': 1.0}
+    if enable_trend:
+        trend_factor, trend_info = calculate_trend_factor(df, comparison_window_days=trend_window_days)
     
     # ========== 2. 曜日・月列を先に追加 ==========
     df['weekday'] = df['date'].dt.dayofweek
@@ -998,7 +1414,8 @@ def forecast_with_seasonality_enhanced(
         return False
     
     df['is_special'] = df['date'].apply(is_special_day)
-    normal_df = df[~df['is_special']].copy()  # .copy()を追加して明示的にコピー
+    # NaN（欠品日）と特別期間を除外
+    normal_df = df[(~df['is_special']) & (df['販売商品数'].notna())].copy()
     
     if len(normal_df) > 10:
         # 通常日のみでベースラインを再計算（二重計上対策）
@@ -1024,17 +1441,26 @@ def forecast_with_seasonality_enhanced(
         m_values = normal_df[normal_df['month'] == m]['販売商品数'].values
         month_factor[m] = calculate_robust_factor(m_values, normal_baseline, min_samples=5)
     
-    # ========== 6. 特別期間係数 ==========
-    special_factors = calculate_special_period_factors(
-        df, normal_baseline, auto_calculate=auto_special_factors
-    )
+    # ========== 6. 特別期間係数（v20: 正月日別対応） ==========
+    if use_daily_new_year:
+        # v20版: 正月を日別に計算
+        special_factors = calculate_special_period_factors_v2(
+            df, normal_baseline, auto_calculate=auto_special_factors
+        )
+    else:
+        # 従来版: 正月を1係数で計算
+        special_factors = calculate_special_period_factors(
+            df, normal_baseline, auto_calculate=auto_special_factors
+        )
     
     # ========== 7. バックテスト（残差取得用） ==========
     residuals = np.array([])
     backtest_result = None
     
-    if backtest_days > 0 and len(df) > backtest_days + 30:
-        backtest_result = run_simple_backtest(df, backtest_days)
+    # バックテスト用にNaNを除外したデータを使用
+    df_for_backtest = df[df['販売商品数'].notna()].copy()
+    if backtest_days > 0 and len(df_for_backtest) > backtest_days + 30:
+        backtest_result = run_simple_backtest(df_for_backtest, backtest_days)
         if backtest_result['available']:
             residuals = np.array(backtest_result['residuals'])
     
@@ -1049,21 +1475,27 @@ def forecast_with_seasonality_enhanced(
         weekday_f = weekday_factor.get(d.dayofweek, 1.0)
         month_f = month_factor.get(d.month, 1.0)
         
-        # 特別期間の判定
-        special_f = special_factors['normal']
-        if d.month == 1 and d.day <= 7:
-            special_f = special_factors['new_year']
-        elif d.month == 8 and 13 <= d.day <= 16:
-            special_f = special_factors['obon']
-        elif d.month == 11 and 10 <= d.day <= 20:
-            special_f = special_factors['shichigosan']
-        elif d.month == 5 and 3 <= d.day <= 5:
-            special_f = special_factors['golden_week']
-        elif d.month == 12 and d.day >= 28:
-            special_f = special_factors['year_end']
+        # 特別期間の判定（v20: 正月日別対応）
+        if use_daily_new_year:
+            # v20版: 正月は日別
+            period_type = get_period_type_v2(d)
+            special_f = special_factors.get(period_type, special_factors.get('normal', 1.0))
+        else:
+            # 従来版: 正月は1係数
+            special_f = special_factors.get('normal', 1.0)
+            if d.month == 1 and d.day <= 7:
+                special_f = special_factors.get('new_year', 3.0)
+            elif d.month == 8 and 13 <= d.day <= 16:
+                special_f = special_factors.get('obon', 1.5)
+            elif d.month == 11 and 10 <= d.day <= 20:
+                special_f = special_factors.get('shichigosan', 1.3)
+            elif d.month == 5 and 3 <= d.day <= 5:
+                special_f = special_factors.get('golden_week', 1.3)
+            elif d.month == 12 and d.day >= 28:
+                special_f = special_factors.get('year_end', 1.5)
         
-        # 予測値計算（通常日ベースライン × 曜日係数 × 月係数 × 特別期間係数）
-        pred = normal_baseline * weekday_f * month_f * special_f
+        # 予測値計算（通常日ベースライン × 曜日係数 × 月係数 × 特別期間係数 × トレンド係数）
+        pred = normal_baseline * weekday_f * month_f * special_f * trend_factor
         pred = max(0.1, pred)
         point_predictions.append(pred)
         
@@ -1072,7 +1504,8 @@ def forecast_with_seasonality_enhanced(
             'predicted': round(pred),
             'weekday_factor': weekday_f,
             'month_factor': month_f,
-            'special_factor': special_f
+            'special_factor': special_f,
+            'trend_factor': trend_factor  # v20追加
         })
     
     result_df = pd.DataFrame(predictions)
@@ -1096,12 +1529,38 @@ def forecast_with_seasonality_enhanced(
         else:  # balanced
             result_df['recommended'] = result_df['p80']
     
-    # バックテスト結果をメタデータとして保存
+    # ========== 10. メタデータの保存 ==========
+    # バックテスト結果
     if backtest_result is not None:
         result_df.attrs['backtest'] = backtest_result
-        result_df.attrs['special_factors'] = special_factors
-        result_df.attrs['baseline_method'] = baseline_method
-        result_df.attrs['normal_baseline'] = normal_baseline
+    else:
+        result_df.attrs['backtest'] = {'mape': None, 'available': False, 'message': 'バックテスト未実行'}
+    
+    result_df.attrs['special_factors'] = special_factors
+    result_df.attrs['baseline_method'] = baseline_method
+    result_df.attrs['normal_baseline'] = normal_baseline
+    
+    # v20追加メタデータ
+    result_df.attrs['v20_features'] = {
+        'zero_fill': enable_zero_fill,
+        'missing_dates_count': len(missing_dates),
+        'stockout_excluded': stockout_periods is not None,
+        'stockout_periods_count': len(stockout_periods) if stockout_periods else 0,
+        'trend_applied': enable_trend and trend_info['available'],
+        'trend_factor': trend_factor,
+        'trend_info': trend_info,
+        'daily_new_year': use_daily_new_year
+    }
+    
+    # 発注点計算（残差がある場合）
+    if backtest_result and backtest_result.get('available') and backtest_result.get('residuals'):
+        reorder_info = calculate_reorder_point(
+            result_df, 
+            backtest_result['residuals'],
+            lead_time_days=min(14, periods),
+            service_level=0.95
+        )
+        result_df.attrs['reorder_point'] = reorder_info
     
     return result_df
 
@@ -1120,7 +1579,13 @@ def forecast_with_vertex_ai(
     auto_special_factors: bool = True,
     include_quantiles: bool = False,
     order_mode: str = 'balanced',
-    backtest_days: int = 14
+    backtest_days: int = 14,
+    # v20新パラメータ
+    enable_zero_fill: bool = True,
+    stockout_periods: Optional[List[Tuple[date, date]]] = None,
+    enable_trend: bool = True,
+    use_daily_new_year: bool = True,
+    trend_window_days: int = 60
 ) -> Tuple[pd.DataFrame, str]:
     """
     予測方法に応じた予測を実行
@@ -1135,6 +1600,11 @@ def forecast_with_vertex_ai(
         include_quantiles: 分位点予測を含める（v19新規）
         order_mode: 発注モード（v19新規）
         backtest_days: バックテスト日数（v19新規）
+        enable_zero_fill: 【v20】0埋め処理
+        stockout_periods: 【v20】欠品期間リスト
+        enable_trend: 【v20】トレンド係数
+        use_daily_new_year: 【v20】正月日別係数
+        trend_window_days: 【v20】トレンド比較期間
     
     Returns:
         予測DataFrame, 使用した予測方法の説明
@@ -1151,14 +1621,20 @@ def forecast_with_vertex_ai(
         return forecast_with_seasonality_fallback(df, periods), "季節性考慮（統計モデル）"
     
     elif method == "🎯 季節性考慮（精度強化版）":
-        # v19新規：精度強化版
+        # v20対応：精度強化版
         forecast = forecast_with_seasonality_enhanced(
             df, periods,
             baseline_method=baseline_method,
             auto_special_factors=auto_special_factors,
             include_quantiles=include_quantiles,
             order_mode=order_mode,
-            backtest_days=backtest_days
+            backtest_days=backtest_days,
+            # v20新パラメータ
+            enable_zero_fill=enable_zero_fill,
+            stockout_periods=stockout_periods,
+            enable_trend=enable_trend,
+            use_daily_new_year=use_daily_new_year,
+            trend_window_days=trend_window_days
         )
         
         # メッセージ生成
@@ -1168,6 +1644,24 @@ def forecast_with_vertex_ai(
         if include_quantiles:
             mode_name = {'conservative': '滞留回避', 'balanced': 'バランス', 'aggressive': '欠品回避'}
             method_desc += f"・{mode_name.get(order_mode, order_mode)}モード"
+        
+        # v20機能の表示
+        v20_features = []
+        if enable_zero_fill:
+            v20_features.append("0埋め")
+        if enable_trend:
+            # トレンド情報を取得
+            if hasattr(forecast, 'attrs') and 'v20_features' in forecast.attrs:
+                v20_info = forecast.attrs['v20_features']
+                if v20_info.get('trend_applied'):
+                    trend_factor = v20_info.get('trend_factor', 1.0)
+                    if trend_factor != 1.0:
+                        v20_features.append(f"トレンド{trend_factor:.1%}")
+        if use_daily_new_year:
+            v20_features.append("正月日別")
+        
+        if v20_features:
+            method_desc += "・" + "・".join(v20_features)
         
         # バックテスト結果があれば追記
         if hasattr(forecast, 'attrs') and 'backtest' in forecast.attrs:
@@ -1473,7 +1967,7 @@ FORECAST_METHODS = {
         "requires_vertex_ai": True
     },
     "🎯 季節性考慮（精度強化版）": {
-        "description": "【v19新機能】中央値ベース・特別期間自動学習・分位点予測・バックテスト付き。最も推奨。",
+        "description": "【v20】0埋め・欠品除外・トレンド係数・正月日別係数対応。分位点予測・バックテスト付き。最も推奨。",
         "icon": "🎯",
         "color": "#9C27B0",
         "requires_vertex_ai": False
@@ -2273,6 +2767,20 @@ if 'v19_backtest_days' not in st.session_state:
     st.session_state.v19_backtest_days = 14  # デフォルト: 14日
 if 'v19_last_backtest_result' not in st.session_state:
     st.session_state.v19_last_backtest_result = None
+
+# v20新機能のセッション状態
+if 'v20_enable_zero_fill' not in st.session_state:
+    st.session_state.v20_enable_zero_fill = True  # デフォルト: 0埋めON
+if 'v20_enable_trend' not in st.session_state:
+    st.session_state.v20_enable_trend = True  # デフォルト: トレンド係数ON
+if 'v20_use_daily_new_year' not in st.session_state:
+    st.session_state.v20_use_daily_new_year = True  # デフォルト: 正月日別ON
+if 'v20_trend_window_days' not in st.session_state:
+    st.session_state.v20_trend_window_days = 60  # デフォルト: 60日
+if 'v20_stockout_periods' not in st.session_state:
+    st.session_state.v20_stockout_periods = []  # 欠品期間リスト
+if 'v20_last_reorder_point' not in st.session_state:
+    st.session_state.v20_last_reorder_point = None
 
 
 # =============================================================================
@@ -4688,6 +5196,97 @@ def render_individual_forecast_section():
                     value=True,
                     key="ind_v19_include_quantiles"
                 )
+                
+                # ==========================================================================
+                # 【v20新機能】精度向上オプション
+                # ==========================================================================
+                st.markdown("---")
+                st.markdown("**📈 v20 精度向上オプション**")
+                
+                col_v20_1, col_v20_2 = st.columns(2)
+                
+                with col_v20_1:
+                    enable_zero_fill = st.checkbox(
+                        "0埋め処理（推奨）",
+                        value=True,
+                        help="売上がない日を0で補完し、正確な曜日・季節係数を計算します",
+                        key="ind_v20_zero_fill"
+                    )
+                    
+                    enable_trend = st.checkbox(
+                        "トレンド係数（前年比）",
+                        value=True,
+                        help="直近の売上と前年同期を比較し、成長/衰退トレンドを反映します",
+                        key="ind_v20_trend"
+                    )
+                
+                with col_v20_2:
+                    use_daily_new_year = st.checkbox(
+                        "正月日別係数（1/1〜1/7）",
+                        value=True,
+                        help="正月を日別に係数設定し、元日のピークを正確に捉えます",
+                        key="ind_v20_daily_new_year"
+                    )
+                    
+                    trend_window_days = st.selectbox(
+                        "トレンド比較期間",
+                        options=[30, 60, 90],
+                        format_func=lambda x: f"直近{x}日間",
+                        index=1,
+                        key="ind_v20_trend_window"
+                    )
+                
+                # 欠品期間の入力
+                st.markdown("**🚫 欠品期間の除外**")
+                st.caption("在庫切れ期間を指定すると、その期間は学習から除外されます")
+                
+                col_stock1, col_stock2, col_stock3 = st.columns([2, 2, 1])
+                
+                with col_stock1:
+                    stockout_start = st.date_input(
+                        "欠品開始日",
+                        value=None,
+                        key="ind_v20_stockout_start"
+                    )
+                
+                with col_stock2:
+                    stockout_end = st.date_input(
+                        "欠品終了日",
+                        value=None,
+                        key="ind_v20_stockout_end"
+                    )
+                
+                with col_stock3:
+                    add_stockout = st.button("追加", key="ind_v20_add_stockout")
+                
+                # 欠品期間の追加処理
+                if add_stockout and stockout_start and stockout_end:
+                    if stockout_start <= stockout_end:
+                        new_period = (stockout_start, stockout_end)
+                        if new_period not in st.session_state.v20_stockout_periods:
+                            st.session_state.v20_stockout_periods.append(new_period)
+                            st.success(f"欠品期間を追加しました: {stockout_start} 〜 {stockout_end}")
+                    else:
+                        st.warning("終了日は開始日以降にしてください")
+                
+                # 登録済み欠品期間の表示
+                if st.session_state.v20_stockout_periods:
+                    st.markdown("**登録済み欠品期間:**")
+                    for i, (s, e) in enumerate(st.session_state.v20_stockout_periods):
+                        col_p1, col_p2 = st.columns([4, 1])
+                        with col_p1:
+                            st.text(f"  {i+1}. {s} 〜 {e}")
+                        with col_p2:
+                            if st.button("削除", key=f"del_stockout_{i}"):
+                                st.session_state.v20_stockout_periods.pop(i)
+                                st.rerun()
+                    
+                    if st.button("すべてクリア", key="clear_all_stockout"):
+                        st.session_state.v20_stockout_periods = []
+                        st.rerun()
+                
+                # v20オプションの取得
+                stockout_periods = st.session_state.v20_stockout_periods if st.session_state.v20_stockout_periods else None
         else:
             # 精度強化版以外はデフォルト値
             baseline_method = 'median'
@@ -4695,6 +5294,12 @@ def render_individual_forecast_section():
             order_mode = 'balanced'
             backtest_days = 14
             include_quantiles = False
+            # v20オプションもデフォルト
+            enable_zero_fill = True
+            enable_trend = True
+            use_daily_new_year = True
+            trend_window_days = 60
+            stockout_periods = None
         
         # ==========================================================================
         # 予測実行ボタン
@@ -4856,7 +5461,13 @@ def render_individual_forecast_section():
                             auto_special_factors=auto_special_factors,
                             include_quantiles=include_quantiles,
                             order_mode=order_mode,
-                            backtest_days=backtest_days
+                            backtest_days=backtest_days,
+                            # v20パラメータ
+                            enable_zero_fill=enable_zero_fill,
+                            stockout_periods=stockout_periods,
+                            enable_trend=enable_trend,
+                            use_daily_new_year=use_daily_new_year,
+                            trend_window_days=trend_window_days
                         )
                         
                         if forecast is not None and not forecast.empty:
@@ -5985,8 +6596,8 @@ def main():
     
     st.divider()
     
-    # バージョン情報（v19更新）
-    version_info = "v19 (予測精度強化・セキュリティ改善版)"
+    # バージョン情報（v20更新）
+    version_info = "v20 (精度向上版 - 0埋め・トレンド・正月日別対応)"
     if VERTEX_AI_AVAILABLE:
         version_info += " | 🚀 Vertex AI: 有効"
     else:
