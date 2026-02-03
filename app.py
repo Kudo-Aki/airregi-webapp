@@ -1,34 +1,34 @@
 """
-Airレジ 売上分析・需要予測 Webアプリ（v20: 精度向上版 - 0埋め・トレンド・正月日別対応）
+Airレジ 売上分析・需要予測 Webアプリ（v21: 高精度版 - アンサンブル・Prophet・Holt-Winters・信頼度評価対応）
 
-v19からの変更点（v20新機能）:
-1. 【予測精度の大幅向上】
-   - 0埋め処理: 売上がない日を0で補完し、正確な曜日・季節係数を計算
-   - 欠品期間除外: 在庫切れ期間を学習から除外（需要と供給制約を分離）
-   - トレンド係数: 前年同期比の成長率を予測に反映
-   - 正月日別係数: 1/1〜1/7を日別に係数設定（元日ピーク対応）
-   
-2. 【発注支援機能】
-   - 発注点（リオーダーポイント）の自動計算
-   - 安全在庫の算出（サービスレベル別）
-   - 推奨発注量の表示
+v20からの変更点（v21新機能）:
+1. 【新しい予測手法の追加】
+   - アンサンブル予測: 複数方法を組み合わせ、外れ値を除外した安定した予測
+   - Prophet: Meta製の高精度予測（季節性・トレンド・イベントを自動検出）
+   - Holt-Winters法: 三重指数平滑法（週間の季節パターンを捉える）
 
-3. 【UI改善】
-   - v20精度向上オプションのexpander追加
-   - 欠品期間の入力UI
-   - トレンド・正月日別のON/OFF切り替え
+2. 【バックテストの大幅改善】
+   - 売上が極端に少ない日（3体未満）をMAPE計算から除外
+   - sMAPE（対称MAPE）も計算して比較
+   - MAPE上限設定（500%）で異常値を抑制
+   - 季節商品の自動判定と警告
 
-v19からの維持機能:
+3. 【信頼度評価の高度化】
+   - 総合信頼度スコア（0-100点）の導入
+   - MAPE、データ量、方法間一致度から総合判定
+   - 信頼度レベル表示（◎高い/○良好/△中程度/×要注意）
+   - 信頼度に基づく推奨事項の自動生成
+
+v20以前からの維持機能:
+- 0埋め処理、欠品期間除外、トレンド係数、正月日別係数
+- 発注点（リオーダーポイント）の自動計算
 - ベースライン計算（中央値/トリム平均）
 - 特別期間係数の自動計算
 - 分位点予測（P50/P80/P90）
 - 発注モード選択（滞留回避/バランス/欠品回避）
-- 簡易バックテスト機能（MAPE表示）
 - st.secrets対応（Streamlit Cloud推奨）
 - HTML注入対策
 - st.formによる予測パラメータ設定
-
-v18以前からの維持機能:
 - ファクトチェック用プロンプト生成機能
 - 複数授与品選択時に「合算」「個別」を選択可能
 - 予測期間を「日数指定」「期間指定」で選択可能
@@ -847,17 +847,25 @@ def calculate_prediction_quantiles(predictions: np.ndarray, residuals: np.ndarra
 
 
 def run_simple_backtest(df: pd.DataFrame, holdout_days: int = 14,
-                       forecast_func=None) -> Dict[str, Any]:
+                       forecast_func=None, min_daily_sales: int = 3) -> Dict[str, Any]:
     """
-    簡易バックテストを実行してMAPEを計算
+    【v21改善版】簡易バックテストを実行してMAPEを計算
+    
+    改善点:
+    - 売上が極端に少ない日（min_daily_sales未満）をMAPE計算から除外
+    - sMAPE（対称MAPE）も計算して比較
+    - MAPE上限設定（500%）で異常値を抑制
+    - 季節商品判定と警告
+    - 信頼度レベルの評価
     
     Args:
         df: 売上データ
         holdout_days: ホールドアウト日数
         forecast_func: 予測関数（Noneなら改善版フォールバックを使用）
+        min_daily_sales: MAPE計算に含める最小日販（これ未満の日は除外）
     
     Returns:
-        バックテスト結果（MAPE、MAE、詳細データ）
+        バックテスト結果（MAPE、MAE、詳細データ、信頼度）
     """
     df = df.copy()
     df['date'] = pd.to_datetime(df['date'])
@@ -866,16 +874,35 @@ def run_simple_backtest(df: pd.DataFrame, holdout_days: int = 14,
     if len(df) < holdout_days + 30:  # 最低30日の学習データが必要
         return {
             'mape': None,
+            'smape': None,
             'mae': None,
             'message': 'データ不足のためバックテスト不可',
             'holdout_days': holdout_days,
             'available': False,
-            'residuals': []
+            'residuals': [],
+            'reliability': 'unknown',
+            'reliability_message': 'データ不足',
+            'is_seasonal': False,
+            'valid_days': 0
         }
     
     # データを分割
     train_df = df.iloc[:-holdout_days].copy()
     test_df = df.iloc[-holdout_days:].copy()
+    
+    # 季節商品判定: テスト期間に売上が極端に少ない場合
+    test_nonzero = test_df[test_df['販売商品数'] > 0]['販売商品数']
+    train_nonzero = train_df[train_df['販売商品数'] > 0]['販売商品数']
+    
+    test_mean = test_nonzero.mean() if len(test_nonzero) > 0 else 0
+    train_mean = train_nonzero.mean() if len(train_nonzero) > 0 else 0
+    
+    is_seasonal = False
+    seasonal_warning = ""
+    
+    if train_mean > 0 and test_mean < train_mean * 0.1:
+        is_seasonal = True
+        seasonal_warning = f"（⚠️ 季節商品の可能性: テスト期間の売上が学習期間の{test_mean/train_mean*100:.1f}%）"
     
     # 予測を実行（backtest_days=0で再帰を防止）
     if forecast_func is None:
@@ -896,29 +923,613 @@ def run_simple_backtest(df: pd.DataFrame, holdout_days: int = 14,
     actual = test_df['販売商品数'].values
     predicted = forecast_result['predicted'].values[:len(actual)]
     
-    # MAPE計算（0除算対策）
-    non_zero_mask = actual > 0
-    if non_zero_mask.sum() > 0:
-        mape = np.mean(np.abs(actual[non_zero_mask] - predicted[non_zero_mask]) / actual[non_zero_mask]) * 100
-    else:
-        mape = None
+    # ========== 改善版MAPE計算 ==========
+    # 条件: 実績がmin_daily_sales以上（極端に少ない日を除外）
+    valid_mask = (actual >= min_daily_sales)
+    valid_count = valid_mask.sum()
     
-    # MAE計算
-    mae = np.mean(np.abs(actual - predicted))
+    mape = None
+    smape = None
+    
+    if valid_count >= 3:  # 有効なデータが3日以上ある場合のみ
+        actual_valid = actual[valid_mask]
+        predicted_valid = predicted[valid_mask]
+        
+        # 通常のMAPE（上限500%にクリップ）
+        ape_values = np.abs(actual_valid - predicted_valid) / actual_valid * 100
+        ape_values = np.clip(ape_values, 0, 500)  # 上限500%
+        mape = float(np.mean(ape_values))
+        
+        # sMAPE（対称MAPE）- 予測と実績の両方で割るので極端な値を緩和
+        denominator = (np.abs(actual_valid) + np.abs(predicted_valid)) / 2
+        denominator = np.where(denominator == 0, 1, denominator)  # 0除算防止
+        smape_values = np.abs(actual_valid - predicted_valid) / denominator * 100
+        smape = float(np.mean(smape_values))
+    elif valid_count > 0:
+        # 有効データが少ない場合は、あるデータで計算
+        actual_valid = actual[valid_mask]
+        predicted_valid = predicted[valid_mask]
+        ape_values = np.abs(actual_valid - predicted_valid) / np.maximum(actual_valid, 1) * 100
+        ape_values = np.clip(ape_values, 0, 500)
+        mape = float(np.mean(ape_values))
+    
+    # MAE計算（全データで計算）
+    mae = float(np.mean(np.abs(actual - predicted)))
     
     # 残差を保存（分位点計算用）
     residuals = actual - predicted
     
+    # ========== 信頼度評価 ==========
+    if mape is None or valid_count < 3:
+        reliability = 'unknown'
+        reliability_message = '有効なデータが不足しています'
+    elif is_seasonal:
+        reliability = 'seasonal'
+        reliability_message = '季節商品のため、昨年同期の実績を参照してください'
+    elif mape <= 25:
+        reliability = 'high'
+        reliability_message = '高い精度です'
+    elif mape <= 40:
+        reliability = 'good'
+        reliability_message = '良好な精度です'
+    elif mape <= 60:
+        reliability = 'medium'
+        reliability_message = '中程度の精度です'
+    elif mape <= 100:
+        reliability = 'low'
+        reliability_message = '精度が低めです'
+    else:
+        reliability = 'very_low'
+        reliability_message = '予測の信頼性が低いです'
+    
+    message = f'直近{holdout_days}日間でバックテスト実施（有効日数: {valid_count}日）{seasonal_warning}'
+    
     return {
-        'mape': float(mape) if mape is not None else None,
-        'mae': float(mae),
+        'mape': mape,
+        'smape': smape,
+        'mae': mae,
         'residuals': residuals.tolist(),
         'holdout_days': holdout_days,
+        'valid_days': int(valid_count),
         'actual': actual.tolist(),
         'predicted': predicted.tolist(),
-        'message': f'直近{holdout_days}日間でバックテスト実施',
-        'available': True
+        'message': message,
+        'available': True,
+        'reliability': reliability,
+        'reliability_message': reliability_message,
+        'is_seasonal': is_seasonal
     }
+
+
+# =============================================================================
+# 【v21新機能】高精度予測手法と信頼度評価
+# =============================================================================
+
+# Prophetのインポート（利用可能かチェック）
+PROPHET_AVAILABLE = False
+try:
+    from prophet import Prophet
+    PROPHET_AVAILABLE = True
+    logger.info("Prophet: 利用可能")
+except ImportError:
+    logger.info("Prophet: 未インストール（prophetパッケージが必要）")
+
+# statsmodelsのインポート（Holt-Winters用）
+STATSMODELS_AVAILABLE = False
+try:
+    from statsmodels.tsa.holtwinters import ExponentialSmoothing as HoltWintersModel
+    STATSMODELS_AVAILABLE = True
+    logger.info("Holt-Winters (statsmodels): 利用可能")
+except ImportError:
+    logger.info("Holt-Winters: 未インストール（statsmodelsパッケージが必要）")
+
+
+def forecast_with_prophet(df: pd.DataFrame, periods: int) -> Tuple[Optional[pd.DataFrame], str]:
+    """
+    【v21新機能】Prophet（Meta製）による予測
+    
+    Prophetは季節性、トレンド、イベント効果を自動検出する
+    高精度の時系列予測ライブラリ。神社のような季節変動商品に最適。
+    
+    Args:
+        df: 売上データ（date, 販売商品数を含む）
+        periods: 予測日数
+    
+    Returns:
+        (予測DataFrame, メッセージ)
+    """
+    if not PROPHET_AVAILABLE:
+        return None, "Prophetが利用できません（pip install prophet）"
+    
+    try:
+        df = df.copy()
+        df['date'] = pd.to_datetime(df['date'])
+        df = df.sort_values('date')
+        
+        # Prophet用のデータ形式に変換（ds, y）
+        prophet_df = df[['date', '販売商品数']].rename(columns={'date': 'ds', '販売商品数': 'y'})
+        
+        # 0を除外せず、そのまま使用（Prophetは0を含むデータも扱える）
+        prophet_df = prophet_df.dropna()
+        
+        if len(prophet_df) < 14:
+            return None, "Prophetに必要なデータが不足しています（最低14日必要）"
+        
+        # 警告を抑制
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            
+            # Prophetモデルの設定
+            model = Prophet(
+                yearly_seasonality=True,   # 年間季節性
+                weekly_seasonality=True,   # 週間季節性
+                daily_seasonality=False,   # 日内変動は不要
+                seasonality_mode='multiplicative',  # 乗法的季節性（神社向け）
+                changepoint_prior_scale=0.05,  # トレンド変化の感度
+                seasonality_prior_scale=10,    # 季節性の強さ
+            )
+            
+            # 日本の祝日を追加（正月期間を特別扱い）
+            holidays_list = []
+            
+            # 正月（1/1〜1/7）
+            for year in range(2020, 2030):
+                for day in range(1, 8):
+                    holidays_list.append({
+                        'holiday': 'new_year',
+                        'ds': pd.to_datetime(f'{year}-01-{day:02d}'),
+                        'lower_window': 0,
+                        'upper_window': 0
+                    })
+            
+            # お盆（8/13〜8/16）
+            for year in range(2020, 2030):
+                for day in range(13, 17):
+                    holidays_list.append({
+                        'holiday': 'obon',
+                        'ds': pd.to_datetime(f'{year}-08-{day:02d}'),
+                        'lower_window': 0,
+                        'upper_window': 0
+                    })
+            
+            # 七五三（11/15前後）
+            for year in range(2020, 2030):
+                for day in range(10, 21):
+                    holidays_list.append({
+                        'holiday': 'shichigosan',
+                        'ds': pd.to_datetime(f'{year}-11-{day:02d}'),
+                        'lower_window': 0,
+                        'upper_window': 0
+                    })
+            
+            if holidays_list:
+                holidays_df = pd.DataFrame(holidays_list)
+                model = Prophet(
+                    yearly_seasonality=True,
+                    weekly_seasonality=True,
+                    daily_seasonality=False,
+                    seasonality_mode='multiplicative',
+                    changepoint_prior_scale=0.05,
+                    seasonality_prior_scale=10,
+                    holidays=holidays_df
+                )
+            
+            # モデル学習
+            model.fit(prophet_df)
+            
+            # 予測
+            last_date = df['date'].max()
+            future = model.make_future_dataframe(periods=periods, freq='D')
+            future = future[future['ds'] > last_date]
+            
+            if len(future) == 0:
+                return None, "予測期間が設定できません"
+            
+            forecast = model.predict(future)
+        
+        # 結果を整形
+        result_df = pd.DataFrame({
+            'date': forecast['ds'].values,
+            'predicted': np.round(forecast['yhat'].values).astype(int).clip(min=0),
+            'predicted_lower': np.round(forecast['yhat_lower'].values).astype(int).clip(min=0),
+            'predicted_upper': np.round(forecast['yhat_upper'].values).astype(int).clip(min=0)
+        })
+        
+        result_df.attrs['method'] = 'Prophet'
+        
+        return result_df, "Prophet（季節性自動検出・Meta製）"
+        
+    except Exception as e:
+        logger.error(f"Prophet予測エラー: {e}")
+        return None, f"Prophetエラー: {str(e)[:50]}"
+
+
+def forecast_with_holt_winters(df: pd.DataFrame, periods: int, 
+                               seasonal_periods: int = 7) -> Tuple[Optional[pd.DataFrame], str]:
+    """
+    【v21新機能】Holt-Winters法（三重指数平滑法）による予測
+    
+    レベル、トレンド、季節性の3つの成分を持つ指数平滑法。
+    週間の季節パターンを捉えるのに適している。
+    
+    Args:
+        df: 売上データ
+        periods: 予測日数
+        seasonal_periods: 季節周期（デフォルト7=週間）
+    
+    Returns:
+        (予測DataFrame, メッセージ)
+    """
+    if not STATSMODELS_AVAILABLE:
+        return None, "Holt-Wintersが利用できません（pip install statsmodels）"
+    
+    try:
+        df = df.copy()
+        df['date'] = pd.to_datetime(df['date'])
+        df = df.sort_values('date')
+        
+        # 販売データを取得
+        sales = df['販売商品数'].values.astype(float)
+        
+        # 0を小さい値に置換（乗法的モデルのため）
+        sales = np.where(sales <= 0, 0.1, sales)
+        
+        if len(sales) < seasonal_periods * 2:
+            return None, f"Holt-Wintersに必要なデータが不足しています（最低{seasonal_periods*2}日必要）"
+        
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            
+            # Holt-Wintersモデル（乗法的季節性）
+            try:
+                model = HoltWintersModel(
+                    sales,
+                    seasonal_periods=seasonal_periods,
+                    trend='add',           # 加法的トレンド
+                    seasonal='mul',        # 乗法的季節性
+                    damped_trend=True      # トレンド減衰
+                )
+                fitted = model.fit(optimized=True)
+            except:
+                # 乗法的がダメなら加法的で試す
+                model = HoltWintersModel(
+                    sales,
+                    seasonal_periods=seasonal_periods,
+                    trend='add',
+                    seasonal='add',
+                    damped_trend=True
+                )
+                fitted = model.fit(optimized=True)
+            
+            forecast = fitted.forecast(periods)
+        
+        # 結果を整形
+        last_date = df['date'].max()
+        future_dates = pd.date_range(start=last_date + timedelta(days=1), periods=periods, freq='D')
+        
+        result_df = pd.DataFrame({
+            'date': future_dates,
+            'predicted': np.round(forecast).astype(int).clip(min=0)
+        })
+        
+        result_df.attrs['method'] = 'Holt-Winters'
+        
+        return result_df, "Holt-Winters法（三重指数平滑法）"
+        
+    except Exception as e:
+        logger.error(f"Holt-Winters予測エラー: {e}")
+        return None, f"Holt-Wintersエラー: {str(e)[:50]}"
+
+
+def calculate_reliability_score(
+    predictions: Dict[str, int],
+    backtest_results: Dict[str, Dict],
+    data_days: int
+) -> Dict[str, Any]:
+    """
+    【v21新機能】予測の総合信頼度スコアを計算
+    
+    複数の指標から総合的な信頼度を評価:
+    - MAPE（精度）
+    - データ量
+    - 方法間の一致度
+    
+    Args:
+        predictions: 各方法の予測合計 {方法名: 予測値}
+        backtest_results: 各方法のバックテスト結果
+        data_days: 学習データの日数
+    
+    Returns:
+        信頼度評価結果
+    """
+    scores = {}
+    
+    # 1. 各方法のMAPEスコア（0-100点）
+    for method, bt in backtest_results.items():
+        if bt and bt.get('mape') is not None:
+            mape = bt['mape']
+            if mape <= 20:
+                mape_score = 100
+            elif mape <= 30:
+                mape_score = 85
+            elif mape <= 50:
+                mape_score = 65
+            elif mape <= 80:
+                mape_score = 45
+            elif mape <= 100:
+                mape_score = 30
+            else:
+                mape_score = 15
+            scores[method] = {'mape_score': mape_score, 'mape': mape}
+        else:
+            scores[method] = {'mape_score': 50, 'mape': None}  # 不明な場合は50点
+    
+    # 2. データ量スコア（0-100点）
+    if data_days >= 365:
+        data_score = 100
+    elif data_days >= 180:
+        data_score = 80
+    elif data_days >= 90:
+        data_score = 60
+    elif data_days >= 30:
+        data_score = 40
+    else:
+        data_score = 20
+    
+    # 3. 方法間一致度スコア（0-100点）
+    pred_values = [v for v in predictions.values() if v is not None and v > 0]
+    consensus_score = 50  # デフォルト
+    
+    if len(pred_values) >= 2:
+        median_pred = np.median(pred_values)
+        if median_pred > 0:
+            # 各予測の中央値からの乖離を計算
+            deviations = [abs(v - median_pred) / median_pred for v in pred_values]
+            avg_deviation = np.mean(deviations)
+            
+            if avg_deviation <= 0.1:  # 10%以内
+                consensus_score = 100
+            elif avg_deviation <= 0.2:  # 20%以内
+                consensus_score = 80
+            elif avg_deviation <= 0.3:  # 30%以内
+                consensus_score = 60
+            elif avg_deviation <= 0.5:  # 50%以内
+                consensus_score = 40
+            else:
+                consensus_score = 20
+    
+    # 総合スコア計算（加重平均）
+    method_scores = [s['mape_score'] for s in scores.values() if s['mape_score'] is not None]
+    avg_mape_score = np.mean(method_scores) if method_scores else 50
+    
+    total_score = (
+        avg_mape_score * 0.4 +    # MAPEの重み: 40%
+        data_score * 0.3 +        # データ量の重み: 30%
+        consensus_score * 0.3     # 一致度の重み: 30%
+    )
+    
+    # 信頼度レベル判定
+    if total_score >= 75:
+        level = 'high'
+        level_text = '◎ 高い'
+        color = '#4CAF50'
+    elif total_score >= 55:
+        level = 'good'
+        level_text = '○ 良好'
+        color = '#8BC34A'
+    elif total_score >= 40:
+        level = 'medium'
+        level_text = '△ 中程度'
+        color = '#FFC107'
+    else:
+        level = 'low'
+        level_text = '× 要注意'
+        color = '#F44336'
+    
+    return {
+        'total_score': round(total_score, 1),
+        'level': level,
+        'level_text': level_text,
+        'color': color,
+        'mape_score': round(avg_mape_score, 1),
+        'data_score': data_score,
+        'consensus_score': consensus_score,
+        'method_scores': scores,
+        'recommendation': _get_reliability_recommendation(level, predictions, backtest_results)
+    }
+
+
+def _get_reliability_recommendation(level: str, predictions: Dict[str, int], 
+                                    backtest_results: Dict[str, Dict]) -> str:
+    """信頼度に基づく推奨事項を生成"""
+    
+    if level == 'high':
+        return "予測精度は十分です。この予測値を基に発注計画を立てることをお勧めします。"
+    
+    elif level == 'good':
+        return "予測精度は良好です。予測値を参考に、±10%程度の余裕を持った計画をお勧めします。"
+    
+    elif level == 'medium':
+        # 最も精度の高い方法を推奨
+        best_method = None
+        best_mape = float('inf')
+        for method, bt in backtest_results.items():
+            if bt and bt.get('mape') is not None and bt['mape'] < best_mape:
+                best_mape = bt['mape']
+                best_method = method
+        
+        if best_method and best_mape < 100:
+            return f"予測精度は中程度です。「{best_method}」の予測（MAPE {best_mape:.1f}%）を参考に、昨年実績も確認してください。"
+        return "予測精度は中程度です。複数の予測方法と昨年実績を参考にしてください。"
+    
+    else:  # low
+        pred_values = [v for v in predictions.values() if v is not None and v > 0]
+        if pred_values:
+            median_pred = int(np.median(pred_values))
+            return f"⚠️ 予測の信頼性が低いです。複数方法の中央値（{median_pred:,}体）を参考に、昨年同期の実績を基準にしてください。"
+        return "⚠️ 予測の信頼性が低いです。昨年同期の実績を基準にしてください。"
+
+
+def forecast_ensemble(df: pd.DataFrame, periods: int) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    【v21新機能】アンサンブル予測
+    
+    複数の予測方法を組み合わせ、外れ値を除外した安定した予測を生成。
+    
+    Args:
+        df: 売上データ
+        periods: 予測日数
+    
+    Returns:
+        (予測DataFrame, 詳細情報)
+    """
+    results = {}
+    backtest_results = {}
+    
+    df = df.copy()
+    df['date'] = pd.to_datetime(df['date'])
+    df = df.sort_values('date')
+    
+    # 各方法で予測を実行
+    # 1. 精度強化版
+    try:
+        enhanced = forecast_with_seasonality_enhanced(
+            df, periods,
+            baseline_method='median',
+            auto_special_factors=True,
+            include_quantiles=False,
+            backtest_days=14
+        )
+        if enhanced is not None and not enhanced.empty:
+            results['精度強化版'] = enhanced['predicted'].values
+            if hasattr(enhanced, 'attrs') and 'backtest' in enhanced.attrs:
+                backtest_results['精度強化版'] = enhanced.attrs['backtest']
+    except Exception as e:
+        logger.warning(f"精度強化版の予測エラー: {e}")
+    
+    # 2. 季節性考慮（従来版）
+    try:
+        seasonal = forecast_with_seasonality_fallback(df, periods)
+        if seasonal is not None and not seasonal.empty:
+            results['季節性考慮'] = seasonal['predicted'].values
+    except Exception as e:
+        logger.warning(f"季節性考慮の予測エラー: {e}")
+    
+    # 3. 移動平均
+    try:
+        ma = forecast_moving_average(df, periods)
+        if ma is not None and not ma.empty:
+            results['移動平均'] = ma['predicted'].values
+    except Exception as e:
+        logger.warning(f"移動平均の予測エラー: {e}")
+    
+    # 4. 指数平滑法
+    try:
+        exp = forecast_exponential_smoothing(df, periods)
+        if exp is not None and not exp.empty:
+            results['指数平滑'] = exp['predicted'].values
+    except Exception as e:
+        logger.warning(f"指数平滑法の予測エラー: {e}")
+    
+    # 5. Prophet（利用可能な場合）
+    if PROPHET_AVAILABLE:
+        try:
+            prophet_result, _ = forecast_with_prophet(df, periods)
+            if prophet_result is not None and not prophet_result.empty:
+                results['Prophet'] = prophet_result['predicted'].values
+        except Exception as e:
+            logger.warning(f"Prophetの予測エラー: {e}")
+    
+    # 6. Holt-Winters（利用可能な場合）
+    if STATSMODELS_AVAILABLE:
+        try:
+            hw_result, _ = forecast_with_holt_winters(df, periods)
+            if hw_result is not None and not hw_result.empty:
+                results['Holt-Winters'] = hw_result['predicted'].values
+        except Exception as e:
+            logger.warning(f"Holt-Wintersの予測エラー: {e}")
+    
+    # フォールバック
+    if not results:
+        avg = df['販売商品数'].mean() if len(df) > 0 else 1
+        avg = max(1, avg)
+        last_date = df['date'].max()
+        future_dates = pd.date_range(start=last_date + timedelta(days=1), periods=periods, freq='D')
+        
+        result_df = pd.DataFrame({
+            'date': future_dates,
+            'predicted': [int(round(avg))] * periods
+        })
+        return result_df, {
+            'methods_used': [],
+            'ensemble_type': 'fallback',
+            'reliability': {'level': 'low', 'level_text': '× 要注意', 'color': '#F44336'}
+        }
+    
+    # アンサンブル計算
+    all_predictions = np.array(list(results.values()))
+    
+    # 日ごとに中央値を計算（外れ値の影響を受けにくい）
+    median_predictions = np.median(all_predictions, axis=0)
+    
+    # IQRで外れ値を検出
+    q1 = np.percentile(all_predictions, 25, axis=0)
+    q3 = np.percentile(all_predictions, 75, axis=0)
+    iqr = q3 - q1
+    
+    lower_bound = q1 - 1.5 * iqr
+    upper_bound = q3 + 1.5 * iqr
+    
+    # 外れ値を除外した平均
+    trimmed_predictions = []
+    for i in range(periods):
+        day_preds = all_predictions[:, i]
+        valid_preds = day_preds[(day_preds >= lower_bound[i]) & (day_preds <= upper_bound[i])]
+        if len(valid_preds) > 0:
+            trimmed_predictions.append(np.mean(valid_preds))
+        else:
+            trimmed_predictions.append(median_predictions[i])
+    
+    trimmed_predictions = np.array(trimmed_predictions)
+    
+    # 最終予測（中央値と外れ値除外平均の平均）
+    final_predictions = (median_predictions + trimmed_predictions) / 2
+    
+    # 結果DataFrame
+    last_date = df['date'].max()
+    future_dates = pd.date_range(start=last_date + timedelta(days=1), periods=periods, freq='D')
+    
+    result_df = pd.DataFrame({
+        'date': future_dates,
+        'predicted': np.round(final_predictions).astype(int).clip(min=0),
+        'predicted_median': np.round(median_predictions).astype(int).clip(min=0),
+        'predicted_lower': np.round(q1).astype(int).clip(min=0),
+        'predicted_upper': np.round(q3).astype(int).clip(min=0)
+    })
+    
+    # 各方法の合計
+    method_totals = {method: int(np.sum(preds)) for method, preds in results.items()}
+    
+    # 信頼度評価
+    reliability = calculate_reliability_score(
+        method_totals,
+        backtest_results,
+        len(df)
+    )
+    
+    ensemble_info = {
+        'methods_used': list(results.keys()),
+        'method_totals': method_totals,
+        'ensemble_total': int(np.sum(final_predictions)),
+        'median_total': int(np.sum(median_predictions)),
+        'reliability': reliability
+    }
+    
+    result_df.attrs['ensemble'] = ensemble_info
+    
+    return result_df, ensemble_info
 
 
 # =============================================================================
@@ -1725,6 +2336,62 @@ def forecast_with_vertex_ai(
     elif method == "指数平滑法":
         return forecast_exponential_smoothing(df, periods), "指数平滑法（統計モデル）"
     
+    elif method == "📊 Prophet（季節商品向け）":
+        # v21新機能: Prophet
+        result, message = forecast_with_prophet(df, periods)
+        if result is not None:
+            return result, message
+        else:
+            # Prophetが失敗した場合は精度強化版にフォールバック
+            logger.warning(f"Prophetが利用不可のため精度強化版にフォールバック: {message}")
+            forecast = forecast_with_seasonality_enhanced(
+                df, periods,
+                baseline_method=baseline_method,
+                auto_special_factors=auto_special_factors,
+                backtest_days=backtest_days
+            )
+            return forecast, f"精度強化版（Prophetの代替: {message}）"
+    
+    elif method == "📈 Holt-Winters法":
+        # v21新機能: Holt-Winters
+        result, message = forecast_with_holt_winters(df, periods)
+        if result is not None:
+            return result, message
+        else:
+            # Holt-Wintersが失敗した場合は精度強化版にフォールバック
+            logger.warning(f"Holt-Wintersが利用不可のため精度強化版にフォールバック: {message}")
+            forecast = forecast_with_seasonality_enhanced(
+                df, periods,
+                baseline_method=baseline_method,
+                auto_special_factors=auto_special_factors,
+                backtest_days=backtest_days
+            )
+            return forecast, f"精度強化版（Holt-Wintersの代替: {message}）"
+    
+    elif method == "🧠 アンサンブル予測（v21）":
+        # v21新機能: アンサンブル予測
+        result, ensemble_info = forecast_ensemble(df, periods)
+        
+        # メッセージ生成
+        methods_used = ensemble_info.get('methods_used', [])
+        reliability = ensemble_info.get('reliability', {})
+        reliability_text = reliability.get('level_text', '')
+        
+        message = f"アンサンブル予測（{len(methods_used)}手法の組み合わせ）"
+        if reliability_text:
+            message += f"・信頼度: {reliability_text}"
+        
+        # 信頼度情報を属性に追加
+        result.attrs['ensemble'] = ensemble_info
+        result.attrs['backtest'] = {
+            'mape': None,
+            'available': True,
+            'reliability': reliability.get('level', 'medium'),
+            'message': f"アンサンブル信頼度スコア: {reliability.get('total_score', 0):.1f}点"
+        }
+        
+        return result, message
+    
     else:
         # デフォルトはVertex AI
         predictions, used_vertex_ai, message = get_vertex_ai_prediction(df, periods, product_id, use_covariates=True)
@@ -1809,7 +2476,7 @@ def forecast_all_methods_with_vertex_ai(
     backtest_days: int = 14
 ) -> Dict[str, Tuple[pd.DataFrame, str]]:
     """
-    すべての予測方法で予測を実行（Vertex AI含む、v19: 精度強化版追加）
+    すべての予測方法で予測を実行（v21: Prophet、Holt-Winters、アンサンブル追加）
     """
     results = {}
     
@@ -1820,6 +2487,16 @@ def forecast_all_methods_with_vertex_ai(
             results['Vertex AI'] = (predictions, message)
         except Exception as e:
             logger.warning(f"Vertex AI予測失敗: {e}")
+    
+    # 【v21新規】アンサンブル予測
+    try:
+        ensemble_result, ensemble_info = forecast_ensemble(df, periods)
+        reliability = ensemble_info.get('reliability', {})
+        reliability_text = reliability.get('level_text', '')
+        method_desc = f"アンサンブル予測（{len(ensemble_info.get('methods_used', []))}手法・信頼度: {reliability_text}）"
+        results['アンサンブル'] = (ensemble_result, method_desc)
+    except Exception as e:
+        logger.warning(f"アンサンブル予測失敗: {e}")
     
     # 【v19新規】精度強化版予測
     try:
@@ -1835,6 +2512,24 @@ def forecast_all_methods_with_vertex_ai(
         results['精度強化版'] = (enhanced_forecast, method_desc)
     except Exception as e:
         logger.warning(f"精度強化版予測失敗: {e}")
+    
+    # 【v21新規】Prophet予測
+    if PROPHET_AVAILABLE:
+        try:
+            prophet_result, message = forecast_with_prophet(df, periods)
+            if prophet_result is not None:
+                results['Prophet'] = (prophet_result, message)
+        except Exception as e:
+            logger.warning(f"Prophet予測失敗: {e}")
+    
+    # 【v21新規】Holt-Winters予測
+    if STATSMODELS_AVAILABLE:
+        try:
+            hw_result, message = forecast_with_holt_winters(df, periods)
+            if hw_result is not None:
+                results['Holt-Winters'] = (hw_result, message)
+        except Exception as e:
+            logger.warning(f"Holt-Winters予測失敗: {e}")
     
     # 統計モデル予測（従来版）
     results['季節性考慮'] = (forecast_with_seasonality_fallback(df, periods), "季節性考慮（統計モデル）")
@@ -1878,7 +2573,7 @@ def display_comparison_results_v19(
     # 分かりやすいリスト形式で表示
     st.markdown("---")
     for method_name, totals in method_totals.items():
-        icon = "🚀" if "Vertex" in method_name else "🎯" if "精度強化" in method_name else "📈" if "季節" in method_name else "📊" if "移動" in method_name else "📉"
+        icon = "🚀" if "Vertex" in method_name else "🧠" if "アンサンブル" in method_name else "🎯" if "精度強化" in method_name else "📊" if "Prophet" in method_name else "📈" if "Holt" in method_name or "季節" in method_name else "📊" if "移動" in method_name else "📉"
         mape_str = f"（MAPE {backtest_info[method_name]:.1f}%）" if method_name in backtest_info else ""
         st.markdown(f"""
         **{icon} {safe_html(method_name)}**: **{totals['rounded']:,}体**（日販 {totals['avg']:.1f}体）{mape_str}
@@ -1890,7 +2585,7 @@ def display_comparison_results_v19(
     cols = st.columns(min(num_methods, 4))
     
     for i, (method_name, totals) in enumerate(method_totals.items()):
-        icon = "🚀" if "Vertex" in method_name else "🎯" if "精度強化" in method_name else "📈" if "季節" in method_name else "📊" if "移動" in method_name else "📉"
+        icon = "🚀" if "Vertex" in method_name else "🧠" if "アンサンブル" in method_name else "🎯" if "精度強化" in method_name else "📊" if "Prophet" in method_name else "📈" if "Holt" in method_name or "季節" in method_name else "📊" if "移動" in method_name else "📉"
         short_name = method_name.replace("（統計）", "").replace("（推奨）", "")
         with cols[i % 4]:
             delta_str = f"MAPE {backtest_info[method_name]:.1f}%" if method_name in backtest_info else f"日販 {totals['avg']:.1f}体"
@@ -1904,7 +2599,7 @@ def display_comparison_results_v19(
     with st.expander("📋 詳細データを表示", expanded=False):
         summary_rows = []
         for method_name, totals in method_totals.items():
-            icon = "🚀" if "Vertex" in method_name else "🎯" if "精度強化" in method_name else "📈" if "季節" in method_name else "📊" if "移動" in method_name else "📉"
+            icon = "🚀" if "Vertex" in method_name else "🧠" if "アンサンブル" in method_name else "🎯" if "精度強化" in method_name else "📊" if "Prophet" in method_name else "📈" if "Holt" in method_name or "季節" in method_name else "📊" if "移動" in method_name else "📉"
             mape_str = f"{backtest_info[method_name]:.1f}%" if method_name in backtest_info else "-"
             summary_rows.append({
                 '予測方法': f"{icon} {method_name}",
@@ -2017,10 +2712,28 @@ FORECAST_METHODS = {
         "color": "#4285F4",
         "requires_vertex_ai": True
     },
+    "🧠 アンサンブル予測（v21）": {
+        "description": "【v21新機能】複数の予測方法を組み合わせ、外れ値を除外した安定した予測。信頼度評価付き。",
+        "icon": "🧠",
+        "color": "#673AB7",
+        "requires_vertex_ai": False
+    },
     "🎯 季節性考慮（精度強化版）": {
-        "description": "【v20】0埋め・欠品除外・トレンド係数・正月日別係数対応。分位点予測・バックテスト付き。最も推奨。",
+        "description": "【v20】0埋め・欠品除外・トレンド係数・正月日別係数対応。分位点予測・バックテスト付き。",
         "icon": "🎯",
         "color": "#9C27B0",
+        "requires_vertex_ai": False
+    },
+    "📊 Prophet（季節商品向け）": {
+        "description": "【v21新機能】Meta製の高精度予測。季節性・トレンド・イベントを自動検出。季節商品に最適。",
+        "icon": "📊",
+        "color": "#2196F3",
+        "requires_vertex_ai": False
+    },
+    "📈 Holt-Winters法": {
+        "description": "【v21新機能】三重指数平滑法。週間の季節パターンを捉える。",
+        "icon": "📈",
+        "color": "#009688",
         "requires_vertex_ai": False
     },
     "季節性考慮（統計）": {
@@ -2042,7 +2755,7 @@ FORECAST_METHODS = {
         "requires_vertex_ai": False
     },
     "🔄 すべての方法で比較": {
-        "description": "Vertex AIと統計モデルすべてで予測し、結果を比較します。",
+        "description": "すべての予測方法で予測し、結果を比較。信頼度評価付き。",
         "icon": "🔄",
         "color": "#607D8B",
         "requires_vertex_ai": False
@@ -4422,15 +5135,36 @@ def display_single_forecast_result_v19(
                     bt_df['誤差'] = bt_df['実績'] - bt_df['予測']
                     bt_df['誤差率(%)'] = ((bt_df['実績'] - bt_df['予測']) / bt_df['実績'].replace(0, 1) * 100).round(1)
                     st.dataframe(bt_df, use_container_width=True)
+                    
+                    # 有効日数の表示（v21）
+                    valid_days = bt.get('valid_days', len(bt.get('actual', [])))
+                    st.caption(f"※ MAPE計算に使用した有効日数: {valid_days}日")
             
-            # 予測の信頼度メッセージ
-            if mape is not None:
-                if mape < 15:
-                    st.info(f"💡 この予測は高い信頼度（MAPE {mape:.1f}%）です。安心して発注計画に活用できます。")
-                elif mape < 30:
-                    st.warning(f"⚠️ この予測は中程度の信頼度（MAPE {mape:.1f}%）です。バッファを持った発注をおすすめします。")
+            # 予測の信頼度メッセージ（v21改善版）
+            reliability = bt.get('reliability', 'unknown')
+            reliability_msg = bt.get('reliability_message', '')
+            is_seasonal = bt.get('is_seasonal', False)
+            
+            if is_seasonal:
+                st.warning(f"🌸 季節商品の可能性があります。{reliability_msg}")
+            elif reliability == 'high':
+                st.success(f"✅ 予測精度: 高い（MAPE {mape:.1f}%）- {reliability_msg}")
+            elif reliability == 'good':
+                st.info(f"💡 予測精度: 良好（MAPE {mape:.1f}%）- {reliability_msg}")
+            elif reliability == 'medium':
+                st.warning(f"⚠️ 予測精度: 中程度（MAPE {mape:.1f}%）- {reliability_msg}")
+            elif reliability in ('low', 'very_low'):
+                st.error(f"❌ 予測精度: 要注意（MAPE {mape:.1f}%）- {reliability_msg}")
+            elif mape is not None:
+                # 従来のロジック（互換性）
+                if mape < 25:
+                    st.success(f"✅ 予測精度: 高い（MAPE {mape:.1f}%）")
+                elif mape < 50:
+                    st.info(f"💡 予測精度: 良好（MAPE {mape:.1f}%）")
+                elif mape < 80:
+                    st.warning(f"⚠️ 予測精度: 中程度（MAPE {mape:.1f}%）")
                 else:
-                    st.error(f"❌ この予測は信頼度が低め（MAPE {mape:.1f}%）です。複数の予測方法で比較検討してください。")
+                    st.error(f"❌ 予測精度: 要注意（MAPE {mape:.1f}%）")
     
     # ==========================================================================
     # 【v19新機能】分位点予測と発注推奨
@@ -6663,7 +7397,7 @@ def main():
     st.divider()
     
     # バージョン情報（v20更新）
-    version_info = "v20 (精度向上版 - 0埋め・トレンド・正月日別対応)"
+    version_info = "v21 (高精度版 - アンサンブル・Prophet・Holt-Winters・信頼度評価対応)"
     if VERTEX_AI_AVAILABLE:
         version_info += " | 🚀 Vertex AI: 有効"
     else:
