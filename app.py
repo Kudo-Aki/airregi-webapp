@@ -2642,7 +2642,10 @@ def display_comparison_results_v19(
     
     method_colors = {
         'Vertex AI': '#4285F4',
+        'アンサンブル': '#673AB7',
         '精度強化版': '#9C27B0',
+        'Prophet': '#2196F3',
+        'Holt-Winters': '#009688',
         '季節性考慮': '#4CAF50',
         '移動平均法': '#1E88E5',
         '指数平滑法': '#FF9800'
@@ -5505,6 +5508,10 @@ def display_comparison_results_v12(all_results: Dict[str, Tuple[pd.DataFrame, st
     
     method_colors = {
         'Vertex AI': '#4285F4',
+        'アンサンブル': '#673AB7',
+        '精度強化版': '#9C27B0',
+        'Prophet': '#2196F3',
+        'Holt-Winters': '#009688',
         '季節性考慮': '#4CAF50',
         '移動平均法': '#1E88E5',
         '指数平滑法': '#FF9800'
