@@ -1348,20 +1348,44 @@ def forecast_with_seasonality_enhanced(
     
     # ========== v20新機能1: 0埋め処理 ==========
     missing_dates = []
+    zero_fill_applied = False
     if enable_zero_fill:
         df, missing_dates = fill_missing_dates(df, fill_value=0)
+        zero_fill_applied = True
+        
+        # 欠損率のチェックと警告
+        if len(missing_dates) > 0:
+            total_days = len(df)
+            original_days = total_days - len(missing_dates)
+            missing_ratio = len(missing_dates) / total_days if total_days > 0 else 0
+            
+            if missing_ratio > 0.5:
+                logger.warning(
+                    f"欠損率が高いです（{missing_ratio:.1%}）。"
+                    f"元データ{original_days}日 / 全期間{total_days}日。"
+                    f"季節商品の可能性があります。"
+                )
     
     # ========== v20新機能2: 欠品期間の除外 ==========
     if stockout_periods:
         df = exclude_stockout_periods(df, stockout_periods)
     
     # データが少なすぎる場合のフォールバック
-    # NaNを除外してカウント
-    valid_count = df['販売商品数'].notna().sum()
+    # 【修正】0埋め時は0を除外してカウント（季節商品対応）
+    if zero_fill_applied:
+        valid_count = ((df['販売商品数'].notna()) & (df['販売商品数'] > 0)).sum()
+    else:
+        valid_count = df['販売商品数'].notna().sum()
+    
     if valid_count < 7:
         logger.warning(f"有効データが少なすぎます（{valid_count}件）。シンプルな予測にフォールバックします。")
-        # 単純平均で予測（NaN除外）
-        avg_value = df['販売商品数'].dropna().mean() if valid_count > 0 else 1.0
+        # 単純平均で予測（0埋め時は0も除外）
+        if zero_fill_applied:
+            valid_sales = df[(df['販売商品数'].notna()) & (df['販売商品数'] > 0)]['販売商品数']
+        else:
+            valid_sales = df['販売商品数'].dropna()
+        
+        avg_value = valid_sales.mean() if len(valid_sales) > 0 else 1.0
         avg_value = max(1.0, avg_value)
         
         last_date = df['date'].max()
@@ -1379,10 +1403,19 @@ def forecast_with_seasonality_enhanced(
         }
         return result_df
     
-    # NaNを除外した値で計算
-    valid_values = df['販売商品数'].dropna().values
-    
     # ========== 1. 頑健なベースライン計算 ==========
+    # 【重要】0埋め時は0を除外してベースラインを計算（季節商品対応）
+    if zero_fill_applied:
+        nonzero_values = df[(df['販売商品数'].notna()) & (df['販売商品数'] > 0)]['販売商品数'].values
+        if len(nonzero_values) >= 7:
+            valid_values = nonzero_values
+            logger.info(f"0埋めモード: {len(nonzero_values)}件の非ゼロデータでベースラインを計算")
+        else:
+            valid_values = df['販売商品数'].dropna().values
+            logger.warning(f"非ゼロデータが少ないため、全データ({len(valid_values)}件)でベースラインを計算")
+    else:
+        valid_values = df['販売商品数'].dropna().values
+    
     overall_baseline = calculate_robust_baseline(valid_values, method=baseline_method)
     
     if overall_baseline <= 0:
@@ -1414,9 +1447,21 @@ def forecast_with_seasonality_enhanced(
         return False
     
     df['is_special'] = df['date'].apply(is_special_day)
-    # NaN（欠品日）と特別期間を除外
-    normal_df = df[(~df['is_special']) & (df['販売商品数'].notna())].copy()
     
+    # ========== 3.1 通常日データの抽出 ==========
+    # 【重要】0埋め時は0も除外して係数を計算（季節商品対応）
+    if zero_fill_applied:
+        # 0埋めした場合: NaN、特別期間、0をすべて除外
+        normal_df = df[
+            (~df['is_special']) & 
+            (df['販売商品数'].notna()) & 
+            (df['販売商品数'] > 0)
+        ].copy()
+    else:
+        # 通常: NaNと特別期間を除外
+        normal_df = df[(~df['is_special']) & (df['販売商品数'].notna())].copy()
+    
+    # ========== 3.2 通常日ベースラインの計算 ==========
     if len(normal_df) > 10:
         # 通常日のみでベースラインを再計算（二重計上対策）
         normal_baseline = calculate_robust_baseline(
@@ -1426,10 +1471,16 @@ def forecast_with_seasonality_enhanced(
     else:
         normal_baseline = overall_baseline
     
+    # ベースラインが0以下の場合の安全対策
+    if normal_baseline <= 0:
+        logger.warning(f"通常日ベースラインが0以下({normal_baseline})のため、overall_baselineを使用")
+        normal_baseline = overall_baseline if overall_baseline > 0 else 1.0
+    
     # ========== 4. 曜日係数（頑健版） ==========
     weekday_factor = {}
     
     for wd in range(7):
+        # 【注意】normal_dfは既に0埋め時は0を除外済み
         wd_values = normal_df[normal_df['weekday'] == wd]['販売商品数'].values
         weekday_factor[wd] = calculate_robust_factor(wd_values, normal_baseline, min_samples=3)
     
@@ -1437,7 +1488,7 @@ def forecast_with_seasonality_enhanced(
     month_factor = {}
     
     for m in range(1, 13):
-        # 通常日のみで月係数を計算
+        # 【注意】normal_dfは既に0埋め時は0を除外済み
         m_values = normal_df[normal_df['month'] == m]['販売商品数'].values
         month_factor[m] = calculate_robust_factor(m_values, normal_baseline, min_samples=5)
     
