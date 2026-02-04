@@ -1,5 +1,9 @@
 """
-Airレジ 売上分析・需要予測 Webアプリ（v22.3: 全方法統合予測版 - form分離修正）
+Airレジ 売上分析・需要予測 Webアプリ（v22.4: 全方法統合予測版 - 異常値除外）
+
+【v22.4 変更点】
+- 異常予測値（実績平均の50倍を超える）を自動除外
+- 入力データ統計をファクトチェックに正しく表示
 
 【v22.3 変更点】
 - formとsession_state書き込みを完全に分離してStreamlitエラーを回避
@@ -3811,6 +3815,15 @@ def forecast_all_methods_unified_v22(
     df['date'] = pd.to_datetime(df['date'])
     df = df.sort_values('date')
     
+    # 【v22.4】実績データの統計を計算（妥当性チェック用）
+    actual_mean = df['販売商品数'].mean() if '販売商品数' in df.columns else 0
+    actual_max = df['販売商品数'].max() if '販売商品数' in df.columns else 0
+    data_days = len(df)
+    
+    # 妥当性チェック用の上限値を計算
+    # 予測期間の合計が、実績平均の50倍 × 予測日数 を超えたら異常とみなす
+    max_reasonable_total = max(actual_mean * periods * 50, actual_max * periods * 10, 100000)
+    
     # 各モードで精度強化版を実行
     modes = ['conservative', 'balanced', 'aggressive']
     
@@ -3839,6 +3852,10 @@ def forecast_all_methods_unified_v22(
                 mode_forecasts[mode] = forecast
                 # 採用列を統一して合計を計算
                 totals = calculate_forecast_totals_v22(forecast, mode)
+                # 【v22.4】妥当性チェック
+                if totals['rounded_total'] > max_reasonable_total:
+                    logger.warning(f"精度強化版({mode})予測値が異常 ({totals['rounded_total']:,} > {max_reasonable_total:,})、除外します")
+                    continue
                 mode_totals[mode] = totals['rounded_total']
                 
                 # バックテスト結果を取得（1回だけ）
@@ -3847,7 +3864,7 @@ def forecast_all_methods_unified_v22(
                     if bt.get('mape') is not None:
                         backtest_mape = bt['mape']
         
-        if mode_totals:
+        if mode_totals and len(mode_totals) == 3:  # 3モードすべて妥当な場合のみ
             results['精度強化版'] = {
                 'forecast': mode_forecasts.get('balanced'),
                 'totals': mode_totals,
@@ -3869,11 +3886,15 @@ def forecast_all_methods_unified_v22(
             
             if ensemble_result is not None and not ensemble_result.empty:
                 totals = calculate_forecast_totals_v22(ensemble_result, mode)
+                # 【v22.4】妥当性チェック
+                if totals['rounded_total'] > max_reasonable_total:
+                    logger.warning(f"アンサンブル予測値が異常 ({totals['rounded_total']:,} > {max_reasonable_total:,})、除外します")
+                    continue
                 mode_totals[mode] = totals['rounded_total']
                 if ensemble_info is None:
                     ensemble_info = info
         
-        if mode_totals:
+        if mode_totals and len(mode_totals) == 3:  # 3モードすべて妥当な場合のみ
             reliability_info = ensemble_info.get('reliability', {}) if ensemble_info else {}
             results['アンサンブル'] = {
                 'forecast': ensemble_result,
@@ -3893,19 +3914,24 @@ def forecast_all_methods_unified_v22(
             if prophet_result is not None and not prophet_result.empty:
                 # Prophetは単一予測なのでモード別に係数で調整
                 base_total = int(prophet_result['predicted'].sum())
-                mode_totals = {
-                    'conservative': round_up_to_50(int(base_total * 0.9)),
-                    'balanced': round_up_to_50(base_total),
-                    'aggressive': round_up_to_50(int(base_total * 1.15))
-                }
-                results['Prophet'] = {
-                    'forecast': prophet_result,
-                    'totals': mode_totals,
-                    'mape': 35.0,  # デフォルト
-                    'description': FORECAST_METHOD_DESCRIPTIONS['Prophet'],
-                    'reliability': 'medium',
-                    'weight': 0.01
-                }
+                
+                # 【v22.4】妥当性チェック：異常な予測値は除外
+                if base_total > max_reasonable_total:
+                    logger.warning(f"Prophet予測値が異常 ({base_total:,} > {max_reasonable_total:,})、除外します")
+                else:
+                    mode_totals = {
+                        'conservative': round_up_to_50(int(base_total * 0.9)),
+                        'balanced': round_up_to_50(base_total),
+                        'aggressive': round_up_to_50(int(base_total * 1.15))
+                    }
+                    results['Prophet'] = {
+                        'forecast': prophet_result,
+                        'totals': mode_totals,
+                        'mape': 35.0,  # デフォルト
+                        'description': FORECAST_METHOD_DESCRIPTIONS['Prophet'],
+                        'reliability': 'medium',
+                        'weight': 0.01
+                    }
         except Exception as e:
             logger.warning(f"Prophet予測エラー: {e}")
     
@@ -3915,19 +3941,23 @@ def forecast_all_methods_unified_v22(
             hw_result, message = forecast_with_holt_winters(df, periods)
             if hw_result is not None and not hw_result.empty:
                 base_total = int(hw_result['predicted'].sum())
-                mode_totals = {
-                    'conservative': round_up_to_50(int(base_total * 0.9)),
-                    'balanced': round_up_to_50(base_total),
-                    'aggressive': round_up_to_50(int(base_total * 1.15))
-                }
-                results['Holt-Winters'] = {
-                    'forecast': hw_result,
-                    'totals': mode_totals,
-                    'mape': 40.0,  # デフォルト
-                    'description': FORECAST_METHOD_DESCRIPTIONS['Holt-Winters'],
-                    'reliability': 'medium',
-                    'weight': 0.008
-                }
+                # 【v22.4】妥当性チェック
+                if base_total > max_reasonable_total:
+                    logger.warning(f"Holt-Winters予測値が異常 ({base_total:,} > {max_reasonable_total:,})、除外します")
+                else:
+                    mode_totals = {
+                        'conservative': round_up_to_50(int(base_total * 0.9)),
+                        'balanced': round_up_to_50(base_total),
+                        'aggressive': round_up_to_50(int(base_total * 1.15))
+                    }
+                    results['Holt-Winters'] = {
+                        'forecast': hw_result,
+                        'totals': mode_totals,
+                        'mape': 40.0,  # デフォルト
+                        'description': FORECAST_METHOD_DESCRIPTIONS['Holt-Winters'],
+                        'reliability': 'medium',
+                        'weight': 0.008
+                    }
         except Exception as e:
             logger.warning(f"Holt-Winters予測エラー: {e}")
     
@@ -3936,19 +3966,23 @@ def forecast_all_methods_unified_v22(
         seasonal_result = forecast_with_seasonality_fallback(df, periods)
         if seasonal_result is not None and not seasonal_result.empty:
             base_total = int(seasonal_result['predicted'].sum())
-            mode_totals = {
-                'conservative': round_up_to_50(int(base_total * 0.9)),
-                'balanced': round_up_to_50(base_total),
-                'aggressive': round_up_to_50(int(base_total * 1.15))
-            }
-            results['季節性考慮'] = {
-                'forecast': seasonal_result,
-                'totals': mode_totals,
-                'mape': None,
-                'description': FORECAST_METHOD_DESCRIPTIONS['季節性考慮'],
-                'reliability': 'low',
-                'weight': 0.005
-            }
+            # 【v22.4】妥当性チェック
+            if base_total > max_reasonable_total:
+                logger.warning(f"季節性考慮予測値が異常 ({base_total:,} > {max_reasonable_total:,})、除外します")
+            else:
+                mode_totals = {
+                    'conservative': round_up_to_50(int(base_total * 0.9)),
+                    'balanced': round_up_to_50(base_total),
+                    'aggressive': round_up_to_50(int(base_total * 1.15))
+                }
+                results['季節性考慮'] = {
+                    'forecast': seasonal_result,
+                    'totals': mode_totals,
+                    'mape': None,
+                    'description': FORECAST_METHOD_DESCRIPTIONS['季節性考慮'],
+                    'reliability': 'low',
+                    'weight': 0.005
+                }
     except Exception as e:
         logger.warning(f"季節性考慮予測エラー: {e}")
     
@@ -3957,19 +3991,23 @@ def forecast_all_methods_unified_v22(
         ma_result = forecast_moving_average(df, periods)
         if ma_result is not None and not ma_result.empty:
             base_total = int(ma_result['predicted'].sum())
-            mode_totals = {
-                'conservative': round_up_to_50(int(base_total * 0.9)),
-                'balanced': round_up_to_50(base_total),
-                'aggressive': round_up_to_50(int(base_total * 1.15))
-            }
-            results['移動平均'] = {
-                'forecast': ma_result,
-                'totals': mode_totals,
-                'mape': None,
-                'description': FORECAST_METHOD_DESCRIPTIONS['移動平均'],
-                'reliability': 'low',
-                'weight': 0.005
-            }
+            # 【v22.4】妥当性チェック
+            if base_total > max_reasonable_total:
+                logger.warning(f"移動平均予測値が異常 ({base_total:,} > {max_reasonable_total:,})、除外します")
+            else:
+                mode_totals = {
+                    'conservative': round_up_to_50(int(base_total * 0.9)),
+                    'balanced': round_up_to_50(base_total),
+                    'aggressive': round_up_to_50(int(base_total * 1.15))
+                }
+                results['移動平均'] = {
+                    'forecast': ma_result,
+                    'totals': mode_totals,
+                    'mape': None,
+                    'description': FORECAST_METHOD_DESCRIPTIONS['移動平均'],
+                    'reliability': 'low',
+                    'weight': 0.005
+                }
     except Exception as e:
         logger.warning(f"移動平均予測エラー: {e}")
     
@@ -3978,19 +4016,23 @@ def forecast_all_methods_unified_v22(
         exp_result = forecast_exponential_smoothing(df, periods)
         if exp_result is not None and not exp_result.empty:
             base_total = int(exp_result['predicted'].sum())
-            mode_totals = {
-                'conservative': round_up_to_50(int(base_total * 0.9)),
-                'balanced': round_up_to_50(base_total),
-                'aggressive': round_up_to_50(int(base_total * 1.15))
-            }
-            results['指数平滑'] = {
-                'forecast': exp_result,
-                'totals': mode_totals,
-                'mape': None,
-                'description': FORECAST_METHOD_DESCRIPTIONS['指数平滑'],
-                'reliability': 'low',
-                'weight': 0.005
-            }
+            # 【v22.4】妥当性チェック
+            if base_total > max_reasonable_total:
+                logger.warning(f"指数平滑予測値が異常 ({base_total:,} > {max_reasonable_total:,})、除外します")
+            else:
+                mode_totals = {
+                    'conservative': round_up_to_50(int(base_total * 0.9)),
+                    'balanced': round_up_to_50(base_total),
+                    'aggressive': round_up_to_50(int(base_total * 1.15))
+                }
+                results['指数平滑'] = {
+                    'forecast': exp_result,
+                    'totals': mode_totals,
+                    'mape': None,
+                    'description': FORECAST_METHOD_DESCRIPTIONS['指数平滑'],
+                    'reliability': 'low',
+                    'weight': 0.005
+                }
     except Exception as e:
         logger.warning(f"指数平滑予測エラー: {e}")
     
@@ -7490,7 +7532,8 @@ def render_individual_forecast_section():
                     'final_recommendation': final_recommendation,
                     'forecast_days': forecast_days,
                     'product_names': product_names,
-                    'all_products_results': all_products_results
+                    'all_products_results': all_products_results,
+                    'combined_sales_data': combined_sales_data  # 追加
                 }
                 
                 # 納品計画用に従来形式でも保存
@@ -7749,12 +7792,13 @@ def render_individual_forecast_section():
         final_recommendation = results['final_recommendation']
         forecast_days_result = results['forecast_days']
         product_names = results['product_names']
+        combined_sales_data = results.get('combined_sales_data')  # 追加
         
         display_unified_forecast_results_v22(
             all_results=combined_results,
             final_recommendation=final_recommendation,
             forecast_days=forecast_days_result,
-            sales_data=None,
+            sales_data=combined_sales_data,  # 修正
             product_names=product_names
         )
         
@@ -8837,7 +8881,7 @@ def main():
     st.divider()
     
     # バージョン情報（v20更新）
-    version_info = "v22.3 (全方法統合予測版 - form分離修正)"
+    version_info = "v22.4 (全方法統合予測版 - 異常値除外)"
     if VERTEX_AI_AVAILABLE:
         version_info += " | 🚀 Vertex AI: 有効"
     else:
