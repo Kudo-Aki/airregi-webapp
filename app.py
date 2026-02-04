@@ -1,5 +1,15 @@
 """
-Airレジ 売上分析・需要予測 Webアプリ（v22.5: 商品別予測表示版）
+Airレジ 売上分析・需要予測 Webアプリ（v23: 精度改善版）
+
+【v23 変更点】
+- 統計的に正しいP80/P90計算（期間合計の分布から算出）
+- 類似商品探索の精度改善（TF-IDF + コサイン類似度）
+- バックテスト期間延長（14日→30-90日）
+- 分割発注提案機能
+- 日販の正しい定義（zero-fill + 全日付カバー）
+- 係数のデータ推定（固定値の廃止）
+- 新規授与品予測のバックテスト機能
+- 強化されたファクトチェックプロンプト
 
 【v22.5 変更点】
 - 商品別に予測結果を表示（合算ではなくグループ/商品ごと）
@@ -4377,6 +4387,929 @@ CATEGORY_CHARACTERISTICS = {
     "その他": {"seasonality": "low", "base_daily": 0.5, "price_range": (500, 2000)},
 }
 
+# =============================================================================
+# v23 精度改善モジュール（app.py内に統合）
+# =============================================================================
+# 【改善内容】
+# 1. 統計的に正しいP80/P90計算（期間合計の分布から算出）
+# 2. 類似商品探索の精度改善（TF-IDF + コサイン類似度）
+# 3. バックテスト期間延長（14日→30-90日）
+# 4. 分割発注提案機能
+# 5. 日販の正しい定義（zero-fill + 全日付カバー）
+# 6. 係数のデータ推定（固定値の廃止）
+# =============================================================================
+
+# sklearn/rapidfuzzのインポート（オプショナル）
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
+    logger.warning("sklearn未インストール: フォールバック類似度計算を使用します")
+
+try:
+    from rapidfuzz import fuzz
+    RAPIDFUZZ_AVAILABLE = True
+except ImportError:
+    RAPIDFUZZ_AVAILABLE = False
+
+
+# -----------------------------------------------------------------------------
+# 1. 統計的に正しいP80/P90計算
+# -----------------------------------------------------------------------------
+
+def calculate_period_total_distribution_v23(
+    daily_forecasts: np.ndarray,
+    daily_std: float,
+    n_simulations: int = 10000
+) -> Dict[str, float]:
+    """
+    【v23新機能】期間合計の分布から統計的に正しいP値を計算
+    
+    日別P値の足し上げは統計的に誤り。
+    期間合計の分布を直接推定してP値を取得する。
+    """
+    n_days = len(daily_forecasts)
+    
+    if n_days == 0:
+        return {'p50': 0, 'p80': 0, 'p90': 0, 'mean': 0, 'std': 0}
+    
+    point_total = np.sum(daily_forecasts)
+    
+    if daily_std <= 0:
+        daily_std = np.mean(daily_forecasts) * 0.2 if np.mean(daily_forecasts) > 0 else 1.0
+    
+    simulated_totals = []
+    
+    for _ in range(n_simulations):
+        daily_cv = daily_std / np.mean(daily_forecasts) if np.mean(daily_forecasts) > 0 else 0.2
+        daily_cv = min(daily_cv, 0.5)
+        
+        sigma_ln = np.sqrt(np.log(1 + daily_cv ** 2))
+        
+        simulated_daily = []
+        for forecast in daily_forecasts:
+            if forecast <= 0:
+                simulated_daily.append(0)
+            else:
+                mu_ln = np.log(forecast) - sigma_ln ** 2 / 2
+                sim_value = np.random.lognormal(mu_ln, sigma_ln)
+                simulated_daily.append(max(0, sim_value))
+        
+        simulated_totals.append(sum(simulated_daily))
+    
+    simulated_totals = np.array(simulated_totals)
+    
+    p50 = np.percentile(simulated_totals, 50)
+    p80 = np.percentile(simulated_totals, 80)
+    p90 = np.percentile(simulated_totals, 90)
+    
+    return {
+        'p50': p50,
+        'p80': p80,
+        'p90': p90,
+        'mean': np.mean(simulated_totals),
+        'std': np.std(simulated_totals),
+        'point_total': point_total
+    }
+
+
+# -----------------------------------------------------------------------------
+# 2. 類似商品探索の精度改善
+# -----------------------------------------------------------------------------
+
+def normalize_text_v23(text: str) -> str:
+    """テキストの正規化（全角半角統一、記号除去など）"""
+    import unicodedata
+    
+    if not isinstance(text, str):
+        return ""
+    
+    text = unicodedata.normalize('NFKC', text)
+    text = text.lower()
+    text = re.sub(r'[^\w\s\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    return text
+
+
+def create_char_ngrams_v23(text: str, n_range: Tuple[int, int] = (2, 5)) -> List[str]:
+    """文字n-gramを生成"""
+    ngrams = []
+    text = normalize_text_v23(text)
+    
+    for n in range(n_range[0], n_range[1] + 1):
+        for i in range(len(text) - n + 1):
+            ngrams.append(text[i:i+n])
+    
+    return ngrams
+
+
+def calculate_jaccard_similarity_v23(text1: str, text2: str, n_range: Tuple[int, int] = (2, 4)) -> float:
+    """Jaccard類似度（sklearn不要のフォールバック）"""
+    ngrams1 = set(create_char_ngrams_v23(text1, n_range))
+    ngrams2 = set(create_char_ngrams_v23(text2, n_range))
+    
+    if not ngrams1 or not ngrams2:
+        return 0.0
+    
+    intersection = len(ngrams1 & ngrams2)
+    union = len(ngrams1 | ngrams2)
+    
+    return intersection / union if union > 0 else 0.0
+
+
+@st.cache_data(ttl=3600)
+def build_tfidf_matrix_cached(product_names: Tuple[str, ...]) -> Tuple[Any, Any]:
+    """TF-IDF行列をキャッシュして構築"""
+    if not SKLEARN_AVAILABLE:
+        return None, None
+    
+    try:
+        texts = [normalize_text_v23(p) for p in product_names]
+        
+        vectorizer = TfidfVectorizer(
+            analyzer='char',
+            ngram_range=(2, 5),
+            min_df=1,
+            max_df=0.95
+        )
+        
+        matrix = vectorizer.fit_transform(texts)
+        return vectorizer, matrix
+    except Exception as e:
+        logger.warning(f"TF-IDF構築エラー: {e}")
+        return None, None
+
+
+def find_similar_products_v23(
+    name: str, 
+    category: str, 
+    price: int, 
+    description: str,
+    target_audience: List[str] = None,
+    top_k: int = 20
+) -> List[Dict[str, Any]]:
+    """
+    【v23新機能】類似商品探索（TF-IDF + コサイン類似度）
+    
+    改善点:
+    - TF-IDF文字n-gramで類似度計算
+    - 価格・カテゴリ・ターゲット層を副次スコアに
+    - 日販を正しく計算（日次再集計+0埋め）
+    """
+    if not name or not name.strip():
+        return []
+    
+    if st.session_state.data_loader is None:
+        return []
+    
+    df_items = st.session_state.data_loader.load_item_sales()
+    
+    if df_items.empty:
+        return []
+    
+    # 商品の日販統計を正しく計算
+    product_stats = compute_product_daily_stats_v23(df_items)
+    
+    if not product_stats:
+        return []
+    
+    existing_products = list(product_stats.keys())
+    
+    # 検索テキストを構築
+    search_text = normalize_text_v23(name)
+    if description:
+        search_text += " " + normalize_text_v23(description)
+    
+    # TF-IDF類似度を計算
+    if SKLEARN_AVAILABLE:
+        try:
+            vectorizer, matrix = build_tfidf_matrix_cached(tuple(existing_products))
+            
+            if vectorizer is not None and matrix is not None:
+                search_vec = vectorizer.transform([search_text])
+                similarities = cosine_similarity(search_vec, matrix)[0]
+                method = 'tfidf'
+            else:
+                similarities = [calculate_jaccard_similarity_v23(search_text, normalize_text_v23(p)) 
+                              for p in existing_products]
+                method = 'jaccard'
+        except Exception as e:
+            logger.warning(f"TF-IDF計算エラー: {e}")
+            similarities = [calculate_jaccard_similarity_v23(search_text, normalize_text_v23(p)) 
+                          for p in existing_products]
+            method = 'jaccard'
+    elif RAPIDFUZZ_AVAILABLE:
+        similarities = [fuzz.token_set_ratio(search_text, normalize_text_v23(p)) / 100.0 
+                       for p in existing_products]
+        method = 'rapidfuzz'
+    else:
+        similarities = [calculate_jaccard_similarity_v23(search_text, normalize_text_v23(p)) 
+                       for p in existing_products]
+        method = 'jaccard'
+    
+    # カテゴリキーワード
+    category_keywords = {
+        "お守り": ["守", "お守り", "まもり", "御守"],
+        "御朱印": ["御朱印", "朱印"],
+        "御朱印帳": ["御朱印帳", "朱印帳"],
+        "おみくじ": ["おみくじ", "みくじ"],
+        "絵馬": ["絵馬"],
+        "お札": ["札", "お札", "御札"],
+        "縁起物": ["縁起", "だるま", "招き猫"],
+    }
+    
+    # ターゲット層キーワード
+    audience_keywords = {
+        "若い女性": ["縁結び", "恋愛", "美", "ピンク", "かわいい", "キュート"],
+        "若い男性": ["仕事", "勝", "出世", "金運"],
+        "中高年女性": ["健康", "長寿", "厄除け"],
+        "中高年男性": ["商売繁盛", "金運", "仕事"],
+        "家族連れ": ["安産", "子供", "学業", "合格"],
+        "観光客": ["御朱印", "限定", "記念"],
+    }
+    
+    # スコア統合
+    results = []
+    for i, (product, text_sim) in enumerate(zip(existing_products, similarities)):
+        stats = product_stats[product]
+        
+        # テキスト類似度 (60%)
+        score = text_sim * 0.60
+        
+        # 価格類似度 (25%)
+        if stats.get('unit_price', 0) > 0 and price > 0:
+            price_ratio = min(stats['unit_price'], price) / max(stats['unit_price'], price)
+            score += price_ratio * 0.25
+        
+        # カテゴリ一致 (10%)
+        cat_match = 0
+        cat_kws = category_keywords.get(category, [])
+        for kw in cat_kws:
+            if kw in product:
+                cat_match = 0.10
+                break
+        score += cat_match
+        
+        # ターゲット層一致 (5%)
+        audience_match = 0
+        if target_audience:
+            for aud in target_audience:
+                aud_kws = audience_keywords.get(aud, [])
+                for kw in aud_kws:
+                    if kw in product or (description and kw in description):
+                        audience_match = 0.05
+                        break
+                if audience_match > 0:
+                    break
+        score += audience_match
+        
+        # 販売実績がある商品のみ
+        if stats.get('total_qty', 0) > 0:
+            results.append({
+                'name': product,
+                'total_qty': stats['total_qty'],
+                'avg_daily': stats['avg_daily'],
+                'std_daily': stats.get('std_daily', 0),
+                'cv': stats.get('cv', 0),
+                'unit_price': stats.get('unit_price', 0),
+                'similarity': score * 100,  # パーセント表示
+                'text_similarity': text_sim,
+                'method': method
+            })
+    
+    # スコア順にソート
+    results.sort(key=lambda x: x['similarity'], reverse=True)
+    
+    return results[:top_k]
+
+
+def compute_product_daily_stats_v23(
+    df_items: pd.DataFrame,
+    product_names: List[str] = None
+) -> Dict[str, Dict[str, Any]]:
+    """
+    【v23新機能】日次再集計 + 0埋めで正しい日販を計算
+    """
+    if df_items is None or df_items.empty:
+        return {}
+    
+    df = df_items.copy()
+    df['date'] = pd.to_datetime(df['date'])
+    
+    if product_names is None:
+        product_names = df['商品名'].unique().tolist()
+    
+    date_min = df['date'].min()
+    date_max = df['date'].max()
+    all_dates = pd.date_range(start=date_min, end=date_max, freq='D')
+    total_days = len(all_dates)
+    
+    stats = {}
+    
+    for product in product_names:
+        product_df = df[df['商品名'] == product]
+        
+        if product_df.empty:
+            continue
+        
+        # 日別集計
+        daily = product_df.groupby('date').agg({
+            '販売商品数': 'sum',
+            '販売総売上': 'sum'
+        })
+        
+        # 全日付でreindex（欠損は0で埋める）
+        daily_full = daily.reindex(all_dates, fill_value=0)
+        
+        # 統計計算
+        total_qty = int(daily_full['販売商品数'].sum())
+        valid_days = len(daily_full)
+        active_days = int((daily_full['販売商品数'] > 0).sum())
+        
+        avg_daily = total_qty / valid_days if valid_days > 0 else 0.0
+        std_daily = float(daily_full['販売商品数'].std()) if valid_days > 1 else 0.0
+        max_daily = int(daily_full['販売商品数'].max()) if valid_days > 0 else 0
+        min_daily = int(daily_full['販売商品数'].min()) if valid_days > 0 else 0
+        cv = std_daily / avg_daily if avg_daily > 0 else 0.0
+        
+        # 単価計算
+        total_sales = daily_full['販売総売上'].sum()
+        unit_price = total_sales / total_qty if total_qty > 0 else 0
+        
+        stats[product] = {
+            'avg_daily': avg_daily,
+            'total_qty': total_qty,
+            'total_days': valid_days,
+            'active_days': active_days,
+            'std_daily': std_daily,
+            'max_daily': max_daily,
+            'min_daily': min_daily,
+            'cv': cv,
+            'unit_price': unit_price
+        }
+    
+    return stats
+
+
+# -----------------------------------------------------------------------------
+# 3. データから係数推定
+# -----------------------------------------------------------------------------
+
+def estimate_calendar_factors_from_similar_v23(
+    df_items: pd.DataFrame,
+    similar_products: List[Dict],
+    top_n: int = 10
+) -> Dict[str, Dict]:
+    """
+    【v23新機能】類似商品群から曜日・月・特別期間係数を推定
+    """
+    if df_items is None or df_items.empty or not similar_products:
+        return _get_default_factors_v23()
+    
+    # 上位N商品の名前を取得
+    top_products = [p['name'] for p in similar_products[:top_n]]
+    
+    df = df_items.copy()
+    df['date'] = pd.to_datetime(df['date'])
+    df = df[df['商品名'].isin(top_products)]
+    
+    if df.empty:
+        return _get_default_factors_v23()
+    
+    # 日別集計（合算）
+    daily = df.groupby('date')['販売商品数'].sum().reset_index()
+    daily['weekday'] = daily['date'].dt.dayofweek
+    daily['month'] = daily['date'].dt.month
+    
+    # 特別期間フラグ
+    def get_period_type(d):
+        d = pd.Timestamp(d)
+        if d.month == 1 and d.day <= 7:
+            return 'new_year'
+        if d.month == 8 and 13 <= d.day <= 16:
+            return 'obon'
+        if d.month == 11 and 10 <= d.day <= 20:
+            return 'shichigosan'
+        if d.month == 5 and 3 <= d.day <= 5:
+            return 'golden_week'
+        if d.month == 12 and d.day >= 28:
+            return 'year_end'
+        return 'normal'
+    
+    daily['period_type'] = daily['date'].apply(get_period_type)
+    
+    # 通常日のベースライン（中央値）
+    normal_df = daily[daily['period_type'] == 'normal']
+    if len(normal_df) > 0:
+        baseline = normal_df['販売商品数'].median()
+    else:
+        baseline = daily['販売商品数'].median()
+    
+    if baseline <= 0:
+        baseline = 1.0
+    
+    # 曜日係数
+    weekday_factors = {}
+    for wd in range(7):
+        wd_df = normal_df[normal_df['weekday'] == wd]
+        if len(wd_df) >= 3:
+            factor = wd_df['販売商品数'].median() / baseline
+        else:
+            # 土日は1.3、平日は1.0をデフォルト
+            factor = 1.3 if wd >= 5 else 1.0
+        weekday_factors[wd] = np.clip(factor, 0.3, 3.5)
+    
+    # 月係数
+    month_factors = {}
+    for m in range(1, 13):
+        m_df = normal_df[normal_df['month'] == m]
+        if len(m_df) >= 5:
+            factor = m_df['販売商品数'].median() / baseline
+        else:
+            factor = 1.0
+        month_factors[m] = np.clip(factor, 0.3, 3.5)
+    
+    # 特別期間係数
+    special_factors = {'normal': 1.0}
+    defaults = {
+        'new_year': 5.0,
+        'obon': 1.5,
+        'shichigosan': 1.3,
+        'golden_week': 1.3,
+        'year_end': 1.5
+    }
+    
+    for period in defaults.keys():
+        period_df = daily[daily['period_type'] == period]
+        if len(period_df) >= 2:
+            factor = period_df['販売商品数'].median() / baseline
+        else:
+            factor = defaults[period]
+        special_factors[period] = np.clip(factor, 0.5, 10.0)
+    
+    # 残差（CV）の計算
+    residuals = []
+    for _, row in daily.iterrows():
+        wd = row['weekday']
+        m = row['month']
+        pt = row['period_type']
+        
+        expected = baseline * weekday_factors[wd] * month_factors[m]
+        if pt != 'normal':
+            expected *= special_factors[pt]
+        
+        if expected > 0:
+            residuals.append(row['販売商品数'] / expected)
+    
+    cv = np.std(residuals) if residuals else 0.3
+    
+    return {
+        'weekday': weekday_factors,
+        'month': month_factors,
+        'special_periods': special_factors,
+        'baseline': baseline,
+        'cv': cv
+    }
+
+
+def _get_default_factors_v23() -> Dict:
+    """デフォルト係数（データがない場合のフォールバック）"""
+    return {
+        'weekday': {0: 1.0, 1: 1.0, 2: 1.0, 3: 1.0, 4: 1.0, 5: 1.3, 6: 1.3},
+        'month': {1: 2.5, 2: 0.8, 3: 0.9, 4: 0.9, 5: 1.0, 6: 0.8,
+                  7: 0.9, 8: 1.1, 9: 0.9, 10: 1.0, 11: 1.2, 12: 1.3},
+        'special_periods': {
+            'normal': 1.0,
+            'new_year': 5.0,
+            'obon': 1.5,
+            'shichigosan': 1.3,
+            'golden_week': 1.3,
+            'year_end': 1.5
+        },
+        'baseline': 1.0,
+        'cv': 0.3
+    }
+
+
+# -----------------------------------------------------------------------------
+# 4. 新規授与品予測（v23改善版）
+# -----------------------------------------------------------------------------
+
+def forecast_new_product_v23(
+    name: str, 
+    category: str, 
+    price: int,
+    similar_products: List[Dict], 
+    period_days: int,
+    order_mode: str = 'balanced'
+) -> Dict[str, Any]:
+    """
+    【v23新機能】新規授与品の需要予測
+    
+    改善点:
+    - 類似商品群から係数推定
+    - 統計的に正しいP50/P80/P90計算
+    - 丸め処理の後段化
+    - 分割発注提案
+    """
+    # データローダーからdf_itemsを取得
+    df_items = None
+    if st.session_state.data_loader is not None:
+        df_items = st.session_state.data_loader.load_item_sales()
+    
+    # 類似商品から係数推定
+    if similar_products and df_items is not None and not df_items.empty:
+        factors = estimate_calendar_factors_from_similar_v23(df_items, similar_products)
+        
+        # 類似商品の加重平均日販を計算
+        weighted_sum = sum(p['avg_daily'] * p['similarity'] for p in similar_products[:5])
+        weight_total = sum(p['similarity'] for p in similar_products[:5])
+        base_daily = weighted_sum / weight_total if weight_total > 0 else factors['baseline']
+        
+        # 変動係数
+        cv = factors['cv']
+    else:
+        factors = _get_default_factors_v23()
+        base_daily = CATEGORY_CHARACTERISTICS.get(category, {}).get('base_daily', 1.0)
+        cv = 0.3
+    
+    # 日次予測を生成（floatで保持）
+    daily_forecast_raw = []
+    
+    for i in range(period_days):
+        target_date = date.today() + timedelta(days=i)
+        month = target_date.month
+        weekday = target_date.weekday()
+        
+        # 期間タイプの判定
+        if target_date.month == 1 and target_date.day <= 7:
+            period_type = 'new_year'
+        elif target_date.month == 8 and 13 <= target_date.day <= 16:
+            period_type = 'obon'
+        elif target_date.month == 11 and 10 <= target_date.day <= 20:
+            period_type = 'shichigosan'
+        elif target_date.month == 5 and 3 <= target_date.day <= 5:
+            period_type = 'golden_week'
+        elif target_date.month == 12 and target_date.day >= 28:
+            period_type = 'year_end'
+        else:
+            period_type = 'normal'
+        
+        weekday_f = factors['weekday'].get(weekday, 1.0)
+        month_f = factors['month'].get(month, 1.0)
+        special_f = factors['special_periods'].get(period_type, 1.0)
+        
+        # 予測値（floatで保持）
+        pred_raw = base_daily * weekday_f * month_f * special_f
+        pred_raw = max(0.1, pred_raw)
+        
+        daily_forecast_raw.append({
+            'date': target_date,
+            'predicted_raw': pred_raw,
+            'predicted': int(round(pred_raw)),
+            'weekday_factor': weekday_f,
+            'month_factor': month_f,
+            'special_factor': special_f,
+            'period_type': period_type
+        })
+    
+    # 期間合計の分布を計算（統計的に正しいP値）
+    daily_values = np.array([d['predicted_raw'] for d in daily_forecast_raw])
+    daily_std = cv * np.mean(daily_values)
+    
+    distribution = calculate_period_total_distribution_v23(daily_values, daily_std)
+    
+    # 丸め処理は最終段階でのみ
+    p50_total = distribution['p50']
+    p80_total = distribution['p80']
+    p90_total = distribution['p90']
+    point_total = distribution['point_total']
+    
+    p50_rounded = round_up_to_50(int(round(p50_total)))
+    p80_rounded = round_up_to_50(int(round(p80_total)))
+    p90_rounded = round_up_to_50(int(round(p90_total)))
+    point_rounded = round_up_to_50(int(round(point_total)))
+    
+    # 発注モードに応じた推奨値
+    mode_map = {
+        'conservative': ('滞留回避（P50）', p50_rounded),
+        'balanced': ('バランス（P80）', p80_rounded),
+        'aggressive': ('欠品回避（P90）', p90_rounded)
+    }
+    recommended_label, recommended_qty = mode_map.get(order_mode, ('バランス（P80）', p80_rounded))
+    
+    # 分割発注提案
+    split_proposals = suggest_split_orders_v23(recommended_qty, period_days)
+    
+    # 月別集計
+    df_forecast = pd.DataFrame(daily_forecast_raw)
+    df_forecast['month'] = pd.to_datetime(df_forecast['date']).dt.to_period('M')
+    monthly = df_forecast.groupby('month')['predicted'].sum().to_dict()
+    
+    return {
+        'daily_forecast': daily_forecast_raw,
+        'point_total': point_total,
+        'point_total_rounded': point_rounded,
+        'p50_total': p50_total,
+        'p50_rounded': p50_rounded,
+        'p80_total': p80_total,
+        'p80_rounded': p80_rounded,
+        'p90_total': p90_total,
+        'p90_rounded': p90_rounded,
+        'recommended_qty': recommended_qty,
+        'recommended_label': recommended_label,
+        'order_mode': order_mode,
+        'avg_daily': point_total / period_days if period_days > 0 else 0,
+        'period_days': period_days,
+        'monthly': monthly,
+        'base_daily': base_daily,
+        'cv': cv,
+        'factors': factors,
+        'similar_count': len(similar_products),
+        'split_proposals': split_proposals
+    }
+
+
+def suggest_split_orders_v23(
+    total_qty: int,
+    forecast_days: int,
+    lead_time_days: int = 14,
+    min_order_qty: int = 50
+) -> List[Dict[str, Any]]:
+    """【v23新機能】分割発注の提案"""
+    proposals = []
+    
+    # 単発発注
+    proposals.append({
+        'type': 'single',
+        'description': '一括発注',
+        'orders': [{'timing': '即時', 'qty': total_qty, 'coverage_days': forecast_days}],
+        'total_qty': total_qty,
+        'risk_level': 'high' if total_qty > 1000 else 'medium'
+    })
+    
+    # 2分割発注
+    if forecast_days >= 60:
+        first_coverage = forecast_days // 2 + lead_time_days
+        daily_avg = total_qty / forecast_days
+        
+        first_qty = int(np.ceil(daily_avg * first_coverage / min_order_qty)) * min_order_qty
+        second_qty = total_qty - first_qty
+        second_qty = max(min_order_qty, int(np.ceil(second_qty / min_order_qty)) * min_order_qty)
+        
+        proposals.append({
+            'type': 'split_2',
+            'description': '2回分割発注（推奨）',
+            'orders': [
+                {'timing': '即時', 'qty': first_qty, 'coverage_days': first_coverage},
+                {'timing': f'{forecast_days // 2 - lead_time_days}日後', 'qty': second_qty, 
+                 'coverage_days': forecast_days - first_coverage + lead_time_days}
+            ],
+            'total_qty': first_qty + second_qty,
+            'risk_level': 'low'
+        })
+    
+    # 3分割発注
+    if forecast_days >= 120:
+        interval = forecast_days // 3
+        daily_avg = total_qty / forecast_days
+        
+        orders = []
+        remaining = total_qty
+        for i in range(3):
+            coverage = interval + lead_time_days if i < 2 else forecast_days - interval * 2
+            qty = int(np.ceil(daily_avg * coverage / min_order_qty)) * min_order_qty
+            qty = min(qty, remaining)
+            remaining -= qty
+            
+            timing = '即時' if i == 0 else f'{interval * i - lead_time_days}日後'
+            orders.append({'timing': timing, 'qty': qty, 'coverage_days': coverage})
+        
+        proposals.append({
+            'type': 'split_3',
+            'description': '3回分割発注',
+            'orders': orders,
+            'total_qty': sum(o['qty'] for o in orders),
+            'risk_level': 'very_low'
+        })
+    
+    return proposals
+
+
+# -----------------------------------------------------------------------------
+# 5. 拡張バックテスト
+# -----------------------------------------------------------------------------
+
+def run_new_product_backtest_v23(
+    df_items: pd.DataFrame,
+    n_samples: int = 20,
+    test_period_days: int = 90
+) -> Dict[str, Any]:
+    """
+    【v23新機能】新規授与品予測ロジックのバックテスト
+    
+    既存商品を「新規扱い」して予測し、実績と比較。
+    """
+    if df_items is None or df_items.empty:
+        return {'available': False, 'message': 'データなし'}
+    
+    df = df_items.copy()
+    df['date'] = pd.to_datetime(df['date'])
+    
+    # 商品ごとの販売数を集計
+    product_totals = df.groupby('商品名')['販売商品数'].sum()
+    
+    # 十分なデータがある商品を抽出（最低100個以上）
+    valid_products = product_totals[product_totals >= 100].index.tolist()
+    
+    if len(valid_products) < 5:
+        return {'available': False, 'message': f'十分なデータのある商品が少なすぎます（{len(valid_products)}件）'}
+    
+    # サンプリング
+    np.random.seed(42)
+    test_products = np.random.choice(valid_products, min(n_samples, len(valid_products)), replace=False)
+    
+    results = []
+    p80_hits = 0
+    p90_hits = 0
+    
+    for product in test_products:
+        # この商品を「新規」として、他の商品から予測
+        other_products = [p for p in valid_products if p != product]
+        
+        if not other_products:
+            continue
+        
+        # 類似商品を探す（この商品を除いたデータで）
+        product_stats = compute_product_daily_stats_v23(df[df['商品名'].isin(other_products)])
+        
+        # 簡易的な類似度計算（名前のJaccard類似度のみ）
+        similar = []
+        for other in other_products:
+            sim = calculate_jaccard_similarity_v23(product, other) * 100
+            if sim > 5:
+                stats = product_stats.get(other, {})
+                if stats.get('total_qty', 0) > 0:
+                    similar.append({
+                        'name': other,
+                        'similarity': sim,
+                        'avg_daily': stats.get('avg_daily', 1),
+                        'std_daily': stats.get('std_daily', 0),
+                        'cv': stats.get('cv', 0.3)
+                    })
+        
+        similar.sort(key=lambda x: x['similarity'], reverse=True)
+        
+        # 予測
+        factors = estimate_calendar_factors_from_similar_v23(
+            df[df['商品名'].isin(other_products)], 
+            similar[:10]
+        )
+        
+        if similar:
+            weighted_sum = sum(p['avg_daily'] * p['similarity'] for p in similar[:5])
+            weight_total = sum(p['similarity'] for p in similar[:5])
+            base_daily = weighted_sum / weight_total if weight_total > 0 else factors['baseline']
+        else:
+            base_daily = factors['baseline']
+        
+        cv = factors['cv']
+        predicted_total = base_daily * test_period_days
+        p80_estimate = predicted_total * (1 + 0.84 * cv)
+        p90_estimate = predicted_total * (1 + 1.28 * cv)
+        
+        # 実績
+        product_df = df[df['商品名'] == product]
+        daily = product_df.groupby('date')['販売商品数'].sum()
+        
+        if len(daily) >= test_period_days:
+            actual_total = daily.iloc[:test_period_days].sum()
+        else:
+            actual_total = daily.sum()
+        
+        # 誤差計算
+        if actual_total > 0:
+            mape = abs(predicted_total - actual_total) / actual_total * 100
+        else:
+            mape = 100
+        
+        if actual_total <= p80_estimate:
+            p80_hits += 1
+        if actual_total <= p90_estimate:
+            p90_hits += 1
+        
+        results.append({
+            'product': product,
+            'predicted': predicted_total,
+            'p80': p80_estimate,
+            'p90': p90_estimate,
+            'actual': actual_total,
+            'mape': mape,
+            'similar_count': len(similar)
+        })
+    
+    if not results:
+        return {'available': False, 'message': 'バックテスト実行不可'}
+    
+    avg_mape = np.mean([r['mape'] for r in results])
+    n_tests = len(results)
+    
+    return {
+        'available': True,
+        'results': results,
+        'avg_mape': avg_mape,
+        'p80_coverage': p80_hits / n_tests,
+        'p90_coverage': p90_hits / n_tests,
+        'n_tests': n_tests
+    }
+
+
+# -----------------------------------------------------------------------------
+# 6. 強化されたファクトチェックプロンプト
+# -----------------------------------------------------------------------------
+
+def generate_enhanced_factcheck_prompt_new_product_v23(
+    product_name: str,
+    category: str,
+    price: int,
+    result: Dict[str, Any],
+    similar_products: List[Dict]
+) -> str:
+    """【v23新機能】新規授与品予測用の強化ファクトチェックプロンプト"""
+    
+    # 類似商品情報
+    similar_section = "■ 類似商品（上位5件）:\n"
+    if similar_products:
+        for i, p in enumerate(similar_products[:5], 1):
+            similar_section += f"  {i}. {p['name']} - 日販{p['avg_daily']:.1f}体, 類似度{p['similarity']:.0f}%\n"
+    else:
+        similar_section += "  （類似商品なし - カテゴリ平均を使用）\n"
+    
+    # 係数情報
+    factors = result.get('factors', {})
+    factors_section = "■ 使用した係数:\n"
+    factors_section += f"  - ベース日販: {result.get('base_daily', 0):.2f}体/日\n"
+    factors_section += f"  - 変動係数(CV): {result.get('cv', 0):.2%}\n"
+    factors_section += f"  - 正月係数: {factors.get('special_periods', {}).get('new_year', 'N/A')}\n"
+    
+    # 分割発注提案
+    split_section = ""
+    if result.get('split_proposals'):
+        split_section = "\n■ 分割発注提案:\n"
+        for proposal in result['split_proposals']:
+            split_section += f"  【{proposal['description']}】リスク: {proposal['risk_level']}\n"
+            for order in proposal['orders']:
+                split_section += f"    - {order['timing']}: {order['qty']:,}体（{order['coverage_days']}日分）\n"
+    
+    prompt = f"""【新規授与品 需要予測ファクトチェック依頼】
+
+■ 基本情報:
+- 商品名: {product_name}
+- カテゴリ: {category}
+- 価格: ¥{price:,}
+- 予測期間: {result.get('period_days', 0)}日間
+- 類似商品数: {result.get('similar_count', 0)}件
+
+{similar_section}
+{factors_section}
+■ 予測結果（統計的分位点）:
+- 点推定（平均）: {result.get('point_total', 0):,.0f}体 → 丸め後: {result.get('point_total_rounded', 0):,}体
+- 滞留回避（P50）: {result.get('p50_total', 0):,.0f}体 → 丸め後: {result.get('p50_rounded', 0):,}体
+- バランス（P80）: {result.get('p80_total', 0):,.0f}体 → 丸め後: {result.get('p80_rounded', 0):,}体
+- 欠品回避（P90）: {result.get('p90_total', 0):,.0f}体 → 丸め後: {result.get('p90_rounded', 0):,}体
+
+■ 推奨発注数:
+- モード: {result.get('recommended_label', 'N/A')}
+- 数量: {result.get('recommended_qty', 0):,}体
+- 予測売上: ¥{result.get('recommended_qty', 0) * price:,}
+
+■ 日販の検算:
+- 予測日販（平均）: {result.get('avg_daily', 0):.2f}体/日
+- ベース日販: {result.get('base_daily', 0):.2f}体/日
+- P80日販換算: {result.get('p80_rounded', 0) / result.get('period_days', 1):.2f}体/日
+{split_section}
+■ 検証依頼:
+1. 類似商品の選定は妥当ですか？
+2. 予測値（P80: {result.get('p80_rounded', 0):,}体）は現実的ですか？
+3. 新規商品のため不確実性が高いですが、P90で発注すべきですか？
+4. 分割発注は検討すべきですか？
+
+【出力形式】
+1. 検算結果（OK/誤りあり）
+2. 妥当性判定（妥当/要修正/却下）
+3. 推奨発注数（あなたの見解）
+4. リスク分析
+5. 追加確認事項
+"""
+    
+    return prompt
+
+
+
+
 
 # =============================================================================
 # ファクトチェック用プロンプト生成
@@ -8386,7 +9319,429 @@ def display_inventory_chart(sim_data: List[Dict], min_stock: int):
 # =============================================================================
 
 def render_new_product_forecast():
-    """新規授与品の需要予測"""
+    """
+    【v23改善版】新規授与品の需要予測
+    
+    改善点:
+    - TF-IDF類似度による類似商品探索
+    - 日販の正しい計算（日次再集計+0埋め）
+    - データからの係数推定
+    - 統計的に正しいP50/P80/P90計算
+    - 分割発注提案
+    - バックテスト機能
+    """
+    
+    st.markdown("""
+    <div class="new-product-card">
+        <h2>✨ 新規授与品の需要予測（v23改善版）</h2>
+        <p>まだ販売実績のない新しい授与品の需要を、類似商品のデータから予測します。</p>
+        <p style="font-size: 0.9em; opacity: 0.9;">🆕 TF-IDF類似度、統計的P値計算、分割発注提案に対応</p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # タブで機能を分割
+    tab1, tab2 = st.tabs(["📊 需要予測", "🧪 精度検証（バックテスト）"])
+    
+    with tab1:
+        st.markdown('<p class="section-header">① 新規授与品の情報を入力</p>', unsafe_allow_html=True)
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            new_product_name = st.text_input(
+                "授与品名",
+                placeholder="例: 縁結び水晶守",
+                help="新しく作る授与品の名前",
+                key="v23_new_product_name"
+            )
+            
+            new_product_category = st.selectbox(
+                "カテゴリー",
+                list(CATEGORY_CHARACTERISTICS.keys()),
+                help="最も近いカテゴリーを選んでください",
+                key="v23_new_product_category"
+            )
+            
+            new_product_price = st.number_input(
+                "価格（円）",
+                min_value=100,
+                max_value=50000,
+                value=1000,
+                step=100,
+                help="販売予定価格",
+                key="v23_new_product_price"
+            )
+        
+        with col2:
+            new_product_description = st.text_area(
+                "特徴・コンセプト",
+                placeholder="例: 水晶を使用した縁結びのお守り。若い女性向け。",
+                help="授与品の特徴を記述（類似商品の検索精度が向上します）",
+                key="v23_new_product_description"
+            )
+            
+            target_audience = st.multiselect(
+                "ターゲット層",
+                ["若い女性", "若い男性", "中高年女性", "中高年男性", "家族連れ", "観光客", "地元の方"],
+                default=["若い女性", "観光客"],
+                key="v23_target_audience"
+            )
+        
+        st.markdown('<p class="section-header">② 類似商品を分析</p>', unsafe_allow_html=True)
+        
+        if new_product_name and new_product_name.strip():
+            with st.spinner("類似商品を検索中..."):
+                similar_products = find_similar_products_v23(
+                    new_product_name, 
+                    new_product_category, 
+                    new_product_price,
+                    new_product_description,
+                    target_audience
+                )
+            
+            if similar_products:
+                method_used = similar_products[0].get('method', 'unknown')
+                st.write(f"**類似商品が {len(similar_products)} 件見つかりました**（検索方法: {method_used}）")
+                
+                # 詳細テーブル
+                with st.expander("📋 類似商品の詳細", expanded=True):
+                    table_data = []
+                    for i, prod in enumerate(similar_products[:10], 1):
+                        table_data.append({
+                            '順位': i,
+                            '商品名': prod['name'],
+                            '日販': f"{prod['avg_daily']:.1f}体",
+                            '変動係数': f"{prod.get('cv', 0):.1%}",
+                            '類似度': f"{prod['similarity']:.0f}%"
+                        })
+                    
+                    df_similar = pd.DataFrame(table_data)
+                    st.dataframe(df_similar, use_container_width=True, hide_index=True)
+            else:
+                st.warning("⚠️ 類似商品が見つかりませんでした。カテゴリーの平均値から予測します。")
+        else:
+            similar_products = []
+            st.info("👆 授与品名を入力すると、類似商品を検索します")
+        
+        st.markdown('<p class="section-header">③ 需要予測</p>', unsafe_allow_html=True)
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            forecast_period = st.selectbox(
+                "予測期間",
+                ["1ヶ月", "3ヶ月", "6ヶ月", "1年"],
+                index=2,
+                key="v23_forecast_period"
+            )
+        
+        with col2:
+            order_mode = st.selectbox(
+                "発注モード",
+                ["滞留回避（P50）", "バランス（P80）★推奨", "欠品回避（P90）"],
+                index=1,
+                help="P50=50%信頼区間、P80=80%信頼区間、P90=90%信頼区間",
+                key="v23_order_mode"
+            )
+        
+        with col3:
+            lead_time = st.number_input(
+                "リードタイム（日）",
+                min_value=1,
+                max_value=90,
+                value=14,
+                help="発注から納品までの日数（分割発注提案に使用）",
+                key="v23_lead_time"
+            )
+        
+        # モードの変換
+        mode_map = {
+            "滞留回避（P50）": "conservative",
+            "バランス（P80）★推奨": "balanced",
+            "欠品回避（P90）": "aggressive"
+        }
+        selected_mode = mode_map.get(order_mode, "balanced")
+        
+        # 期間の変換
+        period_days = {"1ヶ月": 30, "3ヶ月": 90, "6ヶ月": 180, "1年": 365}[forecast_period]
+        
+        if st.button("🔮 新規授与品の需要を予測", type="primary", use_container_width=True, key="v23_forecast_btn"):
+            if not new_product_name or not new_product_name.strip():
+                st.error("授与品名を入力してください")
+            else:
+                with st.spinner("予測中...（統計的分位点を計算しています）"):
+                    forecast_result = forecast_new_product_v23(
+                        new_product_name,
+                        new_product_category,
+                        new_product_price,
+                        similar_products,
+                        period_days,
+                        selected_mode
+                    )
+                    
+                    # 結果をsession_stateに保存
+                    st.session_state['v23_new_product_result'] = forecast_result
+                    st.session_state['v23_new_product_info'] = {
+                        'name': new_product_name,
+                        'category': new_product_category,
+                        'price': new_product_price,
+                        'similar_products': similar_products
+                    }
+        
+        # 結果表示
+        if st.session_state.get('v23_new_product_result'):
+            result = st.session_state['v23_new_product_result']
+            info = st.session_state.get('v23_new_product_info', {})
+            
+            display_new_product_forecast_v23(
+                result, 
+                info.get('name', ''),
+                info.get('price', 0),
+                info.get('similar_products', [])
+            )
+    
+    with tab2:
+        render_new_product_backtest_v23()
+
+
+def display_new_product_forecast_v23(result: dict, product_name: str, price: int, similar_products: list):
+    """【v23改善版】新規授与品の予測結果を表示"""
+    
+    st.success("✅ 予測完了！")
+    
+    st.write(f"### 📦 「{product_name}」の需要予測")
+    
+    # 信頼度表示
+    similar_count = result.get('similar_count', 0)
+    if similar_count >= 5:
+        st.info(f"📊 類似商品 {similar_count} 件のデータを基に予測しました。信頼度: ⭐⭐⭐")
+    elif similar_count >= 2:
+        st.warning(f"📊 類似商品 {similar_count} 件のデータを基に予測しました。信頼度: ⭐⭐")
+    else:
+        st.warning("📊 類似商品が少ないため、カテゴリーの平均値から予測しました。信頼度: ⭐")
+    
+    # メイン指標
+    st.write("#### 🎯 推奨発注数")
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.metric(
+            "📉 滞留回避（P50）",
+            f"{result.get('p50_rounded', 0):,}体",
+            help="50%の確率で需要を満たす数量"
+        )
+    
+    with col2:
+        st.metric(
+            "⚖️ バランス（P80）★推奨",
+            f"{result.get('p80_rounded', 0):,}体",
+            help="80%の確率で需要を満たす数量"
+        )
+    
+    with col3:
+        st.metric(
+            "🛡️ 欠品回避（P90）",
+            f"{result.get('p90_rounded', 0):,}体",
+            help="90%の確率で需要を満たす数量"
+        )
+    
+    # 選択されたモードをハイライト
+    st.info(f"""
+    📌 **選択モード: {result.get('recommended_label', 'N/A')}**
+    - 推奨発注数: **{result.get('recommended_qty', 0):,}体**
+    - 予測売上: ¥{result.get('recommended_qty', 0) * price:,}
+    - 予測日販: {result.get('avg_daily', 0):.1f}体/日
+    """)
+    
+    # 統計情報
+    with st.expander("📈 予測の詳細", expanded=False):
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.write("**予測パラメータ**")
+            st.write(f"- 予測期間: {result.get('period_days', 0)}日間")
+            st.write(f"- ベース日販: {result.get('base_daily', 0):.2f}体/日")
+            st.write(f"- 変動係数(CV): {result.get('cv', 0):.1%}")
+            st.write(f"- 類似商品数: {result.get('similar_count', 0)}件")
+        
+        with col2:
+            st.write("**未丸め値（検算用）**")
+            st.write(f"- 点推定: {result.get('point_total', 0):,.1f}体")
+            st.write(f"- P50: {result.get('p50_total', 0):,.1f}体")
+            st.write(f"- P80: {result.get('p80_total', 0):,.1f}体")
+            st.write(f"- P90: {result.get('p90_total', 0):,.1f}体")
+    
+    # 月別予測グラフ
+    monthly_data = []
+    if result.get('monthly') and isinstance(result['monthly'], dict):
+        for period, qty in result['monthly'].items():
+            monthly_data.append({'月': str(period), '予測販売数': qty})
+    
+    if monthly_data:
+        st.write("#### 📅 月別予測")
+        df_monthly = pd.DataFrame(monthly_data)
+        
+        fig = px.bar(
+            df_monthly, x='月', y='予測販売数',
+            title='月別予測販売数',
+            color='予測販売数',
+            color_continuous_scale='Blues'
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    
+    # 分割発注提案
+    st.write("#### 🚚 発注戦略の提案")
+    
+    split_proposals = result.get('split_proposals', [])
+    if split_proposals:
+        for proposal in split_proposals:
+            risk_color = {
+                'very_low': '🟢',
+                'low': '🟢',
+                'medium': '🟡',
+                'high': '🔴'
+            }.get(proposal['risk_level'], '⚪')
+            
+            with st.expander(f"{risk_color} {proposal['description']} - 合計{proposal['total_qty']:,}体", expanded=(proposal['type'] == 'split_2')):
+                for order in proposal['orders']:
+                    st.write(f"- **{order['timing']}**: {order['qty']:,}体（{order['coverage_days']}日分カバー）")
+                
+                if proposal['type'] == 'split_2':
+                    st.success("✅ 分割発注により、欠品リスクと滞留リスクの両方を軽減できます")
+    
+    # ファクトチェックプロンプト
+    with st.expander("🔍 ファクトチェック用プロンプト", expanded=False):
+        prompt = generate_enhanced_factcheck_prompt_new_product_v23(
+            product_name,
+            st.session_state.get('v23_new_product_info', {}).get('category', ''),
+            price,
+            result,
+            similar_products
+        )
+        
+        st.markdown("""
+        <div style="background-color: #fff3cd; padding: 10px; border-radius: 5px; margin-bottom: 10px;">
+            <strong>💡 使い方:</strong> 下のテキストを選択してコピー（Ctrl+A → Ctrl+C）し、
+            ChatGPT、Claude、Geminiなどに貼り付けて検証してもらってください。
+        </div>
+        """, unsafe_allow_html=True)
+        
+        st.text_area(
+            "プロンプト",
+            value=prompt,
+            height=400,
+            key="v23_factcheck_prompt",
+            label_visibility="collapsed"
+        )
+
+
+def render_new_product_backtest_v23():
+    """【v23新機能】新規授与品予測ロジックのバックテスト"""
+    
+    st.markdown('<p class="section-header">🧪 新規予測ロジックの精度検証</p>', unsafe_allow_html=True)
+    
+    st.markdown("""
+    既存の商品を「新規商品」として扱い、予測ロジックの精度を検証します。
+    これにより、新規授与品予測の信頼性を定量的に評価できます。
+    """)
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        n_samples = st.slider(
+            "テスト商品数",
+            min_value=5,
+            max_value=50,
+            value=20,
+            help="バックテストに使用する商品数",
+            key="v23_backtest_samples"
+        )
+    
+    with col2:
+        test_period = st.slider(
+            "テスト期間（日）",
+            min_value=30,
+            max_value=180,
+            value=90,
+            help="予測精度を検証する期間",
+            key="v23_backtest_period"
+        )
+    
+    if st.button("🚀 バックテストを実行", type="primary", key="v23_run_backtest"):
+        if st.session_state.data_loader is None:
+            st.error("データが読み込まれていません")
+            return
+        
+        df_items = st.session_state.data_loader.load_item_sales()
+        
+        if df_items.empty:
+            st.error("売上データがありません")
+            return
+        
+        with st.spinner(f"バックテスト実行中... ({n_samples}商品 × {test_period}日)"):
+            backtest_result = run_new_product_backtest_v23(
+                df_items,
+                n_samples=n_samples,
+                test_period_days=test_period
+            )
+        
+        if not backtest_result.get('available'):
+            st.warning(f"⚠️ {backtest_result.get('message', 'バックテスト実行不可')}")
+            return
+        
+        st.success(f"✅ バックテスト完了！（{backtest_result['n_tests']}商品をテスト）")
+        
+        # サマリー
+        st.write("### 📊 精度サマリー")
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            mape = backtest_result.get('avg_mape', 0)
+            mape_color = "🟢" if mape < 30 else "🟡" if mape < 50 else "🔴"
+            st.metric(f"{mape_color} 平均MAPE", f"{mape:.1f}%")
+        
+        with col2:
+            p80_cov = backtest_result.get('p80_coverage', 0)
+            p80_color = "🟢" if p80_cov >= 0.75 else "🟡" if p80_cov >= 0.60 else "🔴"
+            st.metric(f"{p80_color} P80カバレッジ", f"{p80_cov:.1%}", help="目標: 80%")
+        
+        with col3:
+            p90_cov = backtest_result.get('p90_coverage', 0)
+            p90_color = "🟢" if p90_cov >= 0.85 else "🟡" if p90_cov >= 0.75 else "🔴"
+            st.metric(f"{p90_color} P90カバレッジ", f"{p90_cov:.1%}", help="目標: 90%")
+        
+        # 解釈
+        if mape < 30 and p80_cov >= 0.75:
+            st.success("✅ 予測精度は良好です。P80での発注が推奨されます。")
+        elif mape < 50 and p80_cov >= 0.60:
+            st.warning("⚠️ 予測精度は許容範囲ですが、P90での発注を検討してください。")
+        else:
+            st.error("❌ 予測精度が低いです。類似商品の選定基準を見直すか、P90での発注を強く推奨します。")
+        
+        # 詳細テーブル
+        with st.expander("📋 商品別の結果", expanded=False):
+            results = backtest_result.get('results', [])
+            if results:
+                table_data = []
+                for r in results:
+                    table_data.append({
+                        '商品名': r['product'][:20] + '...' if len(r['product']) > 20 else r['product'],
+                        '予測': f"{r['predicted']:,.0f}",
+                        'P80': f"{r['p80']:,.0f}",
+                        '実績': f"{r['actual']:,.0f}",
+                        'MAPE': f"{r['mape']:.1f}%",
+                        '類似商品数': r['similar_count']
+                    })
+                
+                df_results = pd.DataFrame(table_data)
+                st.dataframe(df_results, use_container_width=True, hide_index=True)
+
+
+
+def render_new_product_forecast_legacy():
+    """新規授与品の需要予測（レガシー版 - v23以前の互換用）"""
     
     st.markdown("""
     <div class="new-product-card">
@@ -8924,7 +10279,7 @@ def main():
     st.divider()
     
     # バージョン情報（v20更新）
-    version_info = "v22.5 (商品別予測表示版)"
+    version_info = "v23 (精度改善版: TF-IDF類似度, 統計的P値, 分割発注提案)"
     if VERTEX_AI_AVAILABLE:
         version_info += " | 🚀 Vertex AI: 有効"
     else:
