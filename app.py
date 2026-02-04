@@ -3834,12 +3834,24 @@ def forecast_all_methods_unified_v22(
     # 【v22.5】実績データの統計を計算（妥当性チェック用）
     actual_mean = df['販売商品数'].mean() if '販売商品数' in df.columns else 0
     actual_max = df['販売商品数'].max() if '販売商品数' in df.columns else 0
+    actual_median = df['販売商品数'].median() if '販売商品数' in df.columns else 0
     data_days = len(df)
     
-    # 妥当性チェック用の上限値を計算（v22.5で閾値をさらに厳格化）
-    # 予測期間の合計が、実績平均の3倍 × 予測日数 を超えたら異常とみなす
-    # 下限も5,000に引き下げ（お守りの場合、180日で5,000体以上は異常の可能性が高い）
-    max_reasonable_total = max(actual_mean * periods * 3, actual_max * periods * 2, 5000)
+    # 【v23.2修正】妥当性チェック用の上限値をより厳格に計算
+    # 基本: 実績平均 × 予測日数 × 2.5（最大でも2.5倍まで）
+    # 外れ値の影響を受けにくいよう、maxではなく中央値ベースで計算
+    base_expected = actual_mean * periods
+    
+    # 上限は以下の小さい方:
+    # 1. 実績平均ベース × 2.5
+    # 2. 実績中央値ベース × 3.0（外れ値の影響を受けにくい）
+    # ただし、最低5,000体は確保（データが少ない場合のため）
+    limit_from_mean = actual_mean * periods * 2.5
+    limit_from_median = actual_median * periods * 3.0
+    max_reasonable_total = max(min(limit_from_mean, limit_from_median), 5000)
+    
+    # 【v23.2追加】実績ベースの基準値（後で比較用）
+    expected_total = actual_mean * periods
     
     # 各モードで精度強化版を実行
     modes = ['conservative', 'balanced', 'aggressive']
@@ -4125,8 +4137,34 @@ def calculate_final_recommendation_v22(
     
     # 実績との比較（あれば）
     actual_avg = 0
+    data_days = 0
+    is_anomaly = False
+    anomaly_ratio = 1.0
+    
     if sales_data is not None and not sales_data.empty:
         actual_avg = sales_data['販売商品数'].mean()
+        data_days = len(sales_data)
+        
+        # 【v23.2追加】最終サニティチェック
+        # 予測日数をsession_stateから取得（デフォルト90日）
+        forecast_days = st.session_state.get('v22_forecast_days', 90)
+        
+        # balancedの予測日販を計算
+        if forecast_days > 0 and actual_avg > 0:
+            predicted_daily = final_totals['balanced'] / forecast_days
+            anomaly_ratio = predicted_daily / actual_avg
+            
+            # 予測が実績の2.5倍を超えている場合は異常の可能性
+            if anomaly_ratio > 2.5:
+                is_anomaly = True
+                logger.warning(f"最終推奨値が実績の{anomaly_ratio:.1f}倍で異常の可能性あり（予測日販: {predicted_daily:.1f}, 実績日販: {actual_avg:.1f}）")
+                
+                # 【v23.2修正】異常な予測を実績ベースに補正
+                # 実績平均 × 予測日数 × 安全係数(1.5)
+                corrected_base = actual_avg * forecast_days * 1.5
+                final_totals['conservative'] = round_up_to_50(int(corrected_base * 0.8))
+                final_totals['balanced'] = round_up_to_50(int(corrected_base))
+                final_totals['aggressive'] = round_up_to_50(int(corrected_base * 1.3))
     
     return {
         'conservative': {
@@ -8844,6 +8882,9 @@ def render_individual_forecast_section():
         trend_window_days = params['trend_window_days']
         stockout_periods = params.get('stockout_periods')
         
+        # 【v23.2】予測日数をsession_stateに保存（異常値チェック用）
+        st.session_state['v22_forecast_days'] = forecast_days
+        
         with st.spinner("全予測方法で予測中..."):
             all_products_results = {}
             product_names = list(st.session_state.individual_sales_data.keys())
@@ -10968,7 +11009,7 @@ def main():
     st.divider()
     
     # バージョン情報（v20更新）
-    version_info = "v23.2 (手動参考商品選択・同名優先・予測内訳表示)"
+    version_info = "v23.2.1 (異常値検出強化・手動参考商品選択・予測内訳表示)"
     if VERTEX_AI_AVAILABLE:
         version_info += " | 🚀 Vertex AI: 有効"
     else:
