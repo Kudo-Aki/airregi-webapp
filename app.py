@@ -4711,6 +4711,409 @@ def find_similar_products_v23(
     return results[:top_k]
 
 
+# =============================================================================
+# v23.2 新規授与品予測の改善（手動選択、同名優先、予測内訳表示）
+# =============================================================================
+
+def get_base_name_v23_2(product_name: str) -> str:
+    """
+    【v23.2】商品名からベース名を抽出（型番や色を除く）
+    例: 「椿守 アクリル型」→「椿守」
+    """
+    # 【】内を除去
+    base = re.sub(r'【.*?】', '', product_name)
+    # 「アクリル型」「木札」などの型番を除去
+    base = re.sub(r'(アクリル型|アクリル|木札|金属|布製|大|小|特大|ミニ)', '', base)
+    # 色を除去
+    base = re.sub(r'(赤|青|黄|緑|白|黒|金|銀|ピンク|紫|水色|オレンジ)', '', base)
+    # 空白を除去して返す
+    return base.strip()
+
+
+def find_similar_products_v23_2(
+    name: str, 
+    category: str, 
+    price: int, 
+    description: str,
+    target_audience: List[str] = None,
+    top_k: int = 30
+) -> List[Dict[str, Any]]:
+    """
+    【v23.2改善版】類似商品探索（同名商品を最優先）
+    
+    改善点:
+    - 同名商品を最優先（「椿守 アクリル型」→「椿守」を自動上位）
+    - 固有キーワード一致度を重視
+    """
+    if not name or not name.strip():
+        return []
+    
+    if st.session_state.data_loader is None:
+        return []
+    
+    df_items = st.session_state.data_loader.load_item_sales()
+    
+    if df_items.empty:
+        return []
+    
+    # 商品の日販統計を正しく計算
+    product_stats = compute_product_daily_stats_v23(df_items)
+    
+    if not product_stats:
+        return []
+    
+    existing_products = list(product_stats.keys())
+    
+    # 商品名から固有キーワードを抽出
+    def extract_keywords(text: str) -> set:
+        """商品名から意味のあるキーワードを抽出"""
+        keywords = set()
+        # 漢字の連続（2文字以上）
+        keywords.update(re.findall(r'[\u4e00-\u9fff]{2,}', text))
+        # ひらがなの連続（2文字以上）
+        keywords.update(re.findall(r'[\u3040-\u309f]{2,}', text))
+        # カタカナの連続（2文字以上）
+        keywords.update(re.findall(r'[\u30a0-\u30ff]{2,}', text))
+        return keywords
+    
+    search_base_name = get_base_name_v23_2(name)
+    search_keywords = extract_keywords(name)
+    if description:
+        search_keywords.update(extract_keywords(description))
+    
+    # カテゴリキーワード
+    category_keywords = {
+        "お守り": ["守", "お守り", "まもり", "御守"],
+        "御朱印": ["御朱印", "朱印"],
+        "御朱印帳": ["御朱印帳", "朱印帳"],
+        "おみくじ": ["おみくじ", "みくじ"],
+        "絵馬": ["絵馬"],
+        "お札": ["札", "お札", "御札"],
+        "縁起物": ["縁起", "だるま", "招き猫"],
+    }
+    
+    # スコア計算
+    results = []
+    for product in existing_products:
+        stats = product_stats[product]
+        
+        if stats.get('total_qty', 0) <= 0:
+            continue
+        
+        product_base_name = get_base_name_v23_2(product)
+        product_keywords = extract_keywords(product)
+        
+        # 【v23.2】同名商品ボーナス（最優先）
+        same_name_bonus = 0
+        same_name_reason = ''
+        if search_base_name and product_base_name:
+            # 完全一致
+            if search_base_name == product_base_name:
+                same_name_bonus = 0.50  # 50%ボーナス
+                same_name_reason = '同名商品（完全一致）'
+            # 部分一致（検索名がプロダクト名に含まれる、またはその逆）
+            elif search_base_name in product_base_name or product_base_name in search_base_name:
+                same_name_bonus = 0.35  # 35%ボーナス
+                same_name_reason = '同名商品（部分一致）'
+            # キーワードの半分以上が一致
+            elif search_keywords and product_keywords:
+                overlap = len(search_keywords & product_keywords)
+                if overlap >= len(search_keywords) * 0.5:
+                    same_name_bonus = 0.20  # 20%ボーナス
+                    same_name_reason = 'キーワード多数一致'
+        
+        # キーワード一致度 (25%)
+        keyword_score = 0
+        if search_keywords and product_keywords:
+            keyword_score = len(search_keywords & product_keywords) / len(search_keywords) if search_keywords else 0
+        
+        # 価格類似度 (15%)
+        price_score = 0
+        if stats.get('unit_price', 0) > 0 and price > 0:
+            price_score = min(stats['unit_price'], price) / max(stats['unit_price'], price)
+        
+        # カテゴリ一致 (10%)
+        cat_score = 0
+        cat_kws = category_keywords.get(category, [])
+        for kw in cat_kws:
+            if kw in product:
+                cat_score = 1.0
+                break
+        
+        # 総合スコア
+        score = (
+            same_name_bonus +           # 0-50%: 同名商品ボーナス
+            keyword_score * 0.25 +      # 0-25%: キーワード一致
+            price_score * 0.15 +        # 0-15%: 価格類似度
+            cat_score * 0.10            # 0-10%: カテゴリ一致
+        )
+        
+        results.append({
+            'name': product,
+            'total_qty': stats['total_qty'],
+            'avg_daily': stats['avg_daily'],
+            'std_daily': stats.get('std_daily', 0),
+            'cv': stats.get('cv', 0),
+            'unit_price': stats.get('unit_price', 0),
+            'similarity': score * 100,
+            'same_name_bonus': same_name_bonus * 100,
+            'same_name_reason': same_name_reason,
+            'keyword_match': len(search_keywords & product_keywords) if search_keywords and product_keywords else 0,
+            'base_name': product_base_name
+        })
+    
+    # スコア順にソート
+    results.sort(key=lambda x: x['similarity'], reverse=True)
+    
+    return results[:top_k]
+
+
+def forecast_new_product_v23_2(
+    name: str, 
+    category: str, 
+    price: int,
+    reference_products: List[Dict],  # 手動選択された参考商品
+    period_days: int,
+    order_mode: str = 'balanced'
+) -> Dict[str, Any]:
+    """
+    【v23.2改善版】新規授与品の需要予測
+    
+    改善点:
+    - 手動選択された参考商品を使用
+    - 予測内訳の詳細を返す
+    """
+    df_items = None
+    if st.session_state.data_loader is not None:
+        df_items = st.session_state.data_loader.load_item_sales()
+    
+    # 参考商品から係数推定
+    if reference_products and df_items is not None and not df_items.empty:
+        factors = estimate_calendar_factors_from_similar_v23(df_items, reference_products)
+        
+        # 参考商品の加重平均日販を計算
+        # 同名ボーナスが高い商品を重視
+        weighted_sum = 0
+        weight_total = 0
+        for p in reference_products:
+            # 同名ボーナスが高いほど重みを大きく
+            weight = 1.0 + (p.get('same_name_bonus', 0) / 100) * 2
+            weighted_sum += p['avg_daily'] * weight
+            weight_total += weight
+        
+        base_daily = weighted_sum / weight_total if weight_total > 0 else factors['baseline']
+        cv = min(factors['cv'], 1.0)  # CVを100%以下にクリップ
+    else:
+        factors = _get_default_factors_v23()
+        base_daily = CATEGORY_CHARACTERISTICS.get(category, {}).get('base_daily', 1.0)
+        cv = 0.3
+    
+    # 【v23.2】予測内訳を記録
+    daily_forecast_details = []
+    daily_forecast_raw = []
+    
+    for i in range(period_days):
+        target_date = date.today() + timedelta(days=i)
+        month = target_date.month
+        weekday = target_date.weekday()
+        
+        # 期間タイプの判定
+        if target_date.month == 1 and target_date.day <= 7:
+            period_type = 'new_year'
+            period_label = '正月'
+        elif target_date.month == 8 and 13 <= target_date.day <= 16:
+            period_type = 'obon'
+            period_label = 'お盆'
+        elif target_date.month == 11 and 10 <= target_date.day <= 20:
+            period_type = 'shichigosan'
+            period_label = '七五三'
+        elif target_date.month == 5 and 3 <= target_date.day <= 5:
+            period_type = 'golden_week'
+            period_label = 'GW'
+        elif target_date.month == 12 and target_date.day >= 28:
+            period_type = 'year_end'
+            period_label = '年末'
+        else:
+            period_type = 'normal'
+            period_label = '通常'
+        
+        weekday_f = factors['weekday'].get(weekday, 1.0)
+        month_f = factors['month'].get(month, 1.0)
+        special_f = factors['special_periods'].get(period_type, 1.0)
+        
+        # 予測値（floatで保持）
+        pred_raw = base_daily * weekday_f * month_f * special_f
+        pred_raw = max(0.1, pred_raw)
+        
+        daily_forecast_raw.append({
+            'date': target_date,
+            'predicted_raw': pred_raw,
+            'predicted': int(round(pred_raw)),
+            'weekday_factor': weekday_f,
+            'month_factor': month_f,
+            'special_factor': special_f,
+            'period_type': period_type
+        })
+        
+        # 最初の30日と特別期間の詳細を記録
+        if i < 30 or period_type != 'normal':
+            daily_forecast_details.append({
+                'date': target_date.strftime('%m/%d'),
+                'weekday': ['月', '火', '水', '木', '金', '土', '日'][weekday],
+                'base': base_daily,
+                'weekday_f': weekday_f,
+                'month_f': month_f,
+                'special_f': special_f,
+                'period': period_label,
+                'predicted': pred_raw
+            })
+    
+    # 期間合計の分布を計算
+    daily_values = np.array([d['predicted_raw'] for d in daily_forecast_raw])
+    daily_std = cv * np.mean(daily_values)
+    
+    distribution = calculate_period_total_distribution_v23(daily_values, daily_std)
+    
+    # 丸め処理
+    p50_total = distribution['p50']
+    p80_total = distribution['p80']
+    p90_total = distribution['p90']
+    point_total = distribution['point_total']
+    
+    p50_rounded = round_up_to_50(int(round(p50_total)))
+    p80_rounded = round_up_to_50(int(round(p80_total)))
+    p90_rounded = round_up_to_50(int(round(p90_total)))
+    point_rounded = round_up_to_50(int(round(point_total)))
+    
+    # 発注モードに応じた推奨値
+    mode_map = {
+        'conservative': ('滞留回避（P50）', p50_rounded),
+        'balanced': ('バランス（P80）', p80_rounded),
+        'aggressive': ('欠品回避（P90）', p90_rounded)
+    }
+    recommended_label, recommended_qty = mode_map.get(order_mode, ('バランス（P80）', p80_rounded))
+    
+    # 分割発注提案
+    split_proposals = suggest_split_orders_v23(recommended_qty, period_days)
+    
+    # 月別集計
+    df_forecast = pd.DataFrame(daily_forecast_raw)
+    df_forecast['month'] = pd.to_datetime(df_forecast['date']).dt.to_period('M')
+    monthly = df_forecast.groupby('month')['predicted'].sum().to_dict()
+    
+    # 【v23.2】係数サマリー
+    factor_summary = {
+        'weekday_avg': np.mean(list(factors['weekday'].values())),
+        'weekday_weekend': (factors['weekday'].get(5, 1.0) + factors['weekday'].get(6, 1.0)) / 2,
+        'weekday_weekday': np.mean([factors['weekday'].get(i, 1.0) for i in range(5)]),
+        'month_factors': factors['month'],
+        'special_factors': factors['special_periods'],
+        'baseline': factors['baseline']
+    }
+    
+    return {
+        'daily_forecast': daily_forecast_raw,
+        'daily_details': daily_forecast_details,  # 【v23.2】詳細内訳
+        'point_total': point_total,
+        'point_total_rounded': point_rounded,
+        'p50_total': p50_total,
+        'p50_rounded': p50_rounded,
+        'p80_total': p80_total,
+        'p80_rounded': p80_rounded,
+        'p90_total': p90_total,
+        'p90_rounded': p90_rounded,
+        'recommended_qty': recommended_qty,
+        'recommended_label': recommended_label,
+        'order_mode': order_mode,
+        'avg_daily': point_total / period_days if period_days > 0 else 0,
+        'period_days': period_days,
+        'monthly': monthly,
+        'base_daily': base_daily,
+        'cv': cv,
+        'factors': factors,
+        'factor_summary': factor_summary,  # 【v23.2】係数サマリー
+        'reference_count': len(reference_products),
+        'split_proposals': split_proposals
+    }
+
+
+def generate_factcheck_prompt_v23_2(
+    product_name: str,
+    category: str,
+    price: int,
+    result: Dict[str, Any],
+    reference_products: List[Dict]
+) -> str:
+    """【v23.2改善版】ファクトチェックプロンプト"""
+    
+    # 参考商品情報
+    ref_section = "■ 参考商品（手動/自動選択）:\n"
+    if reference_products:
+        for i, p in enumerate(reference_products[:5], 1):
+            bonus = "⭐同名" if p.get('same_name_bonus', 0) > 30 else ""
+            reason = p.get('same_name_reason', '')
+            ref_section += f"  {i}. {p['name']} {bonus}\n"
+            ref_section += f"     - 日販: {p['avg_daily']:.2f}体/日\n"
+            ref_section += f"     - 総販売数: {p['total_qty']:,}体\n"
+            if reason:
+                ref_section += f"     - 選定理由: {reason}\n"
+    else:
+        ref_section += "  （参考商品なし）\n"
+    
+    # 係数情報
+    factor_summary = result.get('factor_summary', {})
+    factors_section = f"""■ 使用した係数:
+  - ベース日販: {result.get('base_daily', 0):.2f}体/日
+  - 変動係数(CV): {result.get('cv', 0):.1%}
+  - 曜日係数（平日平均）: {factor_summary.get('weekday_weekday', 1.0):.2f}
+  - 曜日係数（土日平均）: {factor_summary.get('weekday_weekend', 1.0):.2f}
+  - 正月係数: {factor_summary.get('special_factors', {}).get('new_year', 'N/A')}"""
+    
+    # 検算
+    base = result.get('base_daily', 0)
+    days = result.get('period_days', 0)
+    simple_calc = base * days
+    
+    prompt = f"""【新規授与品 需要予測ファクトチェック依頼】
+
+■ 基本情報:
+- 商品名: {product_name}
+- カテゴリ: {category}
+- 価格: ¥{price:,}
+- 予測期間: {days}日間
+- 参考商品数: {result.get('reference_count', 0)}件
+
+{ref_section}
+{factors_section}
+
+■ 予測結果:
+- ベース計算: {base:.2f} × {days}日 = {simple_calc:.0f}体
+- 係数適用後（点推定）: {result.get('point_total', 0):,.0f}体
+- 滞留回避（P50）: {result.get('p50_rounded', 0):,}体
+- バランス（P80）: {result.get('p80_rounded', 0):,}体 ← 推奨
+- 欠品回避（P90）: {result.get('p90_rounded', 0):,}体
+
+■ 検算:
+- ベース日販 × 期間: {base:.2f} × {days} = {simple_calc:.0f}体
+- 予測との差: {result.get('point_total', 0) - simple_calc:+.0f}体（係数による増減）
+- 予測/ベースの倍率: {result.get('point_total', 0) / simple_calc if simple_calc > 0 else 0:.2f}倍
+
+■ 検証依頼:
+1. 参考商品の選定は妥当ですか？（同名商品があれば最優先すべき）
+2. ベース日販 {base:.2f}体/日 は参考商品の実績と整合していますか？
+3. 予測値 {result.get('p80_rounded', 0):,}体（{days}日間）は現実的ですか？
+4. 新規商品なので分割発注を検討すべきですか？
+
+【出力形式】
+1. 検算結果（OK/誤りあり）
+2. 妥当性判定（妥当/要修正/却下）
+3. あなたの推奨発注数
+4. リスク分析
+"""
+    
+    return prompt
+
+
 def compute_product_daily_stats_v23(
     df_items: pd.DataFrame,
     product_names: List[str] = None
@@ -9362,22 +9765,19 @@ def display_inventory_chart(sim_data: List[Dict], min_stock: int):
 
 def render_new_product_forecast():
     """
-    【v23改善版】新規授与品の需要予測
+    【v23.2改善版】新規授与品の需要予測
     
     改善点:
-    - TF-IDF類似度による類似商品探索
-    - 日販の正しい計算（日次再集計+0埋め）
-    - データからの係数推定
-    - 統計的に正しいP50/P80/P90計算
-    - 分割発注提案
-    - バックテスト機能
+    - 類似商品の手動選択機能
+    - 同名商品の最優先（「椿守 アクリル型」→「椿守」を自動1位）
+    - 予測内訳の詳細表示
     """
     
     st.markdown("""
     <div class="new-product-card">
-        <h2>✨ 新規授与品の需要予測（v23改善版）</h2>
+        <h2>✨ 新規授与品の需要予測（v23.2改善版）</h2>
         <p>まだ販売実績のない新しい授与品の需要を、類似商品のデータから予測します。</p>
-        <p style="font-size: 0.9em; opacity: 0.9;">🆕 TF-IDF類似度、統計的P値計算、分割発注提案に対応</p>
+        <p style="font-size: 0.9em; opacity: 0.9;">🆕 手動で参考商品を選択可能、予測内訳を詳細表示</p>
     </div>
     """, unsafe_allow_html=True)
     
@@ -9392,16 +9792,16 @@ def render_new_product_forecast():
         with col1:
             new_product_name = st.text_input(
                 "授与品名",
-                placeholder="例: 縁結び水晶守",
+                placeholder="例: 椿守 アクリル型",
                 help="新しく作る授与品の名前",
-                key="v23_new_product_name"
+                key="v23_2_new_product_name"
             )
             
             new_product_category = st.selectbox(
                 "カテゴリー",
                 list(CATEGORY_CHARACTERISTICS.keys()),
                 help="最も近いカテゴリーを選んでください",
-                key="v23_new_product_category"
+                key="v23_2_new_product_category"
             )
             
             new_product_price = st.number_input(
@@ -9411,61 +9811,118 @@ def render_new_product_forecast():
                 value=1000,
                 step=100,
                 help="販売予定価格",
-                key="v23_new_product_price"
+                key="v23_2_new_product_price"
             )
         
         with col2:
             new_product_description = st.text_area(
-                "特徴・コンセプト",
-                placeholder="例: 水晶を使用した縁結びのお守り。若い女性向け。",
-                help="授与品の特徴を記述（類似商品の検索精度が向上します）",
-                key="v23_new_product_description"
+                "特徴・コンセプト（任意）",
+                placeholder="例: 椿をモチーフにしたアクリル製のお守り",
+                help="授与品の特徴を記述",
+                key="v23_2_new_product_description"
             )
             
             target_audience = st.multiselect(
-                "ターゲット層",
+                "ターゲット層（任意）",
                 ["若い女性", "若い男性", "中高年女性", "中高年男性", "家族連れ", "観光客", "地元の方"],
-                default=["若い女性", "観光客"],
-                key="v23_target_audience"
+                default=[],
+                key="v23_2_target_audience"
             )
         
-        st.markdown('<p class="section-header">② 類似商品を分析</p>', unsafe_allow_html=True)
+        # ========== ② 参考商品の選択 ==========
+        st.markdown('<p class="section-header">② 参考にする商品を選択</p>', unsafe_allow_html=True)
         
+        # 類似商品を自動検索
+        all_similar_products = []
         if new_product_name and new_product_name.strip():
             with st.spinner("類似商品を検索中..."):
-                similar_products = find_similar_products_v23(
+                all_similar_products = find_similar_products_v23_2(
                     new_product_name, 
                     new_product_category, 
                     new_product_price,
                     new_product_description,
                     target_audience
                 )
+        
+        selected_products = []
+        
+        if all_similar_products:
+            st.success(f"✅ {len(all_similar_products)}件の候補が見つかりました")
             
-            if similar_products:
-                method_used = similar_products[0].get('method', 'unknown')
-                st.write(f"**類似商品が {len(similar_products)} 件見つかりました**（検索方法: {method_used}）")
+            # 自動推薦（上位5件）
+            auto_recommended = all_similar_products[:5]
+            auto_names = [p['name'] for p in auto_recommended]
+            
+            st.write("**🤖 AIが推薦する参考商品（上位5件）:**")
+            
+            rec_table = []
+            for i, p in enumerate(auto_recommended, 1):
+                bonus_badge = "⭐同名" if p.get('same_name_bonus', 0) > 30 else ""
+                reason = p.get('same_name_reason', 'キーワード一致') if bonus_badge else 'キーワード/価格一致'
+                rec_table.append({
+                    '順位': i,
+                    '商品名': f"{p['name']} {bonus_badge}",
+                    '日販': f"{p['avg_daily']:.1f}体/日",
+                    '類似度': f"{p['similarity']:.0f}%",
+                    '理由': reason
+                })
+            
+            df_rec = pd.DataFrame(rec_table)
+            st.dataframe(df_rec, use_container_width=True, hide_index=True)
+            
+            # 手動選択オプション
+            st.write("---")
+            use_manual = st.checkbox(
+                "🔧 参考商品を手動で選択する",
+                value=False,
+                help="AIの推薦ではなく、自分で参考にしたい商品を選びたい場合はチェック",
+                key="v23_2_use_manual"
+            )
+            
+            if use_manual:
+                # 全商品リストから選択
+                all_product_names = [p['name'] for p in all_similar_products]
                 
-                # 詳細テーブル
-                with st.expander("📋 類似商品の詳細", expanded=True):
-                    table_data = []
-                    for i, prod in enumerate(similar_products[:10], 1):
-                        table_data.append({
-                            '順位': i,
-                            '商品名': prod['name'],
-                            '日販': f"{prod['avg_daily']:.1f}体",
-                            '変動係数': f"{prod.get('cv', 0):.1%}",
-                            '類似度': f"{prod['similarity']:.0f}%"
+                selected_names = st.multiselect(
+                    "参考にする商品を選択（複数可）",
+                    options=all_product_names,
+                    default=auto_names[:3],  # デフォルトは上位3件
+                    help="選択した商品の実績を基に予測します",
+                    key="v23_2_manual_selection"
+                )
+                
+                # 選択された商品の情報を取得
+                selected_products = [p for p in all_similar_products if p['name'] in selected_names]
+                
+                if selected_products:
+                    st.write(f"**選択された参考商品: {len(selected_products)}件**")
+                    
+                    sel_table = []
+                    for p in selected_products:
+                        sel_table.append({
+                            '商品名': p['name'],
+                            '日販': f"{p['avg_daily']:.1f}体/日",
+                            '総販売数': f"{p['total_qty']:,}体"
                         })
                     
-                    df_similar = pd.DataFrame(table_data)
-                    st.dataframe(df_similar, use_container_width=True, hide_index=True)
+                    df_sel = pd.DataFrame(sel_table)
+                    st.dataframe(df_sel, use_container_width=True, hide_index=True)
+                    
+                    # 手動選択の場合の予測ベース日販
+                    avg_daily = np.mean([p['avg_daily'] for p in selected_products])
+                    st.info(f"📊 選択商品の平均日販: **{avg_daily:.2f}体/日**")
+                else:
+                    st.warning("⚠️ 参考商品を選択してください")
             else:
-                st.warning("⚠️ 類似商品が見つかりませんでした。カテゴリーの平均値から予測します。")
+                selected_products = auto_recommended
         else:
-            similar_products = []
-            st.info("👆 授与品名を入力すると、類似商品を検索します")
+            if new_product_name:
+                st.warning("⚠️ 類似商品が見つかりませんでした。カテゴリの平均値から予測します。")
+            else:
+                st.info("👆 授与品名を入力すると、類似商品を検索します")
         
-        st.markdown('<p class="section-header">③ 需要予測</p>', unsafe_allow_html=True)
+        # ========== ③ 予測設定 ==========
+        st.markdown('<p class="section-header">③ 予測設定</p>', unsafe_allow_html=True)
         
         col1, col2, col3 = st.columns(3)
         
@@ -9473,8 +9930,8 @@ def render_new_product_forecast():
             forecast_period = st.selectbox(
                 "予測期間",
                 ["1ヶ月", "3ヶ月", "6ヶ月", "1年"],
-                index=2,
-                key="v23_forecast_period"
+                index=1,  # 3ヶ月をデフォルト
+                key="v23_2_forecast_period"
             )
         
         with col2:
@@ -9482,8 +9939,8 @@ def render_new_product_forecast():
                 "発注モード",
                 ["滞留回避（P50）", "バランス（P80）★推奨", "欠品回避（P90）"],
                 index=1,
-                help="P50=50%信頼区間、P80=80%信頼区間、P90=90%信頼区間",
-                key="v23_order_mode"
+                help="P50=50%の確率で需要を満たす, P80=80%, P90=90%",
+                key="v23_2_order_mode"
             )
         
         with col3:
@@ -9492,8 +9949,8 @@ def render_new_product_forecast():
                 min_value=1,
                 max_value=90,
                 value=14,
-                help="発注から納品までの日数（分割発注提案に使用）",
-                key="v23_lead_time"
+                help="発注から納品までの日数",
+                key="v23_2_lead_time"
             )
         
         # モードの変換
@@ -9507,43 +9964,233 @@ def render_new_product_forecast():
         # 期間の変換
         period_days = {"1ヶ月": 30, "3ヶ月": 90, "6ヶ月": 180, "1年": 365}[forecast_period]
         
-        if st.button("🔮 新規授与品の需要を予測", type="primary", use_container_width=True, key="v23_forecast_btn"):
+        # ========== 予測実行ボタン ==========
+        if st.button("🔮 需要を予測", type="primary", use_container_width=True, key="v23_2_forecast_btn"):
             if not new_product_name or not new_product_name.strip():
                 st.error("授与品名を入力してください")
+            elif not selected_products:
+                st.error("参考商品を選択してください（類似商品が見つからない場合は授与品名を変更してお試しください）")
             else:
-                with st.spinner("予測中...（統計的分位点を計算しています）"):
-                    forecast_result = forecast_new_product_v23(
+                with st.spinner("予測中..."):
+                    forecast_result = forecast_new_product_v23_2(
                         new_product_name,
                         new_product_category,
                         new_product_price,
-                        similar_products,
+                        selected_products,
                         period_days,
                         selected_mode
                     )
                     
                     # 結果をsession_stateに保存
-                    st.session_state['v23_new_product_result'] = forecast_result
-                    st.session_state['v23_new_product_info'] = {
+                    st.session_state['v23_2_forecast_result'] = forecast_result
+                    st.session_state['v23_2_product_info'] = {
                         'name': new_product_name,
                         'category': new_product_category,
                         'price': new_product_price,
-                        'similar_products': similar_products
+                        'reference_products': selected_products
                     }
         
-        # 結果表示
-        if st.session_state.get('v23_new_product_result'):
-            result = st.session_state['v23_new_product_result']
-            info = st.session_state.get('v23_new_product_info', {})
+        # ========== 結果表示 ==========
+        if st.session_state.get('v23_2_forecast_result'):
+            result = st.session_state['v23_2_forecast_result']
+            info = st.session_state.get('v23_2_product_info', {})
             
-            display_new_product_forecast_v23(
+            display_new_product_forecast_v23_2(
                 result, 
                 info.get('name', ''),
                 info.get('price', 0),
-                info.get('similar_products', [])
+                info.get('reference_products', [])
             )
     
     with tab2:
         render_new_product_backtest_v23()
+
+
+def display_new_product_forecast_v23_2(result: dict, product_name: str, price: int, reference_products: list):
+    """【v23.2改善版】新規授与品の予測結果を表示"""
+    
+    st.success("✅ 予測完了！")
+    
+    st.write(f"### 📦 「{product_name}」の需要予測")
+    
+    # 参考商品の表示
+    ref_count = result.get('reference_count', 0)
+    if ref_count >= 3:
+        st.info(f"📊 参考商品 **{ref_count}件** の実績データを基に予測しました")
+    elif ref_count >= 1:
+        st.warning(f"⚠️ 参考商品 **{ref_count}件** のみで予測。精度が低い可能性があります")
+    else:
+        st.error("❌ 参考商品なし。カテゴリ平均から予測しています")
+    
+    # ========== 推奨発注数 ==========
+    st.write("#### 🎯 推奨発注数")
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.metric(
+            "📉 滞留回避（P50）",
+            f"{result.get('p50_rounded', 0):,}体",
+            help="50%の確率で需要を満たす"
+        )
+    
+    with col2:
+        st.metric(
+            "⚖️ バランス（P80）",
+            f"{result.get('p80_rounded', 0):,}体",
+            help="80%の確率で需要を満たす"
+        )
+        st.caption("**↑ 推奨**")
+    
+    with col3:
+        st.metric(
+            "🛡️ 欠品回避（P90）",
+            f"{result.get('p90_rounded', 0):,}体",
+            help="90%の確率で需要を満たす"
+        )
+    
+    # 選択モードの強調
+    st.info(f"""
+    📌 **選択モード: {result.get('recommended_label', 'N/A')}**
+    - 推奨発注数: **{result.get('recommended_qty', 0):,}体**
+    - 予測売上: ¥{result.get('recommended_qty', 0) * price:,}
+    """)
+    
+    # ========== 【v23.2】予測内訳の詳細 ==========
+    st.write("#### 📊 予測の内訳")
+    
+    with st.expander("🔍 予測計算の詳細を見る", expanded=True):
+        # 基本パラメータ
+        st.write("**基本パラメータ**")
+        col1, col2, col3, col4 = st.columns(4)
+        
+        col1.metric("ベース日販", f"{result.get('base_daily', 0):.2f}体/日")
+        col2.metric("変動係数(CV)", f"{result.get('cv', 0):.1%}")
+        col3.metric("予測期間", f"{result.get('period_days', 0)}日")
+        col4.metric("参考商品数", f"{result.get('reference_count', 0)}件")
+        
+        # 係数サマリー
+        factor_summary = result.get('factor_summary', {})
+        
+        st.write("**適用した係数**")
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.write("📅 **曜日係数**")
+            st.write(f"- 平日平均: {factor_summary.get('weekday_weekday', 1.0):.2f}")
+            st.write(f"- 土日平均: {factor_summary.get('weekday_weekend', 1.0):.2f}")
+        
+        with col2:
+            st.write("📆 **月係数（抜粋）**")
+            month_f = factor_summary.get('month_factors', {})
+            st.write(f"- 1月: {month_f.get(1, 1.0):.2f}")
+            st.write(f"- 12月: {month_f.get(12, 1.0):.2f}")
+        
+        with col3:
+            st.write("🎌 **特別期間係数**")
+            special_f = factor_summary.get('special_factors', {})
+            st.write(f"- 正月: {special_f.get('new_year', 1.0):.2f}")
+            st.write(f"- 年末: {special_f.get('year_end', 1.0):.2f}")
+        
+        # 計算式の説明
+        st.write("---")
+        st.write("**計算式**")
+        base = result.get('base_daily', 0)
+        ww = factor_summary.get('weekday_weekend', 1.0)
+        m2 = factor_summary.get('month_factors', {}).get(2, 1.0)
+        st.code(f"""
+日別予測 = ベース日販 × 曜日係数 × 月係数 × 特別期間係数
+        = {base:.2f} × (曜日) × (月) × (特別)
+
+例: 通常の土曜日（2月）
+   = {base:.2f} × {ww:.2f} × {m2:.2f} × 1.0
+   ≈ {base * ww * m2:.2f}体/日
+        """)
+        
+        # 日別詳細（最初の14日）
+        daily_details = result.get('daily_details', [])
+        if daily_details:
+            st.write("---")
+            st.write("**日別予測（最初の14日）**")
+            
+            detail_table = []
+            for d in daily_details[:14]:
+                detail_table.append({
+                    '日付': d['date'],
+                    '曜日': d['weekday'],
+                    'ベース': f"{d['base']:.1f}",
+                    '曜日係数': f"{d['weekday_f']:.2f}",
+                    '月係数': f"{d['month_f']:.2f}",
+                    '特別': d['period'],
+                    '予測': f"{d['predicted']:.1f}体"
+                })
+            
+            df_detail = pd.DataFrame(detail_table)
+            st.dataframe(df_detail, use_container_width=True, hide_index=True)
+    
+    # ========== 月別予測グラフ ==========
+    monthly_data = []
+    if result.get('monthly') and isinstance(result['monthly'], dict):
+        for period, qty in result['monthly'].items():
+            monthly_data.append({'月': str(period), '予測販売数': qty})
+    
+    if monthly_data:
+        st.write("#### 📅 月別予測")
+        df_monthly = pd.DataFrame(monthly_data)
+        
+        fig = px.bar(
+            df_monthly, x='月', y='予測販売数',
+            title='月別予測販売数',
+            color='予測販売数',
+            color_continuous_scale='Blues'
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    
+    # ========== 分割発注提案 ==========
+    st.write("#### 🚚 発注戦略の提案")
+    
+    split_proposals = result.get('split_proposals', [])
+    if split_proposals:
+        for proposal in split_proposals:
+            risk_color = {
+                'very_low': '🟢',
+                'low': '🟢',
+                'medium': '🟡',
+                'high': '🔴'
+            }.get(proposal['risk_level'], '⚪')
+            
+            is_recommended = proposal['type'] == 'split_2'
+            
+            with st.expander(f"{risk_color} {proposal['description']} - 合計{proposal['total_qty']:,}体", expanded=is_recommended):
+                for order in proposal['orders']:
+                    st.write(f"- **{order['timing']}**: {order['qty']:,}体（{order['coverage_days']}日分カバー）")
+                
+                if is_recommended:
+                    st.success("✅ 分割発注により、欠品リスクと滞留リスクの両方を軽減できます")
+    
+    # ========== ファクトチェックプロンプト ==========
+    with st.expander("🔍 ファクトチェック用プロンプト", expanded=False):
+        prompt = generate_factcheck_prompt_v23_2(
+            product_name,
+            st.session_state.get('v23_2_product_info', {}).get('category', ''),
+            price,
+            result,
+            reference_products
+        )
+        
+        st.markdown("""
+        <div style="background-color: #fff3cd; padding: 10px; border-radius: 5px; margin-bottom: 10px;">
+            <strong>💡 使い方:</strong> 下のテキストをコピーして、ChatGPT、Claude、Geminiなどに貼り付けて検証してもらってください。
+        </div>
+        """, unsafe_allow_html=True)
+        
+        st.text_area(
+            "プロンプト",
+            value=prompt,
+            height=400,
+            key="v23_2_factcheck_prompt",
+            label_visibility="collapsed"
+        )
 
 
 def display_new_product_forecast_v23(result: dict, product_name: str, price: int, similar_products: list):
@@ -10321,7 +10968,7 @@ def main():
     st.divider()
     
     # バージョン情報（v20更新）
-    version_info = "v23.1 (CV修正・キーワード類似度改善)"
+    version_info = "v23.2 (手動参考商品選択・同名優先・予測内訳表示)"
     if VERTEX_AI_AVAILABLE:
         version_info += " | 🚀 Vertex AI: 有効"
     else:
