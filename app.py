@@ -698,6 +698,204 @@ def calculate_robust_baseline(values: np.ndarray, method: str = 'median') -> flo
         return float(np.mean(values))
 
 
+def calculate_mode_aware_baseline(
+    values: np.ndarray, 
+    order_mode: str = 'balanced',
+    base_method: str = 'median'
+) -> Tuple[float, Dict[str, Any]]:
+    """
+    【v22新機能】発注モードを考慮したベースライン計算
+    
+    モードによってベースライン計算方法を変え、欠品回避モードでは
+    スパイク需要を「リスク」として考慮する。
+    
+    Args:
+        values: 販売数の配列
+        order_mode: 発注モード ('conservative', 'balanced', 'aggressive')
+        base_method: 基本計算方法（互換性維持用）
+    
+    Returns:
+        (ベースライン値, 詳細情報)
+    """
+    if len(values) == 0:
+        return 1.0, {'method': 'fallback', 'reason': 'no_data'}
+    
+    values = np.array(values, dtype=float)
+    values = values[~np.isnan(values)]
+    
+    if len(values) == 0:
+        return 1.0, {'method': 'fallback', 'reason': 'all_nan'}
+    
+    # 基本統計量を計算
+    mean_val = float(np.mean(values))
+    median_val = float(np.median(values))
+    std_val = float(np.std(values)) if len(values) > 1 else 0.0
+    p75_val = float(np.percentile(values, 75))
+    p80_val = float(np.percentile(values, 80))
+    
+    info = {
+        'mean': mean_val,
+        'median': median_val,
+        'std': std_val,
+        'p75': p75_val,
+        'p80': p80_val,
+        'data_points': len(values)
+    }
+    
+    if order_mode == 'conservative':
+        # 滞留回避モード: 中央値ベース（低めに予測）
+        baseline = median_val
+        info['method'] = 'median'
+        info['description'] = '滞留回避: 中央値ベース（スパイクを除外）'
+    
+    elif order_mode == 'aggressive':
+        # 欠品回避モード: 平均値 または 75パーセンタイルの高い方
+        # スパイク需要を「ノイズ」ではなく「考慮すべきリスク」として扱う
+        baseline = max(mean_val, p75_val)
+        info['method'] = 'mean_or_p75'
+        info['description'] = '欠品回避: 平均値/75%タイルの高い方（スパイクをリスクとして考慮）'
+    
+    else:  # balanced
+        # バランスモード: 中央値と平均値の中間
+        baseline = (median_val + mean_val) / 2
+        info['method'] = 'median_mean_avg'
+        info['description'] = 'バランス: 中央値と平均値の中間'
+    
+    # ベースラインの下限チェック（極端な過小評価を防止）
+    # 平均値の50%を下限とする
+    min_baseline = mean_val * 0.5
+    if baseline < min_baseline and mean_val > 0:
+        info['adjusted'] = True
+        info['original_baseline'] = baseline
+        info['adjustment_reason'] = f'平均値の50%未満のため補正（{baseline:.2f} → {min_baseline:.2f}）'
+        baseline = min_baseline
+    
+    return baseline, info
+
+
+def calculate_safety_factor(
+    order_mode: str,
+    std: float,
+    mean: float,
+    lead_time_days: int = 7
+) -> Tuple[float, Dict[str, Any]]:
+    """
+    【v22新機能】発注モードに応じた安全係数を計算
+    
+    欠品回避モードでは標準偏差ベースの安全在庫、
+    または固定係数を適用する。
+    
+    Args:
+        order_mode: 発注モード
+        std: 標準偏差
+        mean: 平均値
+        lead_time_days: リードタイム（日数）
+    
+    Returns:
+        (安全係数, 詳細情報)
+    """
+    info = {
+        'order_mode': order_mode,
+        'std': std,
+        'mean': mean,
+        'lead_time_days': lead_time_days
+    }
+    
+    if order_mode == 'conservative':
+        # 滞留回避: 安全係数なし（1.0）
+        safety_factor = 1.0
+        info['description'] = '滞留回避: 安全係数なし'
+    
+    elif order_mode == 'aggressive':
+        # 欠品回避: 標準偏差ベースの安全係数
+        # サービスレベル95%相当のZ値 ≈ 1.65
+        z_score = 1.65
+        
+        if mean > 0 and std > 0:
+            # 変動係数（CV）を考慮した安全係数
+            cv = std / mean  # 変動係数
+            
+            # リードタイムを考慮（√リードタイム）
+            lt_factor = np.sqrt(lead_time_days)
+            
+            # 安全係数 = 1 + (Z × CV × √LT)
+            # ただし、最低1.15倍、最大1.5倍に制限
+            safety_factor = 1.0 + (z_score * cv * lt_factor / 7)  # 7日で正規化
+            safety_factor = max(1.15, min(1.5, safety_factor))
+            
+            info['cv'] = cv
+            info['z_score'] = z_score
+            info['lt_factor'] = lt_factor
+            info['description'] = f'欠品回避: 安全係数 {safety_factor:.3f}（CV={cv:.2f}）'
+        else:
+            # 標準偏差が計算できない場合は固定係数
+            safety_factor = 1.25
+            info['description'] = '欠品回避: 固定安全係数 1.25（データ不足）'
+    
+    else:  # balanced
+        # バランス: 軽度の安全係数
+        if mean > 0 and std > 0:
+            cv = std / mean
+            # バランスモードは控えめな安全係数
+            safety_factor = 1.0 + (0.5 * cv)  # 変動係数の50%を加算
+            safety_factor = max(1.05, min(1.2, safety_factor))
+            info['cv'] = cv
+            info['description'] = f'バランス: 軽度安全係数 {safety_factor:.3f}'
+        else:
+            safety_factor = 1.1
+            info['description'] = 'バランス: 固定安全係数 1.1'
+    
+    info['safety_factor'] = safety_factor
+    return safety_factor, info
+
+
+def ensure_mode_order_consistency(
+    predictions: Dict[str, float],
+    min_diff_ratio: float = 0.05
+) -> Dict[str, float]:
+    """
+    【v22新機能】モード間の予測値の順序整合性を保証
+    
+    必ず aggressive > balanced > conservative となるように調整。
+    
+    Args:
+        predictions: モード別の予測値 {'conservative': x, 'balanced': y, 'aggressive': z}
+        min_diff_ratio: 最小差分比率（デフォルト5%）
+    
+    Returns:
+        整合性を保証した予測値
+    """
+    cons = predictions.get('conservative', 0)
+    bal = predictions.get('balanced', 0)
+    aggr = predictions.get('aggressive', 0)
+    
+    # 基準値（バランスモード）を中心に調整
+    if bal <= 0:
+        bal = max(cons, aggr, 1)
+    
+    # conservative ≤ balanced を保証
+    if cons > bal:
+        cons = bal * (1 - min_diff_ratio)
+    
+    # balanced ≤ aggressive を保証
+    if aggr < bal:
+        aggr = bal * (1 + min_diff_ratio)
+    
+    # conservative < balanced を保証（最低差分）
+    if bal - cons < bal * min_diff_ratio:
+        cons = bal * (1 - min_diff_ratio)
+    
+    # balanced < aggressive を保証（最低差分）
+    if aggr - bal < bal * min_diff_ratio:
+        aggr = bal * (1 + min_diff_ratio)
+    
+    return {
+        'conservative': cons,
+        'balanced': bal,
+        'aggressive': aggr
+    }
+
+
 def calculate_robust_factor(group_values: np.ndarray, overall_baseline: float, 
                            min_samples: int = 5) -> float:
     """
@@ -2635,7 +2833,20 @@ def forecast_with_seasonality_enhanced(
     else:
         valid_values = df['販売商品数'].dropna().values
     
-    overall_baseline = calculate_robust_baseline(valid_values, method=baseline_method)
+    # 【v22致命的バグ修正】モード対応のベースライン計算
+    # ここでorder_modeを考慮しないと、全モードで同じ予測値になる
+    overall_baseline, baseline_info = calculate_mode_aware_baseline(
+        valid_values, 
+        order_mode=order_mode,
+        base_method=baseline_method
+    )
+    logger.info(f"【v22】モード対応ベースライン: {baseline_info['description']} → {overall_baseline:.2f}")
+    
+    # 【v22】安全係数の計算
+    mean_val = baseline_info.get('mean', overall_baseline)
+    std_val = baseline_info.get('std', 0.0)
+    safety_factor, safety_info = calculate_safety_factor(order_mode, std_val, mean_val)
+    logger.info(f"【v22】安全係数: {safety_info['description']} → {safety_factor:.3f}")
     
     if overall_baseline <= 0:
         overall_baseline = 1.0
@@ -2682,13 +2893,16 @@ def forecast_with_seasonality_enhanced(
     
     # ========== 3.2 通常日ベースラインの計算 ==========
     if len(normal_df) > 10:
-        # 通常日のみでベースラインを再計算（二重計上対策）
-        normal_baseline = calculate_robust_baseline(
+        # 【v22致命的バグ修正】通常日もモード対応でベースライン計算
+        normal_baseline, normal_baseline_info = calculate_mode_aware_baseline(
             normal_df['販売商品数'].values, 
-            method=baseline_method
+            order_mode=order_mode,
+            base_method=baseline_method
         )
+        logger.info(f"【v22】通常日ベースライン: {normal_baseline_info['description']} → {normal_baseline:.2f}")
     else:
         normal_baseline = overall_baseline
+        normal_baseline_info = baseline_info
     
     # ベースラインが0以下の場合の安全対策
     if normal_baseline <= 0:
@@ -2764,8 +2978,9 @@ def forecast_with_seasonality_enhanced(
             elif d.month == 12 and d.day >= 28:
                 special_f = special_factors.get('year_end', 1.5)
         
-        # 予測値計算（通常日ベースライン × 曜日係数 × 月係数 × 特別期間係数 × トレンド係数）
-        pred = normal_baseline * weekday_f * month_f * special_f * trend_factor
+        # 【v22致命的バグ修正】予測値計算に安全係数を適用
+        # 予測値 = 通常日ベースライン × 曜日係数 × 月係数 × 特別期間係数 × トレンド係数 × 安全係数
+        pred = normal_baseline * weekday_f * month_f * special_f * trend_factor * safety_factor
         pred = max(0.1, pred)
         point_predictions.append(pred)
         
@@ -2779,7 +2994,8 @@ def forecast_with_seasonality_enhanced(
             'weekday_factor': weekday_f,
             'month_factor': month_f,
             'special_factor': special_f,
-            'trend_factor': trend_factor  # v20追加
+            'trend_factor': trend_factor,         # v20追加
+            'safety_factor': safety_factor        # 【v22】安全係数
         })
     
     result_df = pd.DataFrame(predictions)
@@ -2809,6 +3025,49 @@ def forecast_with_seasonality_enhanced(
         else:  # balanced
             result_df['recommended_raw'] = result_df['p80_raw']             # 【v22】未丸め
             result_df['recommended'] = result_df['p80']
+    else:
+        # 【v22致命的バグ修正】include_quantiles=Falseでもrecommended列を生成
+        # これがないと、get_order_column()が常にpredictedを返してしまう
+        # モードに応じた係数でrecommended値を計算
+        point_array = np.array(point_predictions)
+        
+        # モード別の分位点係数（過去データの変動に基づく簡易計算）
+        if len(valid_values) > 0:
+            cv = np.std(valid_values) / np.mean(valid_values) if np.mean(valid_values) > 0 else 0.3
+        else:
+            cv = 0.3  # デフォルト変動係数
+        
+        # 係数は変動係数に基づいて計算
+        # P50 ≈ 予測値（中央値相当）
+        # P80 ≈ 予測値 × (1 + 0.84 × CV) ※正規分布の80%点
+        # P90 ≈ 予測値 × (1 + 1.28 × CV) ※正規分布の90%点
+        p50_factor = 1.0
+        p80_factor = 1.0 + 0.84 * cv
+        p90_factor = 1.0 + 1.28 * cv
+        
+        # 最低差を保証（各モード間で最低5%の差）
+        p80_factor = max(p80_factor, 1.05)
+        p90_factor = max(p90_factor, p80_factor * 1.05, 1.10)
+        
+        result_df['p50_raw'] = point_array * p50_factor
+        result_df['p80_raw'] = point_array * p80_factor
+        result_df['p90_raw'] = point_array * p90_factor
+        result_df['p50'] = (point_array * p50_factor).round().astype(int)
+        result_df['p80'] = (point_array * p80_factor).round().astype(int)
+        result_df['p90'] = (point_array * p90_factor).round().astype(int)
+        
+        # 発注モードに応じた推奨値
+        if order_mode == 'conservative':
+            result_df['recommended_raw'] = result_df['p50_raw']
+            result_df['recommended'] = result_df['p50']
+        elif order_mode == 'aggressive':
+            result_df['recommended_raw'] = result_df['p90_raw']
+            result_df['recommended'] = result_df['p90']
+        else:  # balanced
+            result_df['recommended_raw'] = result_df['p80_raw']
+            result_df['recommended'] = result_df['p80']
+        
+        logger.info(f"【v22】簡易分位点計算: CV={cv:.2f}, P50係数={p50_factor:.2f}, P80係数={p80_factor:.2f}, P90係数={p90_factor:.2f}")
     
     # ========== 10. メタデータの保存 ==========
     # バックテスト結果
@@ -2833,8 +3092,14 @@ def forecast_with_seasonality_enhanced(
         'daily_new_year': use_daily_new_year
     }
     
-    # 【v22追加】発注モード情報
+    # 【v22追加】発注モード情報と安全係数情報
     result_df.attrs['order_mode'] = order_mode
+    result_df.attrs['v22_mode_info'] = {
+        'order_mode': order_mode,
+        'baseline_info': baseline_info if 'baseline_info' in dir() else {},
+        'safety_factor': safety_factor,
+        'safety_info': safety_info if 'safety_info' in dir() else {}
+    }
     
     # 発注点計算（残差がある場合）
     if backtest_result and backtest_result.get('available') and backtest_result.get('residuals'):
