@@ -1,5 +1,11 @@
 """
-Airレジ 売上分析・需要予測 Webアプリ（v22.4: 全方法統合予測版 - 異常値除外）
+Airレジ 売上分析・需要予測 Webアプリ（v22.5: 商品別予測表示版）
+
+【v22.5 変更点】
+- 商品別に予測結果を表示（合算ではなくグループ/商品ごと）
+- 各商品の入力データ統計を正しく表示
+- ファクトチェックプロンプトをst.text_areaで表示（コピー対応）
+- 異常値除外の閾値をさらに厳格化（実績平均の5倍まで）
 
 【v22.4 変更点】
 - 異常予測値（実績平均の50倍を超える）を自動除外
@@ -3815,14 +3821,15 @@ def forecast_all_methods_unified_v22(
     df['date'] = pd.to_datetime(df['date'])
     df = df.sort_values('date')
     
-    # 【v22.4】実績データの統計を計算（妥当性チェック用）
+    # 【v22.5】実績データの統計を計算（妥当性チェック用）
     actual_mean = df['販売商品数'].mean() if '販売商品数' in df.columns else 0
     actual_max = df['販売商品数'].max() if '販売商品数' in df.columns else 0
     data_days = len(df)
     
-    # 妥当性チェック用の上限値を計算
-    # 予測期間の合計が、実績平均の50倍 × 予測日数 を超えたら異常とみなす
-    max_reasonable_total = max(actual_mean * periods * 50, actual_max * periods * 10, 100000)
+    # 妥当性チェック用の上限値を計算（v22.5で閾値をさらに厳格化）
+    # 予測期間の合計が、実績平均の3倍 × 予測日数 を超えたら異常とみなす
+    # 下限も5,000に引き下げ（お守りの場合、180日で5,000体以上は異常の可能性が高い）
+    max_reasonable_total = max(actual_mean * periods * 3, actual_max * periods * 2, 5000)
     
     # 各モードで精度強化版を実行
     modes = ['conservative', 'balanced', 'aggressive']
@@ -4072,6 +4079,14 @@ def calculate_final_recommendation_v22(
             'weights_used': {},
             'calculation_method': 'フォールバック'
         }
+    
+    # 【v22.5】精度強化版を重視した重み計算
+    # 精度強化版は他の方法よりも信頼性が高いため、重みの下限を設定
+    for method, result in all_results.items():
+        if method == '精度強化版':
+            # 精度強化版の重みは最低でも0.5（全体の半分）を確保
+            current_weight = result.get('weight', 0.01)
+            result['weight'] = max(current_weight, 0.5)
     
     # 重みを正規化
     total_weight = sum(r.get('weight', 0.01) for r in all_results.values())
@@ -7425,13 +7440,12 @@ def render_individual_year_comparison(df_agg: pd.DataFrame, unit_name: str, star
 
 def render_individual_forecast_section():
     """
-    【v22.3修正版】個別予測セクション
+    【v22.5改訂版】個別予測セクション
     
     変更点:
-    - 予測方法の選択を廃止（常に全方法で自動実行）
-    - 各方法の結果一覧 + 説明を表示
-    - 最終推奨発注数（3パターン: 滞留回避/バランス/欠品回避）を提示
-    - formとsession_state書き込みを分離してエラー回避
+    - 商品ごとに予測結果を表示（合算ではなく）
+    - 各商品の入力データ統計を正しく表示
+    - コピーボタンをst.text_areaで実装
     """
     st.markdown('<p class="section-header">④ 個別需要予測</p>', unsafe_allow_html=True)
     
@@ -7443,7 +7457,6 @@ def render_individual_forecast_section():
     # 予測実行フラグのチェック（formの外で予測を実行）
     # ==========================================================================
     if st.session_state.get('v22_run_forecast_flag'):
-        # フラグをクリア
         params = st.session_state.pop('v22_run_forecast_flag')
         
         forecast_days = params['forecast_days']
@@ -7457,8 +7470,13 @@ def render_individual_forecast_section():
             all_products_results = {}
             product_names = list(st.session_state.individual_sales_data.keys())
             
+            # 商品ごとの売上データも保存
+            products_sales_data = {}
+            
             for product_name, sales_data in st.session_state.individual_sales_data.items():
                 try:
+                    products_sales_data[product_name] = sales_data.copy()
+                    
                     method_results = forecast_all_methods_unified_v22(
                         df=sales_data,
                         periods=forecast_days,
@@ -7471,110 +7489,60 @@ def render_individual_forecast_section():
                     )
                     
                     if method_results:
-                        all_products_results[product_name] = method_results
+                        # 商品ごとの最終推奨を計算
+                        product_final = calculate_final_recommendation_v22(
+                            all_results=method_results,
+                            sales_data=sales_data
+                        )
+                        
+                        all_products_results[product_name] = {
+                            'method_results': method_results,
+                            'final_recommendation': product_final,
+                            'sales_data': sales_data
+                        }
                         
                 except Exception as e:
                     st.warning(f"⚠️ {safe_html(product_name)}の予測に失敗しました: {str(e)[:100]}")
                     logger.error(f"{product_name}の予測エラー: {e}")
             
             if all_products_results:
-                # 全商品の結果を統合
-                combined_results = {}
-                for product_name, method_results in all_products_results.items():
-                    for method_name, result in method_results.items():
-                        if method_name not in combined_results:
-                            combined_results[method_name] = {
-                                'totals': {'conservative': 0, 'balanced': 0, 'aggressive': 0},
-                                'mapes': [],
-                                'description': result.get('description', {}),
-                                'weights': []
-                            }
-                        
-                        totals = result.get('totals', {})
-                        combined_results[method_name]['totals']['conservative'] += totals.get('conservative', 0)
-                        combined_results[method_name]['totals']['balanced'] += totals.get('balanced', 0)
-                        combined_results[method_name]['totals']['aggressive'] += totals.get('aggressive', 0)
-                        
-                        if result.get('mape'):
-                            combined_results[method_name]['mapes'].append(result['mape'])
-                        if result.get('weight'):
-                            combined_results[method_name]['weights'].append(result['weight'])
-                
-                # 平均MAPEと重みを計算
-                for method_name, data in combined_results.items():
-                    if data['mapes']:
-                        data['mape'] = sum(data['mapes']) / len(data['mapes'])
-                    else:
-                        data['mape'] = None
-                    
-                    if data['weights']:
-                        data['weight'] = sum(data['weights']) / len(data['weights'])
-                    else:
-                        data['weight'] = 0.01
-                
-                # 入力データを結合
-                combined_sales_data = None
-                for pname, sdata in st.session_state.individual_sales_data.items():
-                    if combined_sales_data is None:
-                        combined_sales_data = sdata.copy()
-                    else:
-                        combined_sales_data = pd.concat([combined_sales_data, sdata], ignore_index=True)
-                
-                # 最終推奨発注数を算出
-                final_recommendation = calculate_final_recommendation_v22(
-                    all_results=combined_results,
-                    sales_data=combined_sales_data
-                )
-                
-                # session_stateに保存
+                # session_stateに保存（商品ごとの結果）
                 st.session_state['v22_results'] = {
-                    'combined_results': combined_results,
-                    'final_recommendation': final_recommendation,
-                    'forecast_days': forecast_days,
-                    'product_names': product_names,
                     'all_products_results': all_products_results,
-                    'combined_sales_data': combined_sales_data  # 追加
+                    'forecast_days': forecast_days,
+                    'product_names': product_names
                 }
                 
                 # 納品計画用に従来形式でも保存
-                balanced_total = final_recommendation['balanced']['total']
-                st.session_state.forecast_total = balanced_total
-                st.session_state.last_forecast_method = "v22統合予測（全方法）"
-                
-                # individual_forecast_resultsも保存（互換性のため）
                 individual_results = []
-                for pname, mresults in all_products_results.items():
-                    best_method = None
-                    best_mape = float('inf')
-                    for mname, res in mresults.items():
-                        if res.get('mape') and res['mape'] < best_mape:
-                            best_mape = res['mape']
-                            best_method = mname
-                    
-                    if best_method is None:
-                        best_method = '精度強化版' if '精度強化版' in mresults else list(mresults.keys())[0]
-                    
-                    res = mresults.get(best_method, {})
-                    tots = res.get('totals', {})
+                total_balanced = 0
+                
+                for pname, pdata in all_products_results.items():
+                    final_rec = pdata['final_recommendation']
+                    balanced = final_rec['balanced']['total']
+                    total_balanced += balanced
                     
                     individual_results.append({
                         'product': pname,
-                        'forecast': res.get('forecast'),
-                        'raw_total': tots.get('balanced', 0),
-                        'rounded_total': tots.get('balanced', 0),
-                        'avg_predicted': tots.get('balanced', 0) / forecast_days if forecast_days > 0 else 0,
-                        'method_message': f'v22統合予測（{best_method}）'
+                        'forecast': None,
+                        'raw_total': balanced,
+                        'rounded_total': balanced,
+                        'avg_predicted': balanced / forecast_days if forecast_days > 0 else 0,
+                        'method_message': 'v22.5統合予測'
                     })
                 
                 st.session_state.individual_forecast_results = individual_results
+                st.session_state.forecast_total = total_balanced
+                st.session_state.last_forecast_method = "v22.5統合予測（商品別）"
+                
                 st.success("✅ 予測が完了しました！")
     
     # ==========================================================================
-    # 【v22】予測パラメータ設定
+    # 予測パラメータ設定
     # ==========================================================================
     with st.form(key="individual_forecast_form_v22"):
         st.write("### 🎯 予測設定")
-        st.info("📊 **全予測方法で自動的に予測し、最適な発注数を算出します**")
+        st.info("📊 **商品ごとに全予測方法で自動的に予測し、最適な発注数を算出します**")
         
         # 予測期間の設定
         forecast_mode = st.radio(
@@ -7590,7 +7558,6 @@ def render_individual_forecast_section():
             forecast_start_date = None
             forecast_end_date = None
         else:
-            # 期間指定UI
             today = date.today()
             default_start = today + timedelta(days=1)
             default_end = today + timedelta(days=180)
@@ -7660,14 +7627,13 @@ def render_individual_forecast_section():
                 enable_zero_fill = st.checkbox(
                     "0埋め処理（推奨）",
                     value=True,
-                    help="売上がない日を0で補完し、正確な曜日・季節係数を計算します",
+                    help="売上がない日を0で補完",
                     key="v22_zero_fill_input"
                 )
-                
                 enable_trend = st.checkbox(
                     "トレンド係数（前年比）",
                     value=True,
-                    help="直近の売上と前年同期を比較し、成長/衰退トレンドを反映します",
+                    help="成長/衰退トレンドを反映",
                     key="v22_trend_input"
                 )
             
@@ -7675,10 +7641,9 @@ def render_individual_forecast_section():
                 use_daily_new_year = st.checkbox(
                     "正月日別係数（1/1〜1/7）",
                     value=True,
-                    help="正月を日別に係数設定し、元日のピークを正確に捉えます",
+                    help="正月のピークを正確に捉える",
                     key="v22_daily_new_year_input"
                 )
-                
                 trend_window_days = st.selectbox(
                     "トレンド比較期間",
                     options=[30, 60, 90],
@@ -7686,15 +7651,7 @@ def render_individual_forecast_section():
                     index=1,
                     key="v22_trend_window_input"
                 )
-            
-            # 欠品期間の表示
-            st.markdown("**🚫 欠品期間の除外**")
-            if st.session_state.get('v20_stockout_periods'):
-                st.info(f"登録済み欠品期間: {len(st.session_state.v20_stockout_periods)}件（フォーム下部で管理）")
-            else:
-                st.caption("欠品期間は予測実行ボタンの下で登録できます")
         
-        # 予測実行ボタン
         submitted = st.form_submit_button(
             "🔮 全方法で需要予測を実行",
             type="primary",
@@ -7710,19 +7667,9 @@ def render_individual_forecast_section():
         col_stock1, col_stock2, col_stock3 = st.columns([2, 2, 1])
         
         with col_stock1:
-            stockout_start = st.date_input(
-                "欠品開始日",
-                value=None,
-                key="v22_stockout_start_input"
-            )
-        
+            stockout_start = st.date_input("欠品開始日", value=None, key="v22_stockout_start_input")
         with col_stock2:
-            stockout_end = st.date_input(
-                "欠品終了日",
-                value=None,
-                key="v22_stockout_end_input"
-            )
-        
+            stockout_end = st.date_input("欠品終了日", value=None, key="v22_stockout_end_input")
         with col_stock3:
             st.write("")
             st.write("")
@@ -7735,44 +7682,35 @@ def render_individual_forecast_section():
                 new_period = (stockout_start, stockout_end)
                 if new_period not in st.session_state.v20_stockout_periods:
                     st.session_state.v20_stockout_periods.append(new_period)
-                    st.success(f"欠品期間を追加しました: {stockout_start} 〜 {stockout_end}")
+                    st.success(f"欠品期間を追加: {stockout_start} 〜 {stockout_end}")
                     st.rerun()
             else:
                 st.warning("終了日は開始日以降にしてください")
         
         if st.session_state.get('v20_stockout_periods'):
-            st.markdown("**登録済み欠品期間:**")
+            st.markdown("**登録済み:**")
             for i, (s, e) in enumerate(st.session_state.v20_stockout_periods):
                 col_p1, col_p2 = st.columns([4, 1])
                 with col_p1:
                     st.text(f"  {i+1}. {s} 〜 {e}")
                 with col_p2:
-                    if st.button("🗑️", key=f"v22_del_stockout_btn_{i}", help="この期間を削除"):
+                    if st.button("🗑️", key=f"v22_del_stockout_btn_{i}"):
                         st.session_state.v20_stockout_periods.pop(i)
                         st.rerun()
-            
-            if st.button("すべてクリア", key="v22_clear_all_stockout_btn"):
-                st.session_state.v20_stockout_periods = []
-                st.rerun()
-        else:
-            st.info("欠品期間は登録されていません")
     
     # ==========================================================================
-    # フォーム送信時の処理（フラグを立ててrerun）
+    # フォーム送信時の処理
     # ==========================================================================
     if submitted:
-        # 期間指定の検証
         if forecast_mode == "期間で指定":
             if forecast_end_date <= forecast_start_date:
                 st.error("⚠️ 終了日は開始日より後にしてください")
                 return
         
-        # 欠品期間の取得
         stockout_periods = st.session_state.get('v20_stockout_periods', None)
         if stockout_periods:
             stockout_periods = [(s, e) for s, e in stockout_periods]
         
-        # 予測実行フラグとパラメータをsession_stateに保存
         st.session_state['v22_run_forecast_flag'] = {
             'forecast_days': forecast_days,
             'enable_zero_fill': enable_zero_fill,
@@ -7784,31 +7722,67 @@ def render_individual_forecast_section():
         st.rerun()
     
     # ==========================================================================
-    # 【v22】予測結果の表示
+    # 【v22.5】商品別予測結果の表示
     # ==========================================================================
     if st.session_state.get('v22_results'):
         results = st.session_state['v22_results']
-        combined_results = results['combined_results']
-        final_recommendation = results['final_recommendation']
-        forecast_days_result = results['forecast_days']
-        product_names = results['product_names']
-        combined_sales_data = results.get('combined_sales_data')  # 追加
-        
-        display_unified_forecast_results_v22(
-            all_results=combined_results,
-            final_recommendation=final_recommendation,
-            forecast_days=forecast_days_result,
-            sales_data=combined_sales_data,  # 修正
-            product_names=product_names
-        )
-        
-        # 商品別の詳細（折りたたみ）
         all_products_results = results.get('all_products_results', {})
-        if all_products_results:
-            with st.expander("📦 **商品別の詳細結果**", expanded=False):
-                for product_name, method_results in all_products_results.items():
-                    st.markdown(f"#### {product_name}")
+        forecast_days_result = results.get('forecast_days', 180)
+        
+        if not all_products_results:
+            st.warning("予測結果がありません")
+            return
+        
+        st.write("## 📊 商品別予測結果")
+        st.caption("各商品の予測結果を個別に表示しています")
+        
+        # 商品ごとにタブまたはexpanderで表示
+        for product_name, pdata in all_products_results.items():
+            method_results = pdata['method_results']
+            final_rec = pdata['final_recommendation']
+            sales_data = pdata.get('sales_data')
+            
+            with st.expander(f"📦 **{product_name}**", expanded=True):
+                # 入力データの統計
+                if sales_data is not None and not sales_data.empty:
+                    total_days = len(sales_data)
+                    total_qty = int(sales_data['販売商品数'].sum())
+                    avg_daily = sales_data['販売商品数'].mean()
+                    std_daily = sales_data['販売商品数'].std()
                     
+                    col_stat1, col_stat2, col_stat3, col_stat4 = st.columns(4)
+                    col_stat1.metric("📅 学習データ", f"{total_days}日間")
+                    col_stat2.metric("📈 総販売数", f"{total_qty:,}体")
+                    col_stat3.metric("📊 実績日販", f"{avg_daily:.1f}体/日")
+                    col_stat4.metric("📉 標準偏差", f"{std_daily:.1f}")
+                else:
+                    st.warning("⚠️ 入力データがありません")
+                    avg_daily = 0
+                
+                st.markdown("---")
+                
+                # 最終推奨発注数
+                st.write("### 🎯 推奨発注数")
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    cons = final_rec['conservative']
+                    st.metric(f"📉 {cons['label']}", f"{cons['total']:,}体")
+                    st.caption(cons['risk'])
+                
+                with col2:
+                    bal = final_rec['balanced']
+                    st.metric(f"⚖️ {bal['label']}", f"{bal['total']:,}体")
+                    st.caption(bal['risk'])
+                    st.markdown("**↑ おすすめ**")
+                
+                with col3:
+                    aggr = final_rec['aggressive']
+                    st.metric(f"🛡️ {aggr['label']}", f"{aggr['total']:,}体")
+                    st.caption(aggr['risk'])
+                
+                # 各予測方法の結果
+                with st.expander("📈 各予測方法の詳細", expanded=False):
                     table_data = []
                     for method_name, result in method_results.items():
                         totals = result.get('totals', {})
@@ -7821,77 +7795,146 @@ def render_individual_forecast_section():
                             'MAPE': f"{mape:.1f}%" if mape else "-"
                         })
                     
-                    df = pd.DataFrame(table_data)
-                    st.dataframe(df, use_container_width=True, hide_index=True)
-                    st.markdown("---")
+                    if table_data:
+                        df_methods = pd.DataFrame(table_data)
+                        st.dataframe(df_methods, use_container_width=True, hide_index=True)
+                
+                # ファクトチェック用プロンプト
+                with st.expander("🔍 ファクトチェック用プロンプト", expanded=False):
+                    # プロンプト生成
+                    prompt = generate_product_factcheck_prompt_v22(
+                        product_name=product_name,
+                        method_results=method_results,
+                        final_recommendation=final_rec,
+                        forecast_days=forecast_days_result,
+                        sales_data=sales_data
+                    )
+                    
+                    st.markdown("""
+                    <div style="background-color: #fff3cd; padding: 10px; border-radius: 5px; margin-bottom: 10px;">
+                        <strong>💡 使い方:</strong> 下のテキストを選択してコピー（Ctrl+A → Ctrl+C）し、
+                        ChatGPT、Claude、Geminiなどに貼り付けて検証してもらってください。
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    # st.text_areaでコピーしやすく
+                    st.text_area(
+                        "プロンプト",
+                        value=prompt,
+                        height=300,
+                        key=f"factcheck_prompt_{product_name}",
+                        label_visibility="collapsed"
+                    )
+        
+        # 全商品の合計サマリー
+        if len(all_products_results) > 1:
+            st.markdown("---")
+            st.write("## 📋 全商品合計")
+            
+            total_cons = sum(p['final_recommendation']['conservative']['total'] for p in all_products_results.values())
+            total_bal = sum(p['final_recommendation']['balanced']['total'] for p in all_products_results.values())
+            total_aggr = sum(p['final_recommendation']['aggressive']['total'] for p in all_products_results.values())
+            
+            col1, col2, col3 = st.columns(3)
+            col1.metric("📉 滞留回避（合計）", f"{total_cons:,}体")
+            col2.metric("⚖️ バランス（合計）", f"{total_bal:,}体")
+            col3.metric("🛡️ 欠品回避（合計）", f"{total_aggr:,}体")
     
-    # ==========================================================================
     # 従来の結果表示（互換性維持）
-    # ==========================================================================
-    elif st.session_state.get('individual_all_methods_results'):
-        matrix_results = st.session_state.individual_all_methods_results
-        method_names = []
-        for product_methods in matrix_results.values():
-            for method_name in product_methods.keys():
-                if method_name not in method_names:
-                    method_names.append(method_name)
-        
-        st.success("✅ すべての予測方法で比較完了！")
-        
-        st.write("### 📊 商品×予測方法 マトリックス表")
-        
-        table_data = []
-        method_totals = {m: 0 for m in method_names}
-        
-        for product, methods in matrix_results.items():
-            row = {'商品名': product}
-            for method_name in method_names:
-                value = methods.get(method_name, 0)
-                row[method_name] = f"{value:,}体"
-                method_totals[method_name] += value
-            table_data.append(row)
-        
-        total_row = {'商品名': '**合計**'}
-        for method_name in method_names:
-            total_row[method_name] = f"**{method_totals[method_name]:,}体**"
-        table_data.append(total_row)
-        
-        df_matrix = pd.DataFrame(table_data)
-        st.dataframe(df_matrix, use_container_width=True, hide_index=True)
-        
-        st.write("### 📈 予測方法別 合計")
-        
-        num_methods = len(method_names)
-        cols = st.columns(min(num_methods, 4))
-        for i, method_name in enumerate(method_names):
-            icon = "🚀" if "Vertex" in method_name else "🎯" if "精度強化" in method_name else "🧠" if "アンサンブル" in method_name else "📊"
-            short_name = method_name.replace("（統計）", "").replace("（推奨）", "")
-            with cols[i % 4]:
-                st.metric(f"{icon} {short_name}", f"{method_totals[method_name]:,}体")
-    
     elif st.session_state.get('individual_forecast_results'):
         results = st.session_state.individual_forecast_results
-        st.success(f"✅ {len(results)}件の授与品の予測が完了しました！")
+        st.success(f"✅ {len(results)}件の予測が完了しました！")
         
-        summary_df = pd.DataFrame([
-            {
-                '授与品': r['product'],
-                '予測総数': f"{r['rounded_total']:,}体",
-                '平均日販': f"{r['avg_predicted']:.1f}体/日",
-                '発注推奨数（50倍数）': r['rounded_total']
-            }
-            for r in results
-        ])
-        st.dataframe(summary_df, use_container_width=True, hide_index=True)
+        for r in results:
+            st.write(f"**{r['product']}**: {r['rounded_total']:,}体（{r['avg_predicted']:.1f}体/日）")
+
+
+def generate_product_factcheck_prompt_v22(
+    product_name: str,
+    method_results: Dict[str, Dict[str, Any]],
+    final_recommendation: Dict[str, Any],
+    forecast_days: int,
+    sales_data: pd.DataFrame = None
+) -> str:
+    """
+    【v22.5】商品別ファクトチェック用プロンプト生成
+    """
+    # 入力データの統計
+    if sales_data is not None and not sales_data.empty:
+        total_days = len(sales_data)
+        total_qty = int(sales_data['販売商品数'].sum())
+        avg_daily = sales_data['販売商品数'].mean()
+        std_daily = sales_data['販売商品数'].std()
+        max_daily = sales_data['販売商品数'].max()
+        min_daily = sales_data['販売商品数'].min()
         
-        total_all = sum(r['rounded_total'] for r in results)
-        avg_all = sum(r['avg_predicted'] for r in results)
-        
-        st.write("### 📈 全体サマリー")
-        col1, col2, col3 = st.columns(3)
-        col1.metric("合計予測数", f"{total_all:,}体")
-        col2.metric("合計平均日販", f"{avg_all:.1f}体/日")
-        col3.metric("予測方法", st.session_state.get('last_forecast_method', '-'))
+        input_section = f"""■ 入力データ（過去の実績）:
+- 学習データ期間: {total_days}日間
+- 総販売数: {total_qty:,}体
+- 実績日販（平均）: {avg_daily:.2f}体/日
+- 標準偏差: {std_daily:.2f}
+- 最大日販: {max_daily:.0f}体/日
+- 最小日販: {min_daily:.0f}体/日"""
+    else:
+        input_section = "■ 入力データ: 取得できませんでした（システムエラーの可能性）"
+        avg_daily = 0
+    
+    # 各予測方法の結果
+    methods_section = "■ 各予測方法の結果:\n"
+    for method_name, result in method_results.items():
+        totals = result.get('totals', {})
+        mape = result.get('mape')
+        methods_section += f"  - {method_name}: バランス={totals.get('balanced', 0):,}体"
+        if mape:
+            methods_section += f"（MAPE {mape:.1f}%）"
+        methods_section += "\n"
+    
+    # 最終推奨
+    cons = final_recommendation['conservative']['total']
+    bal = final_recommendation['balanced']['total']
+    aggr = final_recommendation['aggressive']['total']
+    
+    # 変化率
+    expected_from_actual = avg_daily * forecast_days
+    if expected_from_actual > 0:
+        change_rate = ((bal / expected_from_actual) - 1) * 100
+    else:
+        change_rate = 0
+    
+    prompt = f"""【需要予測ファクトチェック依頼】
+
+■ 基本情報:
+- 対象商品: {product_name}
+- 予測期間: {forecast_days}日間
+- 予測方法: 全{len(method_results)}方法の加重平均
+
+{input_section}
+
+{methods_section}
+■ 最終推奨発注数:
+- 滞留回避（P50）: {cons:,}体
+- バランス（P80）: {bal:,}体 ← 推奨
+- 欠品回避（P90）: {aggr:,}体
+
+■ 変化率（実績→予測）:
+- 実績ベース予測: {avg_daily:.2f} × {forecast_days} = {expected_from_actual:,.0f}体
+- AI予測（バランス）: {bal:,}体
+- 乖離率: {change_rate:+.1f}%
+
+■ 検証依頼:
+1. 最終推奨発注数{bal:,}体は妥当ですか？
+2. 実績日販{avg_daily:.1f}体/日に対して、予測は適切ですか？
+3. 各予測方法の結果にばらつきがある場合、どれを信頼すべきですか？
+
+【出力形式】
+1. 検算結果
+2. 妥当性判定（OK/NG/要確認）
+3. リスク分析
+4. 推奨発注数（あなたの見解）
+5. 追加確認事項
+"""
+    
+    return prompt
 
 
 def render_delivery_section():
@@ -8881,7 +8924,7 @@ def main():
     st.divider()
     
     # バージョン情報（v20更新）
-    version_info = "v22.4 (全方法統合予測版 - 異常値除外)"
+    version_info = "v22.5 (商品別予測表示版)"
     if VERTEX_AI_AVAILABLE:
         version_info += " | 🚀 Vertex AI: 有効"
     else:
