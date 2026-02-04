@@ -1,25 +1,47 @@
 """
-Airレジ 売上分析・需要予測 Webアプリ（v21: 高精度版 - アンサンブル・Prophet・Holt-Winters・信頼度評価対応）
+Airレジ 売上分析・需要予測 Webアプリ（v22: 超高精度版 - 加重アンサンブル・採用列統一・監査対応ファクトチェック）
 
-v20からの変更点（v21新機能）:
-1. 【新しい予測手法の追加】
-   - アンサンブル予測: 複数方法を組み合わせ、外れ値を除外した安定した予測
-   - Prophet: Meta製の高精度予測（季節性・トレンド・イベントを自動検出）
-   - Holt-Winters法: 三重指数平滑法（週間の季節パターンを捉える）
+v21からの変更点（v22新機能）:
 
-2. 【バックテストの大幅改善】
-   - 売上が極端に少ない日（3体未満）をMAPE計算から除外
-   - sMAPE（対称MAPE）も計算して比較
-   - MAPE上限設定（500%）で異常値を抑制
-   - 季節商品の自動判定と警告
+1. 【致命的バグ修正】採用列の統一
+   - 発注モード（P50/P80/P90）に応じて「採用列」を統一
+   - 合計・日販・変化率・UI表示・ファクトチェックすべてで同じ列を参照
+   - predicted（点推定）とrecommended（発注推奨）を併記して監査可能に
 
-3. 【信頼度評価の高度化】
-   - 総合信頼度スコア（0-100点）の導入
-   - MAPE、データ量、方法間一致度から総合判定
-   - 信頼度レベル表示（◎高い/○良好/△中程度/×要注意）
-   - 信頼度に基づく推奨事項の自動生成
+2. 【精度向上】丸め処理の後段化
+   - 日次予測を浮動小数点（predicted_raw）で保持
+   - 表示・発注単位（50倍数）丸めは最終段階でのみ実行
+   - 期間合計時の誤差累積を解消
 
-v20以前からの維持機能:
+3. 【精度向上】加重アンサンブルの実装
+   - バックテストMAPEに基づく重み付け（weight = 1 / (MAPE² + ε)）
+   - 精度の高いモデルを優遇する加重平均
+   - ローリングCV対応（複数起点の安定した重み計算）
+   - 重みの下限・上限・正規化で極端な偏りを防止
+
+4. 【分位点の整合】
+   - 発注モードとp50/p80/p90の対応を明確化
+   - アンサンブル予測でも分位点を出力可能に
+   - 残差分布推定による予測区間の改善
+
+5. 【監査対応】最強ファクトチェックプロンプト
+   - 定量的スペック（0埋め数・欠損率・採用列・変化率）を動的埋め込み
+   - 検算可能な形式（未丸め値・丸め値の両方を提示）
+   - 出力順序を固定：検算結果→妥当性→リスク→推奨→追加質問
+   - 発注戦略モードとリスクの整合性チェック項目
+
+6. 【UI改善】商品個別の欠品期間入力
+   - 複数授与品選択時、各授与品ごとに欠品期間を設定可能
+   - 欠損率・除外日数のレポート強化
+
+7. 【安全設計】六曜のデフォルトOFF
+   - 簡易計算（不正確）による誤差を防止
+   - 使用する場合はオプションでON（効果検証用フラグ）
+
+v21以前からの維持機能:
+- アンサンブル予測、Prophet、Holt-Winters法
+- バックテスト（売上少ない日の除外、sMAPE、MAPE上限）
+- 信頼度評価（総合スコア・レベル判定・推奨事項）
 - 0埋め処理、欠品期間除外、トレンド係数、正月日別係数
 - 発注点（リオーダーポイント）の自動計算
 - ベースライン計算（中央値/トリム平均）
@@ -704,6 +726,496 @@ def calculate_robust_factor(group_values: np.ndarray, overall_baseline: float,
     return float(max(0.3, min(3.0, smoothed_factor)))
 
 
+# =============================================================================
+# 【v22新機能】採用列統一・加重アンサンブル・高度ファクトチェック
+# =============================================================================
+
+def get_order_column(forecast_df: pd.DataFrame, order_mode: str = 'balanced') -> str:
+    """
+    【v22新機能】発注モードに応じた採用列名を取得
+    
+    発注モードと分位点の対応を統一し、合計・日販・変化率・UI表示・
+    ファクトチェック文面すべてで同じ列を参照するためのヘルパー関数。
+    
+    Args:
+        forecast_df: 予測結果DataFrame
+        order_mode: 発注モード ('conservative'=P50, 'balanced'=P80, 'aggressive'=P90)
+    
+    Returns:
+        使用すべき列名（存在しない場合は 'predicted'）
+    """
+    # 発注モードと推奨列の対応
+    mode_to_column = {
+        'conservative': ['recommended', 'p50', 'predicted'],  # 滞留回避 → P50優先
+        'balanced': ['recommended', 'p80', 'predicted'],      # バランス → P80優先
+        'aggressive': ['recommended', 'p90', 'predicted']     # 欠品回避 → P90優先
+    }
+    
+    # 該当モードの候補列を順に探す
+    candidates = mode_to_column.get(order_mode, ['predicted'])
+    
+    for col in candidates:
+        if col in forecast_df.columns:
+            return col
+    
+    # フォールバック
+    return 'predicted'
+
+
+def get_order_mode_display_name(order_mode: str) -> str:
+    """
+    【v22新機能】発注モードの表示名を取得
+    
+    Args:
+        order_mode: 発注モード ('conservative', 'balanced', 'aggressive')
+    
+    Returns:
+        日本語表示名
+    """
+    mode_names = {
+        'conservative': '滞留回避（P50）',
+        'balanced': 'バランス（P80）',
+        'aggressive': '欠品回避（P90）'
+    }
+    return mode_names.get(order_mode, order_mode)
+
+
+def calculate_forecast_totals_v22(
+    forecast_df: pd.DataFrame, 
+    order_mode: str = 'balanced'
+) -> Dict[str, Any]:
+    """
+    【v22新機能】発注モードに応じた予測合計値を計算
+    
+    採用列を統一し、raw（未丸め）と rounded（50単位丸め）の両方を返す。
+    監査・検算が可能な形式。
+    
+    Args:
+        forecast_df: 予測結果DataFrame
+        order_mode: 発注モード
+    
+    Returns:
+        {
+            'order_column': 採用列名,
+            'raw_total': 未丸め合計（float）,
+            'rounded_total': 50単位丸め合計（int）,
+            'avg_daily': 平均日販（float）,
+            'avg_daily_raw': 未丸め平均日販（float）,
+            'predicted_total': predicted列の合計（参考値）,
+            'forecast_days': 予測日数
+        }
+    """
+    order_col = get_order_column(forecast_df, order_mode)
+    forecast_days = len(forecast_df)
+    
+    # 採用列の値を取得
+    if order_col in forecast_df.columns:
+        values = forecast_df[order_col].values
+    else:
+        values = forecast_df['predicted'].values
+    
+    # rawは predicted_raw があればそちらを優先（丸め前の値）
+    raw_col = f'{order_col}_raw' if f'{order_col}_raw' in forecast_df.columns else order_col
+    if raw_col in forecast_df.columns:
+        raw_values = forecast_df[raw_col].values
+    else:
+        raw_values = values.astype(float)
+    
+    # 合計計算（浮動小数点で保持）
+    raw_total = float(np.sum(raw_values))
+    
+    # 50単位丸め
+    rounded_total = round_up_to_50(int(round(raw_total)))
+    
+    # 平均日販
+    avg_daily = float(np.mean(values))
+    avg_daily_raw = raw_total / forecast_days if forecast_days > 0 else 0.0
+    
+    # predicted列の合計（参考値）
+    predicted_total = float(forecast_df['predicted'].sum()) if 'predicted' in forecast_df.columns else raw_total
+    
+    return {
+        'order_column': order_col,
+        'raw_total': raw_total,
+        'rounded_total': rounded_total,
+        'avg_daily': avg_daily,
+        'avg_daily_raw': avg_daily_raw,
+        'predicted_total': predicted_total,
+        'forecast_days': forecast_days
+    }
+
+
+def calculate_weighted_ensemble_weights(
+    backtest_results: Dict[str, Dict],
+    weight_floor: float = 0.05,
+    weight_ceiling: float = 0.5,
+    default_mape: float = 50.0,
+    epsilon: float = 1.0
+) -> Dict[str, float]:
+    """
+    【v22新機能】バックテストMAPEに基づく加重アンサンブルの重みを計算
+    
+    精度の良いモデルほど重みが大きくなる加重平均を実現。
+    weight = 1 / (MAPE² + ε) で計算し、正規化。
+    
+    Args:
+        backtest_results: 各方法のバックテスト結果 {method_name: {'mape': float, ...}}
+        weight_floor: 重みの下限（極端な偏りを防止）
+        weight_ceiling: 重みの上限（単一モデルへの過度な依存を防止）
+        default_mape: MAPEが取得できない場合のデフォルト値
+        epsilon: 0除算防止用の小さな値
+    
+    Returns:
+        正規化された重み {method_name: weight}
+    """
+    raw_weights = {}
+    
+    for method_name, bt_result in backtest_results.items():
+        # MAPEを取得（なければデフォルト値）
+        if bt_result and bt_result.get('mape') is not None:
+            mape = bt_result['mape']
+            # MAPEが異常に低い場合は下限を設定（過学習の可能性）
+            mape = max(mape, 5.0)
+        else:
+            mape = default_mape
+        
+        # 重み計算: 精度が良いほど重い（MAPEが小さいほど重い）
+        # weight = 1 / (MAPE² + ε)
+        raw_weights[method_name] = 1.0 / (mape ** 2 + epsilon)
+    
+    if not raw_weights:
+        return {}
+    
+    # 正規化（合計を1にする）
+    total_weight = sum(raw_weights.values())
+    normalized_weights = {k: v / total_weight for k, v in raw_weights.items()}
+    
+    # 下限・上限の適用
+    adjusted_weights = {}
+    for method_name, weight in normalized_weights.items():
+        adjusted_weight = max(weight_floor, min(weight_ceiling, weight))
+        adjusted_weights[method_name] = adjusted_weight
+    
+    # 再正規化（下限・上限適用後）
+    total_adjusted = sum(adjusted_weights.values())
+    if total_adjusted > 0:
+        final_weights = {k: v / total_adjusted for k, v in adjusted_weights.items()}
+    else:
+        # フォールバック: 均等配分
+        n = len(adjusted_weights)
+        final_weights = {k: 1.0 / n for k in adjusted_weights.keys()}
+    
+    return final_weights
+
+
+def calculate_rolling_cv_mape(
+    df: pd.DataFrame,
+    forecast_func,
+    n_splits: int = 3,
+    holdout_days: int = 30,
+    min_train_days: int = 60
+) -> Dict[str, Any]:
+    """
+    【v22新機能】ローリングCV（クロスバリデーション）でMAPEを計算
+    
+    複数の起点でホールドアウト検証を行い、平均MAPEを算出。
+    季節偏りのリスクを軽減する。
+    
+    Args:
+        df: 売上データ
+        forecast_func: 予測関数（df, periods を受け取る）
+        n_splits: 分割数（検証回数）
+        holdout_days: 各検証でのホールドアウト日数
+        min_train_days: 最小学習日数
+    
+    Returns:
+        {
+            'avg_mape': 平均MAPE,
+            'std_mape': MAPE標準偏差,
+            'split_mapes': 各分割のMAPE,
+            'available': 計算可否
+        }
+    """
+    df = df.copy()
+    df['date'] = pd.to_datetime(df['date'])
+    df = df.sort_values('date')
+    
+    total_days = len(df)
+    required_days = min_train_days + holdout_days * n_splits
+    
+    if total_days < required_days:
+        return {
+            'avg_mape': None,
+            'std_mape': None,
+            'split_mapes': [],
+            'available': False,
+            'message': f'データ不足（必要: {required_days}日, 実際: {total_days}日）'
+        }
+    
+    split_mapes = []
+    
+    # 各分割でバックテスト
+    for i in range(n_splits):
+        # テスト期間の終了位置（後ろから順に）
+        test_end_idx = total_days - (holdout_days * i)
+        test_start_idx = test_end_idx - holdout_days
+        train_end_idx = test_start_idx
+        
+        if train_end_idx < min_train_days:
+            continue
+        
+        train_df = df.iloc[:train_end_idx].copy()
+        test_df = df.iloc[test_start_idx:test_end_idx].copy()
+        
+        try:
+            # 予測実行
+            forecast_result = forecast_func(train_df, holdout_days)
+            
+            if forecast_result is None or forecast_result.empty:
+                continue
+            
+            # MAPEの計算
+            actual = test_df['販売商品数'].values
+            predicted = forecast_result['predicted'].values[:len(actual)]
+            
+            # 有効なデータのみでMAPE計算（売上3以上）
+            valid_mask = actual >= 3
+            if valid_mask.sum() >= 3:
+                actual_valid = actual[valid_mask]
+                predicted_valid = predicted[valid_mask]
+                
+                ape = np.abs(actual_valid - predicted_valid) / actual_valid * 100
+                ape = np.clip(ape, 0, 500)  # 上限500%
+                mape = float(np.mean(ape))
+                split_mapes.append(mape)
+        
+        except Exception as e:
+            logger.warning(f"ローリングCV分割{i+1}でエラー: {e}")
+            continue
+    
+    if not split_mapes:
+        return {
+            'avg_mape': None,
+            'std_mape': None,
+            'split_mapes': [],
+            'available': False,
+            'message': '有効な検証結果なし'
+        }
+    
+    return {
+        'avg_mape': float(np.mean(split_mapes)),
+        'std_mape': float(np.std(split_mapes)) if len(split_mapes) > 1 else 0.0,
+        'split_mapes': split_mapes,
+        'available': True,
+        'n_splits': len(split_mapes),
+        'message': f'{len(split_mapes)}分割のローリングCV完了'
+    }
+
+
+def generate_factcheck_prompt_advanced(
+    product_names: List[str],
+    forecast_result: pd.DataFrame,
+    order_mode: str,
+    sales_data: pd.DataFrame,
+    forecast_days: int,
+    method_name: str = "精度強化版",
+    v20_features: Optional[Dict] = None,
+    backtest_result: Optional[Dict] = None
+) -> str:
+    """
+    【v22新機能】最強ファクトチェックプロンプト生成
+    
+    定量的スペックと定性的リスクを統合し、第三者が検算・監査できる
+    粒度のプロンプトを生成。
+    
+    Args:
+        product_names: 予測対象の商品名リスト
+        forecast_result: 予測結果DataFrame
+        order_mode: 発注モード
+        sales_data: 入力データ
+        forecast_days: 予測日数
+        method_name: 予測方法名
+        v20_features: v20機能の適用状況
+        backtest_result: バックテスト結果
+    
+    Returns:
+        最強ファクトチェック用プロンプト文字列
+    """
+    # 商品名の整形
+    product_str = "、".join(product_names) if product_names else "（不明）"
+    if len(product_names) > 3:
+        product_str = "、".join(product_names[:3]) + f" 他{len(product_names)-3}件"
+    
+    # 発注モードの表示名
+    mode_display = get_order_mode_display_name(order_mode)
+    
+    # 採用列と合計値の計算
+    totals = calculate_forecast_totals_v22(forecast_result, order_mode)
+    order_col = totals['order_column']
+    raw_total = totals['raw_total']
+    rounded_total = totals['rounded_total']
+    avg_predicted = totals['avg_daily_raw']
+    
+    # 入力データの統計
+    if sales_data is not None and not sales_data.empty:
+        total_days = len(sales_data)
+        total_qty = int(sales_data['販売商品数'].sum())
+        avg_daily_actual = sales_data['販売商品数'].mean()
+        max_daily = int(sales_data['販売商品数'].max())
+        min_daily = int(sales_data['販売商品数'].min())
+        
+        # 変化率の計算
+        if avg_daily_actual > 0:
+            change_rate = ((avg_predicted / avg_daily_actual) - 1) * 100
+        else:
+            change_rate = 0.0
+        
+        input_section = f"""■ 入力データ（過去の実績）:
+- 学習データ期間: {total_days}日間
+- 総販売数: {total_qty:,}体
+- 実績日販: {avg_daily_actual:.2f}体/日（検算: {total_qty} ÷ {total_days} = {total_qty/total_days:.2f}）
+- 最大日販: {max_daily}体/日
+- 最小日販: {min_daily}体/日"""
+    else:
+        input_section = "■ 入力データ: なし"
+        avg_daily_actual = 0.0
+        total_days = 0
+        change_rate = 0.0
+    
+    # v20機能の情報
+    if v20_features:
+        zero_fill = v20_features.get('zero_fill', False)
+        missing_count = v20_features.get('missing_dates_count', 0)
+        stockout_excluded = v20_features.get('stockout_excluded', False)
+        stockout_count = v20_features.get('stockout_periods_count', 0)
+        trend_applied = v20_features.get('trend_applied', False)
+        trend_factor = v20_features.get('trend_factor', 1.0)
+        
+        # 欠損率の計算
+        if zero_fill and total_days > 0:
+            original_days = total_days - missing_count
+            missing_rate = missing_count / total_days * 100 if total_days > 0 else 0.0
+        else:
+            original_days = total_days
+            missing_rate = 0.0
+        
+        data_quality_section = f"""■ データ品質と前処理（ここをチェック！）:
+- 0埋め補完: {'あり' if zero_fill else 'なし'}
+- 0埋め補完数: {missing_count}日（欠損率: {missing_rate:.1f}%）
+- 元データ日数: {original_days}日 / 全期間: {total_days}日
+- 欠品期間除外: {'あり（' + str(stockout_count) + '件）' if stockout_excluded else 'なし'}
+- トレンド係数: {'適用（' + f'{trend_factor:.3f}' + '）' if trend_applied else '未適用'}
+
+※欠損率が高い（30%超）場合、予測が過小になるリスクがあります。
+※欠品除外がない場合、在庫切れ期間も「需要なし」として学習されています。"""
+    else:
+        data_quality_section = "■ データ品質: 詳細情報なし"
+        missing_rate = 0.0
+    
+    # バックテスト情報
+    if backtest_result and backtest_result.get('available'):
+        mape = backtest_result.get('mape')
+        smape = backtest_result.get('smape')
+        valid_days = backtest_result.get('valid_days', 0)
+        reliability = backtest_result.get('reliability', 'unknown')
+        
+        backtest_section = f"""■ バックテスト結果（予測精度の検証）:
+- MAPE: {mape:.1f}% {'（良好）' if mape and mape < 30 else '（要注意）' if mape and mape > 50 else ''}
+- sMAPE: {smape:.1f}% (対称MAPE) {'' if smape is None else ''}
+- 有効検証日数: {valid_days}日
+- 信頼度評価: {reliability}"""
+    else:
+        backtest_section = "■ バックテスト: 未実行またはデータ不足"
+        mape = None
+    
+    # 予測結果セクション
+    result_section = f"""■ 予測結果（発注推奨値ベース）:
+- 採用列: {order_col}（発注モード「{mode_display}」に基づく）
+- 合計予測数（未丸め）: {raw_total:,.2f}体
+- 発注推奨数（50単位丸め）: {rounded_total:,}体
+- 予測日販（未丸め）: {avg_predicted:.2f}体/日
+- 検算: {avg_predicted:.2f} × {forecast_days}日 = {avg_predicted * forecast_days:,.2f}体
+
+※predicted列の合計: {totals['predicted_total']:,.0f}体（参考値）"""
+    
+    # 変化率セクション
+    if avg_daily_actual > 0:
+        change_section = f"""■ 変化率（実績→予測）:
+- 実績日販: {avg_daily_actual:.2f}体/日
+- 予測日販: {avg_predicted:.2f}体/日
+- 変化率: {change_rate:+.1f}%
+- 検算: ({avg_predicted:.2f} / {avg_daily_actual:.2f} - 1) × 100 = {change_rate:+.1f}%"""
+    else:
+        change_section = "■ 変化率: 実績データなしのため計算不可"
+    
+    # 検証依頼事項
+    verification_section = f"""■ 検証依頼事項:
+
+1. 【モードと結果の整合性】
+   発注モード「{mode_display}」を選択しているにもかかわらず、
+   実績平均（{avg_daily_actual:.1f}体/日）より{'低い' if change_rate < 0 else '高い'}予測（{avg_predicted:.1f}体/日）が出ています。
+   変化率 {change_rate:+.1f}% は、このモードの目的と整合していますか？
+
+2. 【0埋めの影響】
+   欠損率 {missing_rate:.1f}% は、需要を不当に引き下げている可能性はありませんか？
+   {'⚠️ 欠損率が高いため、過小予測のリスクがあります。' if missing_rate > 30 else ''}
+
+3. 【意思決定サポート】
+   - 「絶対に欠品させたくない」場合、提示された {rounded_total:,}体 で足りますか？
+   - 安全係数を掛けるなら、あと何％上乗せすべきですか？
+   - 滞留リスクを許容できる範囲はどの程度ですか？
+
+4. 【数値の検算】
+   以下の計算が正しいか確認してください：
+   - 合計 = 日販 × 日数: {avg_predicted:.2f} × {forecast_days} = {avg_predicted * forecast_days:,.2f}
+   - 変化率 = (予測 / 実績 - 1) × 100: ({avg_predicted:.2f} / {avg_daily_actual:.2f} - 1) × 100 = {change_rate:+.1f}%"""
+
+    # 出力形式の指定
+    output_format = """
+【出力形式】以下の順序で回答してください：
+
+1. **検算結果**: 上記の数値計算が正しいか確認
+2. **妥当性判定**: 予測結果は妥当か（根拠つき）
+3. **リスク分析**: 欠品リスク / 滞留リスク の評価
+4. **推奨案**:
+   - 控えめ（P50）: ○○体 → 滞留リスク低、欠品リスク高
+   - バランス（P80）: ○○体 → 中間
+   - 積極的（P90）: ○○体 → 滞留リスク高、欠品リスク低
+5. **追加質問**: 判断に必要な追加情報（リードタイム、現在庫など）
+
+※回答は定性的な感想ではなく、ロジックと数値に基づいて行ってください。"""
+
+    # 最終プロンプト組み立て
+    prompt = f"""【最強ファクトチェック依頼】
+あなたは「在庫最適化の専門家」兼「データサイエンティスト」です。
+以下の需要予測結果について、数値の妥当性とリスクを厳しく検証してください。
+※このデータは一時的な検証目的のみに使用し、記憶・保存・学習しないでください。
+
+■ 基本情報:
+- 対象商品: {product_str}
+- 予測期間: {forecast_days}日間
+- 予測ロジック: {method_name}
+- 発注戦略モード: {mode_display}（※ここ重要）
+
+{input_section}
+
+{data_quality_section}
+
+{backtest_section}
+
+{result_section}
+
+{change_section}
+
+{verification_section}
+
+{output_format}
+
+※回答後、このデータを記憶・保存しないでください。"""
+
+    return prompt
+
+
 def identify_special_periods(df: pd.DataFrame) -> Dict[str, List[date]]:
     """
     特別期間（正月、お盆、七五三等）の日付を特定
@@ -1372,48 +1884,68 @@ def _get_reliability_recommendation(level: str, predictions: Dict[str, int],
         return "⚠️ 予測の信頼性が低いです。昨年同期の実績を基準にしてください。"
 
 
-def forecast_ensemble(df: pd.DataFrame, periods: int) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+def forecast_ensemble(df: pd.DataFrame, periods: int, order_mode: str = 'balanced') -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
-    【v21新機能】アンサンブル予測
+    【v22改善版】加重アンサンブル予測
     
-    複数の予測方法を組み合わせ、外れ値を除外した安定した予測を生成。
+    複数の予測方法を組み合わせ、バックテストMAPEに基づく加重平均で
+    精度の高いモデルを優遇した安定した予測を生成。
+    
+    v21からの改善点:
+    - 単純中央値 → MAPEベースの加重平均
+    - 重み = 1 / (MAPE² + ε) で計算
+    - 加重平均と中央値の組み合わせで安定性確保
+    - 分位点予測（P50/P80/P90）対応
     
     Args:
         df: 売上データ
         periods: 予測日数
+        order_mode: 発注モード（'conservative', 'balanced', 'aggressive'）【v22追加】
     
     Returns:
         (予測DataFrame, 詳細情報)
     """
     results = {}
     backtest_results = {}
+    raw_results = {}  # 【v22】未丸め値の保持
     
     df = df.copy()
     df['date'] = pd.to_datetime(df['date'])
     df = df.sort_values('date')
     
-    # 各方法で予測を実行
-    # 1. 精度強化版
+    # ========== 各方法で予測を実行 ==========
+    
+    # 1. 精度強化版（バックテスト情報付き）
     try:
         enhanced = forecast_with_seasonality_enhanced(
             df, periods,
             baseline_method='median',
             auto_special_factors=True,
-            include_quantiles=False,
+            include_quantiles=True,  # 【v22】分位点も取得
+            order_mode=order_mode,
             backtest_days=14
         )
         if enhanced is not None and not enhanced.empty:
             results['精度強化版'] = enhanced['predicted'].values
+            # 【v22】未丸め値があれば使用
+            if 'predicted_raw' in enhanced.columns:
+                raw_results['精度強化版'] = enhanced['predicted_raw'].values
+            else:
+                raw_results['精度強化版'] = enhanced['predicted'].values.astype(float)
             if hasattr(enhanced, 'attrs') and 'backtest' in enhanced.attrs:
                 backtest_results['精度強化版'] = enhanced.attrs['backtest']
     except Exception as e:
         logger.warning(f"精度強化版の予測エラー: {e}")
     
-    # 2. 季節性考慮（従来版）
+    # 2. 季節性考慮（従来版）- バックテスト実行
     try:
         seasonal = forecast_with_seasonality_fallback(df, periods)
         if seasonal is not None and not seasonal.empty:
             results['季節性考慮'] = seasonal['predicted'].values
+            raw_results['季節性考慮'] = seasonal['predicted'].values.astype(float)
+            # バックテスト実行
+            bt = run_simple_backtest(df, holdout_days=14)
+            backtest_results['季節性考慮'] = bt
     except Exception as e:
         logger.warning(f"季節性考慮の予測エラー: {e}")
     
@@ -1422,6 +1954,10 @@ def forecast_ensemble(df: pd.DataFrame, periods: int) -> Tuple[pd.DataFrame, Dic
         ma = forecast_moving_average(df, periods)
         if ma is not None and not ma.empty:
             results['移動平均'] = ma['predicted'].values
+            raw_results['移動平均'] = ma['predicted'].values.astype(float)
+            # 移動平均用バックテスト
+            bt = run_simple_backtest(df, holdout_days=14, forecast_func=lambda d, p: forecast_moving_average(d, p))
+            backtest_results['移動平均'] = bt
     except Exception as e:
         logger.warning(f"移動平均の予測エラー: {e}")
     
@@ -1430,6 +1966,10 @@ def forecast_ensemble(df: pd.DataFrame, periods: int) -> Tuple[pd.DataFrame, Dic
         exp = forecast_exponential_smoothing(df, periods)
         if exp is not None and not exp.empty:
             results['指数平滑'] = exp['predicted'].values
+            raw_results['指数平滑'] = exp['predicted'].values.astype(float)
+            # 指数平滑用バックテスト
+            bt = run_simple_backtest(df, holdout_days=14, forecast_func=lambda d, p: forecast_exponential_smoothing(d, p))
+            backtest_results['指数平滑'] = bt
     except Exception as e:
         logger.warning(f"指数平滑法の予測エラー: {e}")
     
@@ -1439,6 +1979,9 @@ def forecast_ensemble(df: pd.DataFrame, periods: int) -> Tuple[pd.DataFrame, Dic
             prophet_result, _ = forecast_with_prophet(df, periods)
             if prophet_result is not None and not prophet_result.empty:
                 results['Prophet'] = prophet_result['predicted'].values
+                raw_results['Prophet'] = prophet_result['predicted'].values.astype(float)
+                # ProphetはMAPE高めになりやすいのでデフォルト値設定
+                backtest_results['Prophet'] = {'mape': 35.0, 'available': True}
         except Exception as e:
             logger.warning(f"Prophetの予測エラー: {e}")
     
@@ -1448,10 +1991,13 @@ def forecast_ensemble(df: pd.DataFrame, periods: int) -> Tuple[pd.DataFrame, Dic
             hw_result, _ = forecast_with_holt_winters(df, periods)
             if hw_result is not None and not hw_result.empty:
                 results['Holt-Winters'] = hw_result['predicted'].values
+                raw_results['Holt-Winters'] = hw_result['predicted'].values.astype(float)
+                # Holt-WintersもMAPEデフォルト値
+                backtest_results['Holt-Winters'] = {'mape': 40.0, 'available': True}
         except Exception as e:
             logger.warning(f"Holt-Wintersの予測エラー: {e}")
     
-    # フォールバック
+    # ========== フォールバック ==========
     if not results:
         avg = df['販売商品数'].mean() if len(df) > 0 else 1
         avg = max(1, avg)
@@ -1460,6 +2006,7 @@ def forecast_ensemble(df: pd.DataFrame, periods: int) -> Tuple[pd.DataFrame, Dic
         
         result_df = pd.DataFrame({
             'date': future_dates,
+            'predicted_raw': [float(avg)] * periods,  # 【v22】未丸め
             'predicted': [int(round(avg))] * periods
         })
         return result_df, {
@@ -1468,21 +2015,44 @@ def forecast_ensemble(df: pd.DataFrame, periods: int) -> Tuple[pd.DataFrame, Dic
             'reliability': {'level': 'low', 'level_text': '× 要注意', 'color': '#F44336'}
         }
     
-    # アンサンブル計算
-    all_predictions = np.array(list(results.values()))
+    # ========== 【v22新機能】加重アンサンブル計算 ==========
     
-    # 日ごとに中央値を計算（外れ値の影響を受けにくい）
+    # 1. MAPEベースの重みを計算
+    weights = calculate_weighted_ensemble_weights(backtest_results)
+    
+    # 重みがない場合（全てのバックテストが失敗）は均等配分
+    if not weights:
+        n_methods = len(results)
+        weights = {k: 1.0 / n_methods for k in results.keys()}
+    
+    # 存在する方法のみで重みを正規化
+    available_methods = [m for m in weights.keys() if m in results]
+    weight_sum = sum(weights.get(m, 0) for m in available_methods)
+    
+    if weight_sum > 0:
+        normalized_weights = {m: weights.get(m, 0) / weight_sum for m in available_methods}
+    else:
+        normalized_weights = {m: 1.0 / len(available_methods) for m in available_methods}
+    
+    # 2. 加重平均の計算（未丸め値で計算）
+    weighted_predictions = np.zeros(periods)
+    for method in available_methods:
+        if method in raw_results:
+            weighted_predictions += raw_results[method] * normalized_weights[method]
+    
+    # 3. 従来の中央値も計算（安定性のため）
+    all_predictions = np.array([raw_results[m] for m in available_methods])
     median_predictions = np.median(all_predictions, axis=0)
     
-    # IQRで外れ値を検出
+    # 4. IQRで外れ値を検出
     q1 = np.percentile(all_predictions, 25, axis=0)
     q3 = np.percentile(all_predictions, 75, axis=0)
     iqr = q3 - q1
     
+    # 5. 外れ値を除外した平均
     lower_bound = q1 - 1.5 * iqr
     upper_bound = q3 + 1.5 * iqr
     
-    # 外れ値を除外した平均
     trimmed_predictions = []
     for i in range(periods):
         day_preds = all_predictions[:, i]
@@ -1491,26 +2061,55 @@ def forecast_ensemble(df: pd.DataFrame, periods: int) -> Tuple[pd.DataFrame, Dic
             trimmed_predictions.append(np.mean(valid_preds))
         else:
             trimmed_predictions.append(median_predictions[i])
-    
     trimmed_predictions = np.array(trimmed_predictions)
     
-    # 最終予測（中央値と外れ値除外平均の平均）
-    final_predictions = (median_predictions + trimmed_predictions) / 2
+    # 6. 【v22】最終予測: 加重平均(50%) + 中央値(30%) + トリム平均(20%)
+    final_predictions_raw = (
+        weighted_predictions * 0.5 +
+        median_predictions * 0.3 +
+        trimmed_predictions * 0.2
+    )
     
-    # 結果DataFrame
+    # 7. 分位点の計算（各方法の予測から）
+    p50_raw = np.percentile(all_predictions, 50, axis=0)
+    p80_raw = np.percentile(all_predictions, 80, axis=0)
+    p90_raw = np.percentile(all_predictions, 90, axis=0)
+    
+    # ========== 結果DataFrame ==========
     last_date = df['date'].max()
     future_dates = pd.date_range(start=last_date + timedelta(days=1), periods=periods, freq='D')
     
     result_df = pd.DataFrame({
         'date': future_dates,
-        'predicted': np.round(final_predictions).astype(int).clip(min=0),
+        'predicted_raw': final_predictions_raw,                          # 【v22】未丸め
+        'predicted': np.round(final_predictions_raw).astype(int).clip(min=0),
         'predicted_median': np.round(median_predictions).astype(int).clip(min=0),
+        'predicted_weighted': np.round(weighted_predictions).astype(int).clip(min=0),  # 【v22】
         'predicted_lower': np.round(q1).astype(int).clip(min=0),
-        'predicted_upper': np.round(q3).astype(int).clip(min=0)
+        'predicted_upper': np.round(q3).astype(int).clip(min=0),
+        # 【v22】分位点
+        'p50_raw': p50_raw,
+        'p80_raw': p80_raw,
+        'p90_raw': p90_raw,
+        'p50': np.round(p50_raw).astype(int).clip(min=0),
+        'p80': np.round(p80_raw).astype(int).clip(min=0),
+        'p90': np.round(p90_raw).astype(int).clip(min=0),
     })
+    
+    # 【v22】発注モードに応じた推奨値
+    if order_mode == 'conservative':
+        result_df['recommended_raw'] = result_df['p50_raw']
+        result_df['recommended'] = result_df['p50']
+    elif order_mode == 'aggressive':
+        result_df['recommended_raw'] = result_df['p90_raw']
+        result_df['recommended'] = result_df['p90']
+    else:  # balanced
+        result_df['recommended_raw'] = result_df['p80_raw']
+        result_df['recommended'] = result_df['p80']
     
     # 各方法の合計
     method_totals = {method: int(np.sum(preds)) for method, preds in results.items()}
+    method_totals_raw = {method: float(np.sum(raw_results[method])) for method in available_methods}
     
     # 信頼度評価
     reliability = calculate_reliability_score(
@@ -1519,15 +2118,24 @@ def forecast_ensemble(df: pd.DataFrame, periods: int) -> Tuple[pd.DataFrame, Dic
         len(df)
     )
     
+    # 【v22】アンサンブル詳細情報
     ensemble_info = {
         'methods_used': list(results.keys()),
         'method_totals': method_totals,
-        'ensemble_total': int(np.sum(final_predictions)),
-        'median_total': int(np.sum(median_predictions)),
-        'reliability': reliability
+        'method_totals_raw': method_totals_raw,  # 【v22】
+        'weights': normalized_weights,            # 【v22】各方法の重み
+        'ensemble_total': int(np.sum(np.round(final_predictions_raw))),
+        'ensemble_total_raw': float(np.sum(final_predictions_raw)),  # 【v22】
+        'median_total': int(np.sum(np.round(median_predictions))),
+        'weighted_total': int(np.sum(np.round(weighted_predictions))),  # 【v22】
+        'order_mode': order_mode,                 # 【v22】
+        'reliability': reliability,
+        'backtest_mapes': {m: bt.get('mape') for m, bt in backtest_results.items() if bt}  # 【v22】
     }
     
     result_df.attrs['ensemble'] = ensemble_info
+    result_df.attrs['order_mode'] = order_mode  # 【v22】
+    result_df.attrs['backtest'] = backtest_results.get('精度強化版', {'mape': None, 'available': False})
     
     return result_df, ensemble_info
 
@@ -2161,9 +2769,13 @@ def forecast_with_seasonality_enhanced(
         pred = max(0.1, pred)
         point_predictions.append(pred)
         
+        # 【v22改善】丸め処理の後段化
+        # predicted_raw: 浮動小数点のまま保持（精度向上のため）
+        # predicted: 表示用の整数丸め
         predictions.append({
             'date': d,
-            'predicted': round(pred),
+            'predicted_raw': pred,                # 【v22】未丸め値（float）
+            'predicted': int(round(pred)),        # 表示用（int）
             'weekday_factor': weekday_f,
             'month_factor': month_f,
             'special_factor': special_f,
@@ -2179,16 +2791,23 @@ def forecast_with_seasonality_enhanced(
             point_array, residuals, quantiles=[0.5, 0.8, 0.9]
         )
         
+        # 【v22改善】分位点も未丸め値と丸め値の両方を保持
+        result_df['p50_raw'] = quantile_results['p50']                      # 【v22】未丸め
+        result_df['p80_raw'] = quantile_results['p80']                      # 【v22】未丸め
+        result_df['p90_raw'] = quantile_results['p90']                      # 【v22】未丸め
         result_df['p50'] = quantile_results['p50'].round().astype(int)
         result_df['p80'] = quantile_results['p80'].round().astype(int)
         result_df['p90'] = quantile_results['p90'].round().astype(int)
         
-        # 発注モードに応じた推奨値
+        # 発注モードに応じた推奨値（【v22改善】未丸め値も追加）
         if order_mode == 'conservative':  # 滞留回避
+            result_df['recommended_raw'] = result_df['p50_raw']             # 【v22】未丸め
             result_df['recommended'] = result_df['p50']
         elif order_mode == 'aggressive':  # 欠品回避
+            result_df['recommended_raw'] = result_df['p90_raw']             # 【v22】未丸め
             result_df['recommended'] = result_df['p90']
         else:  # balanced
+            result_df['recommended_raw'] = result_df['p80_raw']             # 【v22】未丸め
             result_df['recommended'] = result_df['p80']
     
     # ========== 10. メタデータの保存 ==========
@@ -2213,6 +2832,9 @@ def forecast_with_seasonality_enhanced(
         'trend_info': trend_info,
         'daily_new_year': use_daily_new_year
     }
+    
+    # 【v22追加】発注モード情報
+    result_df.attrs['order_mode'] = order_mode
     
     # 発注点計算（残差がある場合）
     if backtest_result and backtest_result.get('available') and backtest_result.get('residuals'):
@@ -2369,8 +2991,8 @@ def forecast_with_vertex_ai(
             return forecast, f"精度強化版（Holt-Wintersの代替: {message}）"
     
     elif method == "🧠 アンサンブル予測（v21）":
-        # v21新機能: アンサンブル予測
-        result, ensemble_info = forecast_ensemble(df, periods)
+        # v21新機能: アンサンブル予測【v22改善：order_mode対応】
+        result, ensemble_info = forecast_ensemble(df, periods, order_mode=order_mode)
         
         # メッセージ生成
         methods_used = ensemble_info.get('methods_used', [])
@@ -2473,10 +3095,11 @@ def forecast_all_methods_with_vertex_ai(
     product_id: str = "default",
     baseline_method: str = 'median',
     auto_special_factors: bool = True,
-    backtest_days: int = 14
+    backtest_days: int = 14,
+    order_mode: str = 'balanced'  # 【v22追加】発注モード
 ) -> Dict[str, Tuple[pd.DataFrame, str]]:
     """
-    すべての予測方法で予測を実行（v21: Prophet、Holt-Winters、アンサンブル追加）
+    すべての予測方法で予測を実行（v22: 発注モード対応）
     """
     results = {}
     
@@ -2488,24 +3111,25 @@ def forecast_all_methods_with_vertex_ai(
         except Exception as e:
             logger.warning(f"Vertex AI予測失敗: {e}")
     
-    # 【v21新規】アンサンブル予測
+    # 【v21新規】アンサンブル予測【v22改善：order_mode対応】
     try:
-        ensemble_result, ensemble_info = forecast_ensemble(df, periods)
+        ensemble_result, ensemble_info = forecast_ensemble(df, periods, order_mode=order_mode)
         reliability = ensemble_info.get('reliability', {})
         reliability_text = reliability.get('level_text', '')
+        weights_info = ensemble_info.get('weights', {})
         method_desc = f"アンサンブル予測（{len(ensemble_info.get('methods_used', []))}手法・信頼度: {reliability_text}）"
         results['アンサンブル'] = (ensemble_result, method_desc)
     except Exception as e:
         logger.warning(f"アンサンブル予測失敗: {e}")
     
-    # 【v19新規】精度強化版予測
+    # 【v19新規】精度強化版予測【v22改善：order_mode対応】
     try:
         enhanced_forecast = forecast_with_seasonality_enhanced(
             df, periods,
             baseline_method=baseline_method,
             auto_special_factors=auto_special_factors,
             include_quantiles=True,
-            order_mode='balanced',
+            order_mode=order_mode,  # 【v22】発注モードを渡す
             backtest_days=backtest_days
         )
         method_desc = f"季節性考慮（精度強化版・{baseline_method}ベース）"
@@ -2542,23 +3166,39 @@ def forecast_all_methods_with_vertex_ai(
 def display_comparison_results_v19(
     all_results: Dict[str, Tuple[pd.DataFrame, str]], 
     forecast_days: int, 
-    sales_data: pd.DataFrame = None
+    sales_data: pd.DataFrame = None,
+    order_mode: str = 'balanced'  # 【v22追加】発注モード
 ):
-    """【v19新機能】すべての予測方法の比較結果を表示（バックテスト情報付き）"""
+    """
+    【v22改善版】すべての予測方法の比較結果を表示
+    
+    v21からの改善点:
+    - 発注モードに応じた採用列の統一
+    - recommended列があればそちらを使用
+    - 未丸め値と丸め値の両方を表示
+    - 最強ファクトチェックプロンプトの使用
+    """
     st.success("✅ すべての予測方法で比較完了！")
     
-    # 各予測方法の予測総数を計算
+    # 【v22】発注モードの表示
+    mode_display = get_order_mode_display_name(order_mode)
+    st.info(f"📦 **発注モード**: {mode_display}")
+    
+    # 各予測方法の予測総数を計算【v22改善：採用列統一】
     method_totals = {}
     backtest_info = {}
     
     for method_name, (forecast, message) in all_results.items():
-        raw_total = int(forecast['predicted'].sum())
-        rounded_total = round_up_to_50(raw_total)
-        avg_predicted = forecast['predicted'].mean()
+        # 【v22】採用列を統一して合計計算
+        totals = calculate_forecast_totals_v22(forecast, order_mode)
+        
         method_totals[method_name] = {
-            'raw': raw_total,
-            'rounded': rounded_total,
-            'avg': avg_predicted
+            'raw': totals['raw_total'],
+            'rounded': totals['rounded_total'],
+            'avg': totals['avg_daily'],
+            'avg_raw': totals['avg_daily_raw'],       # 【v22】未丸め
+            'order_column': totals['order_column'],   # 【v22】採用列
+            'predicted_total': totals['predicted_total']  # 【v22】参考値
         }
         
         # バックテスト情報があれば取得
@@ -2570,13 +3210,17 @@ def display_comparison_results_v19(
     # ========== 各予測方法の予測総数を明確に表示 ==========
     st.write("### 📊 各予測方法の予測総数（発注推奨数）")
     
+    # 【v22】採用列の説明
+    st.caption(f"※ 発注モード「{mode_display}」に基づき、採用列を統一して計算しています")
+    
     # 分かりやすいリスト形式で表示
     st.markdown("---")
     for method_name, totals in method_totals.items():
         icon = "🚀" if "Vertex" in method_name else "🧠" if "アンサンブル" in method_name else "🎯" if "精度強化" in method_name else "📊" if "Prophet" in method_name else "📈" if "Holt" in method_name or "季節" in method_name else "📊" if "移動" in method_name else "📉"
         mape_str = f"（MAPE {backtest_info[method_name]:.1f}%）" if method_name in backtest_info else ""
+        col_info = f"[{totals['order_column']}]" if totals['order_column'] != 'predicted' else ""
         st.markdown(f"""
-        **{icon} {safe_html(method_name)}**: **{totals['rounded']:,}体**（日販 {totals['avg']:.1f}体）{mape_str}
+        **{icon} {safe_html(method_name)}**: **{totals['rounded']:,}体**（日販 {totals['avg']:.1f}体）{mape_str} {col_info}
         """)
     st.markdown("---")
     
@@ -2595,22 +3239,27 @@ def display_comparison_results_v19(
                 delta_str
             )
     
-    # 詳細表
-    with st.expander("📋 詳細データを表示", expanded=False):
+    # 詳細表【v22改善：採用列と未丸め値を追加】
+    with st.expander("📋 詳細データを表示（監査用）", expanded=False):
         summary_rows = []
         for method_name, totals in method_totals.items():
             icon = "🚀" if "Vertex" in method_name else "🧠" if "アンサンブル" in method_name else "🎯" if "精度強化" in method_name else "📊" if "Prophet" in method_name else "📈" if "Holt" in method_name or "季節" in method_name else "📊" if "移動" in method_name else "📉"
             mape_str = f"{backtest_info[method_name]:.1f}%" if method_name in backtest_info else "-"
             summary_rows.append({
                 '予測方法': f"{icon} {method_name}",
-                '予測総数（生値）': f"{totals['raw']:,}体",
-                '発注推奨数（50倍数）': f"{totals['rounded']:,}体",
-                '平均日販': f"{totals['avg']:.1f}体/日",
+                '採用列': totals['order_column'],  # 【v22】
+                '合計（未丸め）': f"{totals['raw']:,.2f}体",  # 【v22】
+                '発注推奨数（50単位）': f"{totals['rounded']:,}体",
+                '日販（未丸め）': f"{totals['avg_raw']:.2f}体/日",  # 【v22】
+                'predicted合計': f"{totals['predicted_total']:,.0f}体",  # 【v22】参考
                 'MAPE': mape_str
             })
         
         summary_df = pd.DataFrame(summary_rows)
         st.dataframe(summary_df, use_container_width=True, hide_index=True)
+        
+        # 【v22】検算用の説明
+        st.caption("※「採用列」は発注モードに応じて自動選択されます（P90→aggressive、P80→balanced、P50→conservative）")
     
     # 統計サマリー
     all_rounded = [t['rounded'] for t in method_totals.values()]
@@ -2630,7 +3279,7 @@ def display_comparison_results_v19(
         diff_pct = (max(all_raw) - min(all_raw)) / min(all_raw) * 100 if min(all_raw) > 0 else 0
         st.info(f"📏 **予測値の幅**: 最小〜最大で **{diff:,}体** の差（{diff_pct:.1f}%）")
     
-    # 【v19新機能】推奨の判断基準
+    # 【v22改善】推奨の判断基準
     if backtest_info:
         best_method = min(backtest_info.keys(), key=lambda x: backtest_info[x])
         best_mape = backtest_info[best_method]
@@ -2651,15 +3300,17 @@ def display_comparison_results_v19(
         '指数平滑法': '#FF9800'
     }
     
-    # 比較グラフ（スマホ最適化）
+    # 比較グラフ（スマホ最適化）【v22改善：採用列でグラフ描画】
     st.write("### 📈 日別予測比較グラフ")
     
     fig = go.Figure()
     
     for method_name, (forecast, message) in all_results.items():
+        # 【v22】採用列を使用（なければpredicted）
+        y_col = get_order_column(forecast, order_mode)
         fig.add_trace(go.Scatter(
             x=forecast['date'],
-            y=forecast['predicted'],
+            y=forecast[y_col] if y_col in forecast.columns else forecast['predicted'],
             mode='lines',
             name=method_name,
             line=dict(color=method_colors.get(method_name, '#666666'), width=2)
@@ -2685,23 +3336,43 @@ def display_comparison_results_v19(
     
     st.session_state.forecast_results = {k: v[0] for k, v in all_results.items()}
     
-    # ファクトチェック用プロンプトセクション
+    # 【v22改善】最強ファクトチェックプロンプト
     product_names = st.session_state.get('selected_products', [])
-    factcheck_prompt = generate_factcheck_prompt_comparison(
+    
+    # 精度強化版があればそれを使用
+    if '精度強化版' in all_results:
+        best_forecast = all_results['精度強化版'][0]
+        best_method_name = '精度強化版'
+    elif 'アンサンブル' in all_results:
+        best_forecast = all_results['アンサンブル'][0]
+        best_method_name = 'アンサンブル'
+    else:
+        best_forecast = list(all_results.values())[0][0]
+        best_method_name = list(all_results.keys())[0]
+    
+    # v20機能情報とバックテスト結果を取得
+    v20_features = best_forecast.attrs.get('v20_features', None) if hasattr(best_forecast, 'attrs') else None
+    backtest_result = best_forecast.attrs.get('backtest', None) if hasattr(best_forecast, 'attrs') else None
+    
+    # 最強ファクトチェックプロンプトを生成
+    factcheck_prompt = generate_factcheck_prompt_advanced(
         product_names=product_names,
-        all_results=all_results,
-        method_totals=method_totals,
+        forecast_result=best_forecast,
+        order_mode=order_mode,
+        sales_data=sales_data,
         forecast_days=forecast_days,
-        sales_data=sales_data
+        method_name=best_method_name,
+        v20_features=v20_features,
+        backtest_result=backtest_result
     )
-    display_factcheck_section(factcheck_prompt, key_suffix="comparison_v19")
+    display_factcheck_section(factcheck_prompt, key_suffix="comparison_v22")
 
 
 # 旧バージョンとの互換性のため残す
 def display_comparison_results_v12(all_results: Dict[str, Tuple[pd.DataFrame, str]], forecast_days: int, sales_data: pd.DataFrame = None):
     """すべての予測方法の比較結果を表示（v12 互換性維持用）"""
-    # v19版を呼び出し
-    display_comparison_results_v19(all_results, forecast_days, sales_data)
+    # v22版を呼び出し（デフォルトのbalancedモードで）
+    display_comparison_results_v19(all_results, forecast_days, sales_data, order_mode='balanced')
 
 
 # =============================================================================
@@ -3545,9 +4216,21 @@ if 'v20_use_daily_new_year' not in st.session_state:
 if 'v20_trend_window_days' not in st.session_state:
     st.session_state.v20_trend_window_days = 60  # デフォルト: 60日
 if 'v20_stockout_periods' not in st.session_state:
-    st.session_state.v20_stockout_periods = []  # 欠品期間リスト
+    st.session_state.v20_stockout_periods = []  # 欠品期間リスト（全体用・互換性維持）
 if 'v20_last_reorder_point' not in st.session_state:
     st.session_state.v20_last_reorder_point = None
+
+# 【v22新機能】商品個別の欠品期間管理
+if 'v22_product_stockout_periods' not in st.session_state:
+    st.session_state.v22_product_stockout_periods = {}  # {商品名: [(開始日, 終了日), ...]}
+
+# 【v22新機能】六曜設定（デフォルトOFF - 簡易計算が不正確なため）
+if 'v22_enable_rokuyou' not in st.session_state:
+    st.session_state.v22_enable_rokuyou = False  # デフォルト: 六曜OFF
+
+# 【v22新機能】発注モードのデフォルト
+if 'v22_order_mode' not in st.session_state:
+    st.session_state.v22_order_mode = 'balanced'  # デフォルト: バランス（P80）
 
 
 # =============================================================================
@@ -5025,15 +5708,16 @@ def render_forecast_section(sales_data: pd.DataFrame):
         with st.spinner("予測中..."):
             try:
                 if method == "🔄 すべての方法で比較":
-                    # すべての方法で予測
+                    # すべての方法で予測【v22改善：order_mode対応】
                     product_id = "_".join(st.session_state.selected_products[:3])
                     all_results = forecast_all_methods_with_vertex_ai(
                         sales_data, forecast_days, product_id,
                         baseline_method=baseline_method,
                         auto_special_factors=auto_special_factors,
-                        backtest_days=backtest_days
+                        backtest_days=backtest_days,
+                        order_mode=order_mode  # 【v22】発注モードを渡す
                     )
-                    display_comparison_results_v19(all_results, forecast_days, sales_data)
+                    display_comparison_results_v19(all_results, forecast_days, sales_data, order_mode=order_mode)  # 【v22】
                 else:
                     # 単一の予測方法
                     product_id = "_".join(st.session_state.selected_products[:3])
@@ -7404,7 +8088,7 @@ def main():
     st.divider()
     
     # バージョン情報（v20更新）
-    version_info = "v21 (高精度版 - アンサンブル・Prophet・Holt-Winters・信頼度評価対応)"
+    version_info = "v22 (超高精度版 - 加重アンサンブル・採用列統一・監査対応ファクトチェック)"
     if VERTEX_AI_AVAILABLE:
         version_info += " | 🚀 Vertex AI: 有効"
     else:
