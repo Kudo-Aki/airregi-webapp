@@ -1,5 +1,9 @@
 """
-Airレジ 売上分析・需要予測 Webアプリ（v22.1: 全方法統合予測版 - 2024/02/04修正）
+Airレジ 売上分析・需要予測 Webアプリ（v22.3: 全方法統合予測版 - form分離修正）
+
+【v22.3 変更点】
+- formとsession_state書き込みを完全に分離してStreamlitエラーを回避
+- 予測実行をフラグ方式で管理（form送信→rerun→予測実行）
 
 【v22.1 変更点】
 - 予測方法選択を廃止: 「予測する」ボタン1つで全方法を自動実行
@@ -7379,13 +7383,13 @@ def render_individual_year_comparison(df_agg: pd.DataFrame, unit_name: str, star
 
 def render_individual_forecast_section():
     """
-    【v22全面改訂版】個別予測セクション
+    【v22.3修正版】個別予測セクション
     
     変更点:
     - 予測方法の選択を廃止（常に全方法で自動実行）
     - 各方法の結果一覧 + 説明を表示
     - 最終推奨発注数（3パターン: 滞留回避/バランス/欠品回避）を提示
-    - 精度が高いモデルを重視した加重平均で最終推奨を算出
+    - formとsession_state書き込みを分離してエラー回避
     """
     st.markdown('<p class="section-header">④ 個別需要予測</p>', unsafe_allow_html=True)
     
@@ -7394,212 +7398,18 @@ def render_individual_forecast_section():
         return
     
     # ==========================================================================
-    # 【v22】予測パラメータ設定（予測方法選択を廃止）
+    # 予測実行フラグのチェック（formの外で予測を実行）
     # ==========================================================================
-    with st.form(key="individual_forecast_form_v22"):
-        st.write("### 🎯 予測設定")
-        st.info("📊 **全予測方法で自動的に予測し、最適な発注数を算出します**")
+    if st.session_state.get('v22_run_forecast_flag'):
+        # フラグをクリア
+        params = st.session_state.pop('v22_run_forecast_flag')
         
-        # 予測期間の設定
-        forecast_mode = st.radio(
-            "予測期間の指定方法",
-            ["日数で指定", "期間で指定"],
-            horizontal=True,
-            key="v22_forecast_mode",
-            help="「期間で指定」は期間限定品の予測に便利です"
-        )
-        
-        if forecast_mode == "日数で指定":
-            forecast_days = st.slider("予測日数", 30, 365, 180, key="v22_forecast_days")
-            forecast_start_date = None
-            forecast_end_date = None
-        else:
-            # 期間指定UI
-            today = date.today()
-            default_start = today + timedelta(days=1)
-            default_end = today + timedelta(days=180)
-            
-            st.write("**予測期間指定**")
-            col_s1, col_s2, col_s3, col_e1, col_e2, col_e3 = st.columns([1, 1, 1, 1, 1, 1])
-            
-            with col_s1:
-                start_year = st.selectbox(
-                    "予測開始年",
-                    list(range(2025, 2028)),
-                    index=list(range(2025, 2028)).index(default_start.year) if default_start.year in range(2025, 2028) else 0,
-                    key="v22_start_year"
-                )
-            with col_s2:
-                start_month = st.selectbox(
-                    "予測開始月",
-                    list(range(1, 13)),
-                    index=default_start.month - 1,
-                    format_func=lambda x: f"{x}月",
-                    key="v22_start_month"
-                )
-            with col_s3:
-                max_day_start = calendar.monthrange(start_year, start_month)[1]
-                start_day = st.selectbox(
-                    "予測開始日",
-                    list(range(1, max_day_start + 1)),
-                    index=min(default_start.day - 1, max_day_start - 1),
-                    format_func=lambda x: f"{x}日",
-                    key="v22_start_day"
-                )
-            
-            with col_e1:
-                end_year = st.selectbox(
-                    "予測終了年",
-                    list(range(2025, 2028)),
-                    index=list(range(2025, 2028)).index(default_end.year) if default_end.year in range(2025, 2028) else 0,
-                    key="v22_end_year"
-                )
-            with col_e2:
-                end_month = st.selectbox(
-                    "予測終了月",
-                    list(range(1, 13)),
-                    index=default_end.month - 1,
-                    format_func=lambda x: f"{x}月",
-                    key="v22_end_month"
-                )
-            with col_e3:
-                max_day_end = calendar.monthrange(end_year, end_month)[1]
-                end_day = st.selectbox(
-                    "予測終了日",
-                    list(range(1, max_day_end + 1)),
-                    index=min(default_end.day - 1, max_day_end - 1),
-                    format_func=lambda x: f"{x}日",
-                    key="v22_end_day"
-                )
-            
-            forecast_start_date = date(start_year, start_month, start_day)
-            forecast_end_date = date(end_year, end_month, end_day)
-            forecast_days = max(1, (forecast_end_date - forecast_start_date).days + 1)
-        
-        # ==========================================================================
-        # 【v22】詳細設定（精度強化オプション）
-        # ==========================================================================
-        with st.expander("⚙️ **詳細設定（精度強化オプション）**", expanded=False):
-            col_v20_1, col_v20_2 = st.columns(2)
-            
-            with col_v20_1:
-                enable_zero_fill = st.checkbox(
-                    "0埋め処理（推奨）",
-                    value=True,
-                    help="売上がない日を0で補完し、正確な曜日・季節係数を計算します",
-                    key="v22_zero_fill"
-                )
-                
-                enable_trend = st.checkbox(
-                    "トレンド係数（前年比）",
-                    value=True,
-                    help="直近の売上と前年同期を比較し、成長/衰退トレンドを反映します",
-                    key="v22_trend"
-                )
-            
-            with col_v20_2:
-                use_daily_new_year = st.checkbox(
-                    "正月日別係数（1/1〜1/7）",
-                    value=True,
-                    help="正月を日別に係数設定し、元日のピークを正確に捉えます",
-                    key="v22_daily_new_year"
-                )
-                
-                trend_window_days = st.selectbox(
-                    "トレンド比較期間",
-                    options=[30, 60, 90],
-                    format_func=lambda x: f"直近{x}日間",
-                    index=1,
-                    key="v22_trend_window"
-                )
-            
-            # 欠品期間の表示
-            st.markdown("**🚫 欠品期間の除外**")
-            if st.session_state.get('v20_stockout_periods'):
-                st.info(f"登録済み欠品期間: {len(st.session_state.v20_stockout_periods)}件（フォーム下部で管理）")
-            else:
-                st.caption("欠品期間は予測実行ボタンの下で登録できます")
-        
-        # ==========================================================================
-        # 予測実行ボタン
-        # ==========================================================================
-        submitted = st.form_submit_button(
-            "🔮 全方法で需要予測を実行",
-            type="primary",
-            use_container_width=True
-        )
-    
-    # ==========================================================================
-    # 欠品期間の管理（フォーム外）
-    # ==========================================================================
-    with st.expander("🚫 欠品期間の登録・管理", expanded=False):
-        st.caption("在庫切れ期間を指定すると、その期間は学習から除外されます")
-        
-        col_stock1, col_stock2, col_stock3 = st.columns([2, 2, 1])
-        
-        with col_stock1:
-            stockout_start = st.date_input(
-                "欠品開始日",
-                value=None,
-                key="v22_stockout_start"
-            )
-        
-        with col_stock2:
-            stockout_end = st.date_input(
-                "欠品終了日",
-                value=None,
-                key="v22_stockout_end"
-            )
-        
-        with col_stock3:
-            st.write("")
-            st.write("")
-            add_stockout = st.button("➕ 追加", key="v22_add_stockout")
-        
-        if add_stockout and stockout_start and stockout_end:
-            if stockout_start <= stockout_end:
-                if 'v20_stockout_periods' not in st.session_state:
-                    st.session_state.v20_stockout_periods = []
-                new_period = (stockout_start, stockout_end)
-                if new_period not in st.session_state.v20_stockout_periods:
-                    st.session_state.v20_stockout_periods.append(new_period)
-                    st.success(f"欠品期間を追加しました: {stockout_start} 〜 {stockout_end}")
-                    st.rerun()
-            else:
-                st.warning("終了日は開始日以降にしてください")
-        
-        if st.session_state.get('v20_stockout_periods'):
-            st.markdown("**登録済み欠品期間:**")
-            for i, (s, e) in enumerate(st.session_state.v20_stockout_periods):
-                col_p1, col_p2 = st.columns([4, 1])
-                with col_p1:
-                    st.text(f"  {i+1}. {s} 〜 {e}")
-                with col_p2:
-                    if st.button("🗑️", key=f"v22_del_stockout_{i}", help="この期間を削除"):
-                        st.session_state.v20_stockout_periods.pop(i)
-                        st.rerun()
-            
-            if st.button("すべてクリア", key="v22_clear_all_stockout"):
-                st.session_state.v20_stockout_periods = []
-                st.rerun()
-        else:
-            st.info("欠品期間は登録されていません")
-    
-    # ==========================================================================
-    # 【v22】予測実行
-    # ==========================================================================
-    if submitted:
-        # 期間指定の検証
-        if forecast_mode == "期間で指定":
-            if forecast_end_date <= forecast_start_date:
-                st.error("⚠️ 終了日は開始日より後にしてください")
-                return
-            st.info(f"📅 予測期間: {forecast_start_date.strftime('%Y年%m月%d日')} 〜 {forecast_end_date.strftime('%Y年%m月%d日')}（{forecast_days}日間）")
-        
-        # 欠品期間の取得
-        stockout_periods = st.session_state.get('v20_stockout_periods', None)
-        if stockout_periods:
-            stockout_periods = [(s, e) for s, e in stockout_periods]
+        forecast_days = params['forecast_days']
+        enable_zero_fill = params['enable_zero_fill']
+        enable_trend = params['enable_trend']
+        use_daily_new_year = params['use_daily_new_year']
+        trend_window_days = params['trend_window_days']
+        stockout_periods = params.get('stockout_periods')
         
         with st.spinner("全予測方法で予測中..."):
             all_products_results = {}
@@ -7607,7 +7417,6 @@ def render_individual_forecast_section():
             
             for product_name, sales_data in st.session_state.individual_sales_data.items():
                 try:
-                    # 全方法で予測実行
                     method_results = forecast_all_methods_unified_v22(
                         df=sales_data,
                         periods=forecast_days,
@@ -7663,11 +7472,11 @@ def render_individual_forecast_section():
                 
                 # 入力データを結合
                 combined_sales_data = None
-                for product_name, sales_data in st.session_state.individual_sales_data.items():
+                for pname, sdata in st.session_state.individual_sales_data.items():
                     if combined_sales_data is None:
-                        combined_sales_data = sales_data.copy()
+                        combined_sales_data = sdata.copy()
                     else:
-                        combined_sales_data = pd.concat([combined_sales_data, sales_data], ignore_index=True)
+                        combined_sales_data = pd.concat([combined_sales_data, sdata], ignore_index=True)
                 
                 # 最終推奨発注数を算出
                 final_recommendation = calculate_final_recommendation_v22(
@@ -7676,11 +7485,13 @@ def render_individual_forecast_section():
                 )
                 
                 # session_stateに保存
-                st.session_state.v22_unified_results = combined_results
-                st.session_state.v22_final_recommendation = final_recommendation
-                st.session_state.v22_forecast_days = forecast_days
-                st.session_state.v22_product_names = product_names
-                st.session_state.v22_all_products_results = all_products_results
+                st.session_state['v22_results'] = {
+                    'combined_results': combined_results,
+                    'final_recommendation': final_recommendation,
+                    'forecast_days': forecast_days,
+                    'product_names': product_names,
+                    'all_products_results': all_products_results
+                }
                 
                 # 納品計画用に従来形式でも保存
                 balanced_total = final_recommendation['balanced']['total']
@@ -7689,54 +7500,269 @@ def render_individual_forecast_section():
                 
                 # individual_forecast_resultsも保存（互換性のため）
                 individual_results = []
-                for product_name, method_results in all_products_results.items():
+                for pname, mresults in all_products_results.items():
                     best_method = None
                     best_mape = float('inf')
-                    for method_name, result in method_results.items():
-                        if result.get('mape') and result['mape'] < best_mape:
-                            best_mape = result['mape']
-                            best_method = method_name
+                    for mname, res in mresults.items():
+                        if res.get('mape') and res['mape'] < best_mape:
+                            best_mape = res['mape']
+                            best_method = mname
                     
                     if best_method is None:
-                        best_method = '精度強化版' if '精度強化版' in method_results else list(method_results.keys())[0]
+                        best_method = '精度強化版' if '精度強化版' in mresults else list(mresults.keys())[0]
                     
-                    result = method_results.get(best_method, {})
-                    totals = result.get('totals', {})
+                    res = mresults.get(best_method, {})
+                    tots = res.get('totals', {})
                     
                     individual_results.append({
-                        'product': product_name,
-                        'forecast': result.get('forecast'),
-                        'raw_total': totals.get('balanced', 0),
-                        'rounded_total': totals.get('balanced', 0),
-                        'avg_predicted': totals.get('balanced', 0) / forecast_days if forecast_days > 0 else 0,
+                        'product': pname,
+                        'forecast': res.get('forecast'),
+                        'raw_total': tots.get('balanced', 0),
+                        'rounded_total': tots.get('balanced', 0),
+                        'avg_predicted': tots.get('balanced', 0) / forecast_days if forecast_days > 0 else 0,
                         'method_message': f'v22統合予測（{best_method}）'
                     })
                 
                 st.session_state.individual_forecast_results = individual_results
+                st.success("✅ 予測が完了しました！")
+    
+    # ==========================================================================
+    # 【v22】予測パラメータ設定
+    # ==========================================================================
+    with st.form(key="individual_forecast_form_v22"):
+        st.write("### 🎯 予測設定")
+        st.info("📊 **全予測方法で自動的に予測し、最適な発注数を算出します**")
+        
+        # 予測期間の設定
+        forecast_mode = st.radio(
+            "予測期間の指定方法",
+            ["日数で指定", "期間で指定"],
+            horizontal=True,
+            key="v22_forecast_mode_input",
+            help="「期間で指定」は期間限定品の予測に便利です"
+        )
+        
+        if forecast_mode == "日数で指定":
+            forecast_days = st.slider("予測日数", 30, 365, 180, key="v22_forecast_days_input")
+            forecast_start_date = None
+            forecast_end_date = None
+        else:
+            # 期間指定UI
+            today = date.today()
+            default_start = today + timedelta(days=1)
+            default_end = today + timedelta(days=180)
+            
+            st.write("**予測期間指定**")
+            col_s1, col_s2, col_s3, col_e1, col_e2, col_e3 = st.columns([1, 1, 1, 1, 1, 1])
+            
+            with col_s1:
+                start_year = st.selectbox(
+                    "予測開始年",
+                    list(range(2025, 2028)),
+                    index=list(range(2025, 2028)).index(default_start.year) if default_start.year in range(2025, 2028) else 0,
+                    key="v22_start_year_input"
+                )
+            with col_s2:
+                start_month = st.selectbox(
+                    "予測開始月",
+                    list(range(1, 13)),
+                    index=default_start.month - 1,
+                    format_func=lambda x: f"{x}月",
+                    key="v22_start_month_input"
+                )
+            with col_s3:
+                max_day_start = calendar.monthrange(start_year, start_month)[1]
+                start_day = st.selectbox(
+                    "予測開始日",
+                    list(range(1, max_day_start + 1)),
+                    index=min(default_start.day - 1, max_day_start - 1),
+                    format_func=lambda x: f"{x}日",
+                    key="v22_start_day_input"
+                )
+            
+            with col_e1:
+                end_year = st.selectbox(
+                    "予測終了年",
+                    list(range(2025, 2028)),
+                    index=list(range(2025, 2028)).index(default_end.year) if default_end.year in range(2025, 2028) else 0,
+                    key="v22_end_year_input"
+                )
+            with col_e2:
+                end_month = st.selectbox(
+                    "予測終了月",
+                    list(range(1, 13)),
+                    index=default_end.month - 1,
+                    format_func=lambda x: f"{x}月",
+                    key="v22_end_month_input"
+                )
+            with col_e3:
+                max_day_end = calendar.monthrange(end_year, end_month)[1]
+                end_day = st.selectbox(
+                    "予測終了日",
+                    list(range(1, max_day_end + 1)),
+                    index=min(default_end.day - 1, max_day_end - 1),
+                    format_func=lambda x: f"{x}日",
+                    key="v22_end_day_input"
+                )
+            
+            forecast_start_date = date(start_year, start_month, start_day)
+            forecast_end_date = date(end_year, end_month, end_day)
+            forecast_days = max(1, (forecast_end_date - forecast_start_date).days + 1)
+        
+        # 詳細設定
+        with st.expander("⚙️ **詳細設定（精度強化オプション）**", expanded=False):
+            col_v20_1, col_v20_2 = st.columns(2)
+            
+            with col_v20_1:
+                enable_zero_fill = st.checkbox(
+                    "0埋め処理（推奨）",
+                    value=True,
+                    help="売上がない日を0で補完し、正確な曜日・季節係数を計算します",
+                    key="v22_zero_fill_input"
+                )
                 
+                enable_trend = st.checkbox(
+                    "トレンド係数（前年比）",
+                    value=True,
+                    help="直近の売上と前年同期を比較し、成長/衰退トレンドを反映します",
+                    key="v22_trend_input"
+                )
+            
+            with col_v20_2:
+                use_daily_new_year = st.checkbox(
+                    "正月日別係数（1/1〜1/7）",
+                    value=True,
+                    help="正月を日別に係数設定し、元日のピークを正確に捉えます",
+                    key="v22_daily_new_year_input"
+                )
+                
+                trend_window_days = st.selectbox(
+                    "トレンド比較期間",
+                    options=[30, 60, 90],
+                    format_func=lambda x: f"直近{x}日間",
+                    index=1,
+                    key="v22_trend_window_input"
+                )
+            
+            # 欠品期間の表示
+            st.markdown("**🚫 欠品期間の除外**")
+            if st.session_state.get('v20_stockout_periods'):
+                st.info(f"登録済み欠品期間: {len(st.session_state.v20_stockout_periods)}件（フォーム下部で管理）")
+            else:
+                st.caption("欠品期間は予測実行ボタンの下で登録できます")
+        
+        # 予測実行ボタン
+        submitted = st.form_submit_button(
+            "🔮 全方法で需要予測を実行",
+            type="primary",
+            use_container_width=True
+        )
+    
+    # ==========================================================================
+    # 欠品期間の管理（フォーム外）
+    # ==========================================================================
+    with st.expander("🚫 欠品期間の登録・管理", expanded=False):
+        st.caption("在庫切れ期間を指定すると、その期間は学習から除外されます")
+        
+        col_stock1, col_stock2, col_stock3 = st.columns([2, 2, 1])
+        
+        with col_stock1:
+            stockout_start = st.date_input(
+                "欠品開始日",
+                value=None,
+                key="v22_stockout_start_input"
+            )
+        
+        with col_stock2:
+            stockout_end = st.date_input(
+                "欠品終了日",
+                value=None,
+                key="v22_stockout_end_input"
+            )
+        
+        with col_stock3:
+            st.write("")
+            st.write("")
+            add_stockout = st.button("➕ 追加", key="v22_add_stockout_btn")
+        
+        if add_stockout and stockout_start and stockout_end:
+            if stockout_start <= stockout_end:
+                if 'v20_stockout_periods' not in st.session_state:
+                    st.session_state.v20_stockout_periods = []
+                new_period = (stockout_start, stockout_end)
+                if new_period not in st.session_state.v20_stockout_periods:
+                    st.session_state.v20_stockout_periods.append(new_period)
+                    st.success(f"欠品期間を追加しました: {stockout_start} 〜 {stockout_end}")
+                    st.rerun()
+            else:
+                st.warning("終了日は開始日以降にしてください")
+        
+        if st.session_state.get('v20_stockout_periods'):
+            st.markdown("**登録済み欠品期間:**")
+            for i, (s, e) in enumerate(st.session_state.v20_stockout_periods):
+                col_p1, col_p2 = st.columns([4, 1])
+                with col_p1:
+                    st.text(f"  {i+1}. {s} 〜 {e}")
+                with col_p2:
+                    if st.button("🗑️", key=f"v22_del_stockout_btn_{i}", help="この期間を削除"):
+                        st.session_state.v20_stockout_periods.pop(i)
+                        st.rerun()
+            
+            if st.button("すべてクリア", key="v22_clear_all_stockout_btn"):
+                st.session_state.v20_stockout_periods = []
                 st.rerun()
+        else:
+            st.info("欠品期間は登録されていません")
+    
+    # ==========================================================================
+    # フォーム送信時の処理（フラグを立ててrerun）
+    # ==========================================================================
+    if submitted:
+        # 期間指定の検証
+        if forecast_mode == "期間で指定":
+            if forecast_end_date <= forecast_start_date:
+                st.error("⚠️ 終了日は開始日より後にしてください")
+                return
+        
+        # 欠品期間の取得
+        stockout_periods = st.session_state.get('v20_stockout_periods', None)
+        if stockout_periods:
+            stockout_periods = [(s, e) for s, e in stockout_periods]
+        
+        # 予測実行フラグとパラメータをsession_stateに保存
+        st.session_state['v22_run_forecast_flag'] = {
+            'forecast_days': forecast_days,
+            'enable_zero_fill': enable_zero_fill,
+            'enable_trend': enable_trend,
+            'use_daily_new_year': use_daily_new_year,
+            'trend_window_days': trend_window_days,
+            'stockout_periods': stockout_periods
+        }
+        st.rerun()
     
     # ==========================================================================
     # 【v22】予測結果の表示
     # ==========================================================================
-    if st.session_state.get('v22_unified_results') and st.session_state.get('v22_final_recommendation'):
-        combined_results = st.session_state.v22_unified_results
-        final_recommendation = st.session_state.v22_final_recommendation
-        forecast_days = st.session_state.get('v22_forecast_days', 180)
-        product_names = st.session_state.get('v22_product_names', [])
+    if st.session_state.get('v22_results'):
+        results = st.session_state['v22_results']
+        combined_results = results['combined_results']
+        final_recommendation = results['final_recommendation']
+        forecast_days_result = results['forecast_days']
+        product_names = results['product_names']
         
         display_unified_forecast_results_v22(
             all_results=combined_results,
             final_recommendation=final_recommendation,
-            forecast_days=forecast_days,
+            forecast_days=forecast_days_result,
             sales_data=None,
             product_names=product_names
         )
         
         # 商品別の詳細（折りたたみ）
-        if st.session_state.get('v22_all_products_results'):
+        all_products_results = results.get('all_products_results', {})
+        if all_products_results:
             with st.expander("📦 **商品別の詳細結果**", expanded=False):
-                for product_name, method_results in st.session_state.v22_all_products_results.items():
+                for product_name, method_results in all_products_results.items():
                     st.markdown(f"#### {product_name}")
                     
                     table_data = []
@@ -7759,7 +7785,6 @@ def render_individual_forecast_section():
     # 従来の結果表示（互換性維持）
     # ==========================================================================
     elif st.session_state.get('individual_all_methods_results'):
-        # 旧形式の「すべての方法で比較」結果がある場合
         matrix_results = st.session_state.individual_all_methods_results
         method_names = []
         for product_methods in matrix_results.values():
@@ -7801,7 +7826,6 @@ def render_individual_forecast_section():
                 st.metric(f"{icon} {short_name}", f"{method_totals[method_name]:,}体")
     
     elif st.session_state.get('individual_forecast_results'):
-        # 通常の予測結果がある場合
         results = st.session_state.individual_forecast_results
         st.success(f"✅ {len(results)}件の授与品の予測が完了しました！")
         
@@ -8813,7 +8837,7 @@ def main():
     st.divider()
     
     # バージョン情報（v20更新）
-    version_info = "v22.1 (全方法統合予測版 - 2024/02/04修正)"
+    version_info = "v22.3 (全方法統合予測版 - form分離修正)"
     if VERTEX_AI_AVAILABLE:
         version_info += " | 🚀 Vertex AI: 有効"
     else:
