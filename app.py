@@ -4631,18 +4631,42 @@ def find_similar_products_v23(
         "観光客": ["御朱印", "限定", "記念"],
     }
     
+    # 【v23.1改善】商品名から固有キーワードを抽出
+    def extract_keywords(text: str) -> set:
+        """商品名から意味のあるキーワードを抽出"""
+        keywords = set()
+        # 漢字の連続（2文字以上）
+        keywords.update(re.findall(r'[\u4e00-\u9fff]{2,}', text))
+        # ひらがなの連続（2文字以上）
+        keywords.update(re.findall(r'[\u3040-\u309f]{2,}', text))
+        # カタカナの連続（2文字以上）
+        keywords.update(re.findall(r'[\u30a0-\u30ff]{2,}', text))
+        # 英数字の連続（2文字以上）
+        keywords.update(re.findall(r'[a-zA-Z0-9]{2,}', text.lower()))
+        return keywords
+    
+    search_keywords = extract_keywords(name)
+    if description:
+        search_keywords.update(extract_keywords(description))
+    
     # スコア統合
     results = []
     for i, (product, text_sim) in enumerate(zip(existing_products, similarities)):
         stats = product_stats[product]
         
-        # テキスト類似度 (60%)
-        score = text_sim * 0.60
+        # テキスト類似度 (40%) - 比重を下げる
+        score = text_sim * 0.40
         
-        # 価格類似度 (25%)
+        # 【v23.1新規】固有キーワード一致度 (25%)
+        product_keywords = extract_keywords(product)
+        if search_keywords and product_keywords:
+            keyword_match = len(search_keywords & product_keywords) / len(search_keywords)
+            score += keyword_match * 0.25
+        
+        # 価格類似度 (20%)
         if stats.get('unit_price', 0) > 0 and price > 0:
             price_ratio = min(stats['unit_price'], price) / max(stats['unit_price'], price)
-            score += price_ratio * 0.25
+            score += price_ratio * 0.20
         
         # カテゴリ一致 (10%)
         cat_match = 0
@@ -4677,6 +4701,7 @@ def find_similar_products_v23(
                 'unit_price': stats.get('unit_price', 0),
                 'similarity': score * 100,  # パーセント表示
                 'text_similarity': text_sim,
+                'keyword_match': len(search_keywords & product_keywords) if search_keywords and product_keywords else 0,
                 'method': method
             })
     
@@ -4864,7 +4889,24 @@ def estimate_calendar_factors_from_similar_v23(
         if expected > 0:
             residuals.append(row['販売商品数'] / expected)
     
-    cv = np.std(residuals) if residuals else 0.3
+    # 【v23.1修正】CVを安全な範囲にクリップ（5%〜100%）
+    # 残差の標準偏差から変動係数を計算
+    if residuals and len(residuals) > 1:
+        residuals_array = np.array(residuals)
+        # 外れ値を除外（1%〜99%パーセンタイル）
+        lower = np.percentile(residuals_array, 1)
+        upper = np.percentile(residuals_array, 99)
+        filtered_residuals = residuals_array[(residuals_array >= lower) & (residuals_array <= upper)]
+        
+        if len(filtered_residuals) > 1:
+            cv = np.std(filtered_residuals)
+        else:
+            cv = np.std(residuals_array)
+        
+        # CVを妥当な範囲にクリップ（0.05〜1.0 = 5%〜100%）
+        cv = np.clip(cv, 0.05, 1.0)
+    else:
+        cv = 0.3  # デフォルト30%
     
     return {
         'weekday': weekday_factors,
@@ -10279,7 +10321,7 @@ def main():
     st.divider()
     
     # バージョン情報（v20更新）
-    version_info = "v23 (精度改善版: TF-IDF類似度, 統計的P値, 分割発注提案)"
+    version_info = "v23.1 (CV修正・キーワード類似度改善)"
     if VERTEX_AI_AVAILABLE:
         version_info += " | 🚀 Vertex AI: 有効"
     else:
