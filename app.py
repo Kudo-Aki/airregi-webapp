@@ -1,5 +1,12 @@
 """
-Airレジ 売上分析・需要予測 Webアプリ（v23: 精度改善版）
+Airレジ 売上分析・需要予測 Webアプリ（v24: 異常値検出UI版）
+
+【v24 変更点】
+- 異常値検出関数（中央値のX倍超えを検出）
+- 閾値変更UI（3倍〜10倍のスライダー、デフォルト5倍）
+- 異常値確認UI（商品ごとに「正常/除外」を選択）
+- 予測時の除外処理（除外された日付を予測計算から除外）
+- データ入力日数表示（「③売上を見る」で「期間X日間 / データあり Y日」を表示）
 
 【v23 変更点】
 - 統計的に正しいP80/P90計算（期間合計の分布から算出）
@@ -3795,7 +3802,8 @@ def forecast_all_methods_unified_v22(
     stockout_periods: Optional[List[Tuple[date, date]]] = None,
     enable_trend: bool = True,
     use_daily_new_year: bool = True,
-    trend_window_days: int = 60
+    trend_window_days: int = 60,
+    outlier_excluded_dates: Optional[List[date]] = None  # 【v24新機能】異常値除外日付
 ) -> Dict[str, Dict[str, Any]]:
     """
     【v22新機能】全予測方法を実行し、モード別の結果を統合
@@ -3812,6 +3820,7 @@ def forecast_all_methods_unified_v22(
         enable_trend: トレンド係数
         use_daily_new_year: 正月日別係数
         trend_window_days: トレンド比較期間
+        outlier_excluded_dates: 【v24新機能】異常値として除外する日付リスト
     
     Returns:
         {
@@ -3830,6 +3839,11 @@ def forecast_all_methods_unified_v22(
     df = df.copy()
     df['date'] = pd.to_datetime(df['date'])
     df = df.sort_values('date')
+    
+    # 【v24新機能】異常値除外を適用
+    if outlier_excluded_dates:
+        df = exclude_outlier_dates(df, outlier_excluded_dates)
+        logger.info(f"異常値除外: {len(outlier_excluded_dates)}日分を除外して予測を実行")
     
     # 【v22.5】実績データの統計を計算（妥当性チェック用）
     actual_mean = df['販売商品数'].mean() if '販売商品数' in df.columns else 0
@@ -6577,10 +6591,88 @@ if 'v22_enable_rokuyou' not in st.session_state:
 if 'v22_order_mode' not in st.session_state:
     st.session_state.v22_order_mode = 'balanced'  # デフォルト: バランス（P80）
 
+# 【v24新機能】異常値検出・除外
+if 'v24_outlier_threshold' not in st.session_state:
+    st.session_state.v24_outlier_threshold = 5.0  # デフォルト: 中央値の5倍
+if 'v24_outlier_excluded_dates' not in st.session_state:
+    st.session_state.v24_outlier_excluded_dates = {}  # {商品名: [除外日付リスト]}
+
 
 # =============================================================================
 # ユーティリティ関数
 # =============================================================================
+
+def detect_outliers(df: pd.DataFrame, threshold: float = 5.0) -> pd.DataFrame:
+    """
+    【v24新機能】異常値検出（中央値のX倍超えを検出）
+    
+    Args:
+        df: 売上データ（'date', '販売商品数'列を含む）
+        threshold: 閾値（中央値の何倍を異常とするか）
+    
+    Returns:
+        異常値を含む行のDataFrame（date, 販売商品数, is_outlier, median, threshold_value）
+    """
+    if df.empty or '販売商品数' not in df.columns:
+        return pd.DataFrame()
+    
+    df = df.copy()
+    df['date'] = pd.to_datetime(df['date'])
+    
+    # 0より大きい値のみで中央値を計算（0は「販売なし」なので除外）
+    positive_values = df[df['販売商品数'] > 0]['販売商品数']
+    
+    if positive_values.empty:
+        return pd.DataFrame()
+    
+    median_val = positive_values.median()
+    threshold_value = median_val * threshold
+    
+    # 異常値フラグを設定
+    df['is_outlier'] = df['販売商品数'] > threshold_value
+    df['median'] = median_val
+    df['threshold_value'] = threshold_value
+    
+    # 異常値のみを返す
+    outliers = df[df['is_outlier']].copy()
+    
+    return outliers
+
+
+def exclude_outlier_dates(df: pd.DataFrame, excluded_dates: List[date]) -> pd.DataFrame:
+    """
+    【v24新機能】異常値の日付を学習データから除外
+    
+    Args:
+        df: 売上データ
+        excluded_dates: 除外する日付のリスト
+    
+    Returns:
+        異常値日付を除外したDataFrame（除外行の販売数はNaN）
+    """
+    if not excluded_dates or df.empty:
+        return df
+    
+    df = df.copy()
+    df['date'] = pd.to_datetime(df['date'])
+    
+    # 除外フラグを初期化
+    df['is_outlier_excluded'] = False
+    
+    for exc_date in excluded_dates:
+        exc_ts = pd.Timestamp(exc_date)
+        mask = df['date'] == exc_ts
+        df.loc[mask, 'is_outlier_excluded'] = True
+    
+    # 除外日の販売数をNaNに（学習から除外）
+    excluded_count = df['is_outlier_excluded'].sum()
+    df.loc[df['is_outlier_excluded'], '販売商品数'] = np.nan
+    
+    if excluded_count > 0:
+        logger.info(f"異常値除外: {excluded_count}日分を学習対象外にしました")
+    
+    return df
+
 
 def round_up_to_50(value: int) -> int:
     """50の倍数に切り上げ"""
@@ -7575,11 +7667,16 @@ def render_sales_analysis(start_date: date, end_date: date):
     
     # メトリクス表示
     st.write("**📊 販売実績**")
+    
+    # 【v24新機能】データあり日数を計算
+    data_days = len(df_agg[df_agg['販売商品数'] > 0]) if not df_agg.empty else 0
+    
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("🛒 販売数量合計", f"{total_qty:,}体")
     col2.metric("💰 売上合計", f"¥{total_sales:,.0f}")
     col3.metric("📈 平均日販", f"{avg_daily:.1f}体/日")
-    col4.metric("📅 期間", f"{period_days}日間")
+    # 【v24修正】期間とデータあり日数を表示
+    col4.metric("📅 期間", f"{period_days}日間", delta=f"データあり {data_days}日", delta_color="off")
     
     # エアレジと郵送の内訳を表示
     if include_mail_orders:
@@ -7599,12 +7696,106 @@ def render_sales_analysis(start_date: date, end_date: date):
             ratio = avg_weekend / avg_weekday
             col7.metric("📊 休日/平日比", f"{ratio:.2f}倍")
     
+    # ========== 【v24新機能】異常値検出セクション ==========
+    render_outlier_detection(df_agg, st.session_state.selected_products)
+    
     # ========== 過去との比較セクション ==========
     render_period_comparison(df_items, original_names, start_date, end_date, total_qty)
     
     st.session_state.sales_data = df_agg
     
     return df_agg
+
+
+def render_outlier_detection(df_agg: pd.DataFrame, selected_products: List[str]):
+    """
+    【v24新機能】異常値検出UI
+    
+    Args:
+        df_agg: 集計済み売上データ
+        selected_products: 選択された商品リスト
+    """
+    with st.expander("🔍 **異常値検出・除外設定**", expanded=False):
+        st.write("売上データから異常値（中央値のX倍を超える日）を検出し、予測から除外できます。")
+        
+        # 閾値スライダー
+        threshold = st.slider(
+            "異常値閾値（中央値の何倍を異常とするか）",
+            min_value=3.0,
+            max_value=10.0,
+            value=st.session_state.v24_outlier_threshold,
+            step=0.5,
+            help="中央値のこの倍数を超える日を異常値として検出します",
+            key="outlier_threshold_slider"
+        )
+        
+        # 閾値が変更されたらsession_stateを更新
+        if threshold != st.session_state.v24_outlier_threshold:
+            st.session_state.v24_outlier_threshold = threshold
+        
+        # 異常値を検出
+        outliers = detect_outliers(df_agg, threshold)
+        
+        if outliers.empty:
+            st.success(f"✅ 異常値は検出されませんでした（閾値: 中央値の{threshold}倍）")
+            # 除外リストをクリア
+            for product in selected_products:
+                if product in st.session_state.v24_outlier_excluded_dates:
+                    del st.session_state.v24_outlier_excluded_dates[product]
+        else:
+            median_val = outliers['median'].iloc[0]
+            threshold_val = outliers['threshold_value'].iloc[0]
+            
+            st.warning(f"⚠️ **{len(outliers)}件の異常値を検出**（中央値: {median_val:.1f}体、閾値: {threshold_val:.1f}体）")
+            
+            # 異常値一覧表示
+            st.write("**検出された異常値:**")
+            
+            display_outliers = outliers[['date', '販売商品数']].copy()
+            display_outliers['date'] = pd.to_datetime(display_outliers['date']).dt.strftime('%Y-%m-%d')
+            display_outliers.columns = ['日付', '販売数']
+            display_outliers['中央値比'] = (outliers['販売商品数'] / median_val).apply(lambda x: f"{x:.1f}倍")
+            
+            # 各行に「正常/除外」選択
+            st.write("予測から除外する日を選択してください:")
+            
+            # 現在の除外リストを取得（商品単位で管理）
+            product_key = ",".join(sorted(selected_products))  # 複数商品の場合はキーを結合
+            current_excluded = st.session_state.v24_outlier_excluded_dates.get(product_key, [])
+            
+            # 選択用のデータフレーム作成
+            new_excluded = []
+            
+            for idx, row in outliers.iterrows():
+                row_date = pd.to_datetime(row['date']).date()
+                col1, col2, col3, col4 = st.columns([2, 2, 2, 2])
+                
+                with col1:
+                    st.write(f"📅 {row_date.strftime('%Y-%m-%d')}")
+                with col2:
+                    st.write(f"📊 {int(row['販売商品数']):,}体")
+                with col3:
+                    st.write(f"⚡ 中央値の{row['販売商品数']/median_val:.1f}倍")
+                with col4:
+                    # チェックボックスで除外/正常を選択
+                    is_excluded = st.checkbox(
+                        "除外",
+                        value=row_date in current_excluded,
+                        key=f"outlier_exclude_{row_date}_{product_key}"
+                    )
+                    if is_excluded:
+                        new_excluded.append(row_date)
+            
+            # 除外リストを更新
+            st.session_state.v24_outlier_excluded_dates[product_key] = new_excluded
+            
+            # 除外状況サマリー
+            if new_excluded:
+                st.info(f"🚫 **{len(new_excluded)}日を予測から除外します**")
+                excluded_dates_str = ", ".join([d.strftime('%Y-%m-%d') for d in sorted(new_excluded)])
+                st.caption(f"除外日: {excluded_dates_str}")
+            else:
+                st.info("ℹ️ すべての日を予測に使用します（除外なし）")
 
 
 def render_period_comparison(df_items: pd.DataFrame, original_names: list, start_date: date, end_date: date, current_total: int):
@@ -8896,6 +9087,10 @@ def render_individual_forecast_section():
                 try:
                     products_sales_data[product_name] = sales_data.copy()
                     
+                    # 【v24新機能】異常値除外日付を取得
+                    product_key = ",".join(sorted(st.session_state.selected_products))
+                    outlier_excluded = st.session_state.v24_outlier_excluded_dates.get(product_key, [])
+                    
                     method_results = forecast_all_methods_unified_v22(
                         df=sales_data,
                         periods=forecast_days,
@@ -8904,7 +9099,8 @@ def render_individual_forecast_section():
                         stockout_periods=stockout_periods,
                         enable_trend=enable_trend,
                         use_daily_new_year=use_daily_new_year,
-                        trend_window_days=trend_window_days
+                        trend_window_days=trend_window_days,
+                        outlier_excluded_dates=outlier_excluded  # 【v24新機能】
                     )
                     
                     if method_results:
@@ -11008,8 +11204,8 @@ def main():
     
     st.divider()
     
-    # バージョン情報（v20更新）
-    version_info = "v23.2.1 (異常値検出強化・手動参考商品選択・予測内訳表示)"
+    # バージョン情報（v24更新）
+    version_info = "v24.0.0 (異常値検出UI・データ入力日数表示)"
     if VERTEX_AI_AVAILABLE:
         version_info += " | 🚀 Vertex AI: 有効"
     else:
