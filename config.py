@@ -75,8 +75,13 @@ MAIL_ORDER_PRODUCT_COLUMNS = {
 # 認証設定
 ALLOWED_DOMAINS = ["gmail.com"]  # 許可するGoogleアカウントのドメイン
 
+# =============================================================================
 # キャッシュ設定（秒）
-CACHE_TTL = 300  # 5分
+# 【パフォーマンス改善】300→1800に変更
+# 日次更新データに対して5分は短すぎるため、30分に延長。
+# 手動でデータ更新を反映したい場合は、ヘッダーの「🔄 データ更新」ボタンを使用。
+# =============================================================================
+CACHE_TTL = 1800  # 30分（旧: 300秒=5分）
 
 # 商品名正規化設定
 NORMALIZE_OPTIONS = {
@@ -111,24 +116,15 @@ DELIVERY_PARAMS = {
 # 3. AutoML Forecasting でモデルをトレーニング・デプロイ
 # 4. サービスアカウントを作成し、JSONキーをダウンロード
 # 5. 以下の値を設定
-#
-# 【環境変数での設定も可能】
-# - VERTEX_AI_PROJECT_ID
-# - VERTEX_AI_LOCATION
-# - VERTEX_AI_ENDPOINT_ID
-# - VERTEX_AI_SERVICE_ACCOUNT_FILE
-# =============================================================================
 
-# Google CloudプロジェクトID（例: "my-project-123456"）
-VERTEX_AI_PROJECT_ID = ""
+# Vertex AI プロジェクトID
+VERTEX_AI_PROJECT_ID = ""  # 例: "my-project-12345"
 
-# リージョン（日本の場合は asia-northeast1 推奨）
-VERTEX_AI_LOCATION = "asia-northeast1"
+# Vertex AI リージョン
+VERTEX_AI_LOCATION = "asia-northeast1"  # 東京リージョン
 
-# AutoML ForecastingエンドポイントID
-# デプロイ後にVertex AI Consoleで確認できます（例: "1234567890123456789"）
-VERTEX_AI_ENDPOINT_ID = ""
+# デプロイ済みエンドポイントID
+VERTEX_AI_ENDPOINT_ID = ""  # 例: "1234567890123456789"
 
-# サービスアカウントJSONファイルのパス
-# プロジェクトルートからの相対パス、または絶対パス
+# サービスアカウントキーファイルのパス
 VERTEX_AI_SERVICE_ACCOUNT_FILE = "service_account.json"
